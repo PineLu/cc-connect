@@ -3780,7 +3780,43 @@ func detectMimeType(data []byte) string {
 	return "image/png"
 }
 
+// stripModelFillerLines removes lines composed solely of single-glyph model
+// progress markers (e.g. U+25FC BLACK MEDIUM SMALL SQUARE "◼") that some
+// models (observed: muse-spark on the opencode-free provider) emit between
+// tool calls. They carry no information yet leak into the user-visible reply.
+// The stored transcript keeps the original (see turn-complete block in
+// core/engine.go); only the platform-facing text is cleaned here.
+func stripModelFillerLines(s string) string {
+	if !strings.ContainsRune(s, '◼') {
+		return s
+	}
+	kept := make([]string, 0, len(s)/16)
+	for _, ln := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" {
+			kept = append(kept, ln)
+			continue
+		}
+		filler := true
+		for _, r := range t {
+			if r != '◼' {
+				filler = false
+				break
+			}
+		}
+		if !filler {
+			kept = append(kept, ln)
+		}
+	}
+	out := strings.TrimLeft(strings.Join(kept, "\n"), "\n")
+	if strings.TrimSpace(out) == "" {
+		return " "
+	}
+	return out
+}
+
 func buildReplyContent(content string) (msgType string, body string) {
+	content = stripModelFillerLines(content)
 	if !containsMarkdown(content) {
 		b, _ := json.Marshal(map[string]string{"text": content})
 		return larkim.MsgTypeText, string(b)
@@ -4999,6 +5035,7 @@ type feishuPreviewHandle struct {
 // Uses schema 2.0 which supports code blocks, tables, and inline formatting.
 // Card font is inherently smaller than Post/Text — this is a Feishu platform limitation.
 func buildCardJSON(content string) string {
+	content = stripModelFillerLines(content)
 	content = sanitizeCardMarkdownForCard(content)
 	card := map[string]any{
 		"schema": "2.0",
