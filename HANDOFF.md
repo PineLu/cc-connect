@@ -1,18 +1,26 @@
 # HANDOFF — cc-connect
 
-更新时间：2026-09-10 23:10。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
+更新时间：2026-09-10 23:45（问题 B + ◼过滤均已编译部署并提交，工作区干净）。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
 
 ## 当前目标
 1. **【已修复并上线】问题 A**：Hermes(ACP) 长任务结束后「最终回复在飞书发两遍」。三层修复 + 回归测试完成，全量测试全绿，已交叉编译部署（PID 5849，projects=4）。
-2. **【已修复·未部署】问题 B**（2026-09-10 用户拍板走方案 A）：ACP 状态行 `in` 显示会话累计值（in 21.1M 超 1M 窗口）。已在 cc-connect 侧修复：`ContextUsage` 加 `CumulativeInputTokens` 标记，ACP 置位，footer 的 `in` 改用 `UsedTokens`、`cw/cr` 省略。go build + go test（core/acp）全绿。**未编译部署、未 commit**，待飞书实测。
-3. 本分支全部源码改动**仍未 commit / push**（等用户指令，建议拆 commit）。
+2. **【已部署·待实测】问题 B**（2026-09-10 用户拍板走方案 A，已提交 `aba8824c`）：ACP 状态行 `in` 显示会话累计值（in 21.1M 超 1M 窗口）。已在 cc-connect 侧修复：`ContextUsage` 加 `CumulativeInputTokens` 标记，ACP 置位，footer 的 `in` 改用 `UsedTokens`、`cw/cr` 省略。go build + go test（core/acp）全绿，**已编译 arm64（50MB）并重启部署（PID 7830，23:14:02，projects=3）**，binary 无改名替换（.new 直接成为正式二进制）。待飞书给 hermes 项目发长任务消息，看 `in` 不再破窗。
+3. **【已部署·已提交】`stripModelFillerLines` 过滤**（`53fc21ea` + 注释笔误 `d7adf66a`，二进制同上）：部分模型（实测 muse-spark/opencode-free，低频偶发）在 tool call 间吐 U+25FC "◼" 进度符号，污染飞书可见消息。过滤纯 ◼ 行（两个入口：`buildReplyContent`、`buildCardJSON`），日志/存档保留原始。**注意：日志中 6 个 ◼ 均为用户自己发的消息内容（9-09 讨论本问题时的飞书原文），不是模型输出残留——新二进制已上线，后续如再出现泄漏才是真触发。**
+4. 工作区干净，**未 push**（等用户指令）。
+
+## 当前分支
+`feat/strip-model-filler`（本波为它建的；`sync-upstream-0905` 仍在本地保留）。本地分支，**未 push**。
 
 ## 当前分支
 `sync-upstream-0905`（基于 sync-upstream-0827；0827 保持不动可回退）。本地分支，**未 push**。
 
 ## 当前 commit
-- HEAD=`6f8c7a79`（message "1"，只提交了编译产物 cc-connect-arm64，勿效仿）。
-- 父 `9212f834`=上游 merge（v1.5.1-beta.1）；对 upstream/main 领先 39 / 落后 0。
+- HEAD=`53fc21ea`（`feat/strip-model-filler`）。本波 3 个提交：
+  - `aba8824c` fix(acp): 状态行 in 改用上下文占用（问题 B，6 文件 +213/−18）
+  - `d7adf66a` docs(feishu): stripModelFillerLines 注释笔误修复
+  - `53fc21ea` feat(feishu): 过滤模型进度符号 ◼ 纯符号行（feishu.go 37 行 + feishu_test.go 30 行）
+- 二进制 cc-connect-arm64 现在 47.7M（新版 `-s -w` 剥离后），旧版 69.1M 备份两份
+  （`.bak-20260909-174919` / `.bak-20260910_231332`），确认稳定后可清理。
 
 ## 已完成
 1. **上游同步**（9212f834，33 文件）：feishu.go 我方 ack/thread 隔离/allow_p2p/卡片超链接/话题回显与上游群聊历史、大资源 Range 下载均保留。
