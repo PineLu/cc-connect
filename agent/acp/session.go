@@ -579,6 +579,15 @@ func (s *acpSession) absorbPromptUsage(res json.RawMessage) {
 		s.lastUsage = &core.ContextUsage{}
 	}
 	s.lastUsage.InputTokens = u.InputTokens
+	// ACP PromptResponse.usage documents inputTokens as "Total input tokens
+	// across all turns": Hermes feeds it from agent.session_prompt_tokens,
+	// which only ever increments (turn_usage.py) and is never reset for the
+	// life of the session. On long agentic turns it sums every API sub-call
+	// and can exceed the context window many times over (observed 21.1M on a
+	// 1M window). Flag it so the footer renders "in" from UsedTokens — the
+	// context size right now, supplied by the separate usage_update channel —
+	// instead of this meaningless running total.
+	s.lastUsage.CumulativeInputTokens = true
 	s.lastUsage.OutputTokens = u.OutputTokens
 	s.lastUsage.TotalTokens = u.TotalTokens
 	s.lastUsage.ReasoningOutputTokens = u.ThoughtTokens

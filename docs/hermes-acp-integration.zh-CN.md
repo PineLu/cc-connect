@@ -689,6 +689,46 @@ line2 工作目录逻辑不变；`reply_footer` / `show_context_indicator` / `sh
 `core/claude_status_footer_test.go`（无 cache 渲染简化行、仅窗口占用回退 legacy、Claude 全字段不变）；
 端到端需在飞书给 hermes 项目发消息，看回复底部两行。
 
+#### 4.13.1 ACP 的 `in` 是会话累计值，不能直接当"本次请求大小"
+
+**现象**：Hermes 长任务跑完，状态行出现 `in 21.1M`，而该模型的窗口只有 1M——一个装不下的数。
+`ctx%` 同期显示正常。
+
+**根因**：`PromptResponse.usage.inputTokens` 在 ACP 协议里定义为
+*Total input tokens **across all turns***（`acp/schema.py::Usage` 的字段注释），本就是累计口径。
+Hermes 侧由 `turn_finalizer.py` 从 `agent.session_prompt_tokens` 取值，而该计数器在
+`turn_usage.py` 每次 API 调用后 `+=`，只在 `agent_init.py` 初始化一次、**整个会话从不重置**。
+一个长 agentic turn 有几十次子调用，累加破窗是必然。`cachedReadTokens`/`cachedWriteTokens`
+同源，同样是累计值（且是 prompt 的子集）。
+
+`ctx%` 不受影响只是因为它走`另一条通道`：占用来自 `usage_update` 的
+`used`（`_build_usage_update` 用 `_estimate_tokens(history)` 估算当前上下文），与 prompt usage
+互不覆盖。所以症状只有 `in` 虚高。
+
+**方案**：不去动 `~/.hermes` 第三方源码（项目约定），改为在 cc-connect 侧标记并替换口径。
+
+- `core.ContextUsage` 新增 `CumulativeInputTokens bool`：标记 `InputTokens` 是会话累计值而非
+  最近一次请求的 prompt 大小。语义与 Anthropic 的"input + cache 是互斥分项"完全不同，必须显式区分。
+- `agent/acp/session.go::absorbPromptUsage` 吸收 prompt usage 时置位该标记。
+- `core/engine.go` 两处渲染（方法版两行状态行 + `buildClaudeStatusLineFooter`）：
+  - `in` 改用 `UsedTokens`（与 `ctx%` 同源，是"此刻上下文多大"）；
+  - 连带 `cw`/`cr` 整段省略——它们同属累计口径，且在 OpenAI 系是 prompt 的子集，显示即重复计数；
+  - 累计标记 + `UsedTokens` 缺失时，`in` 与 `ctx%` 都不渲染（此时所有计数器都是累计值，占用不可知），
+    `out` 保留（输出是累加但真实新增，不是重复计数）。
+
+**改后效果**：
+
+| 场景 | 改前 | 改后 |
+|---|---|---|
+| Hermes 长任务 | `in 21.1M · ctx 47%` | `in 471.0k · ctx 47%` |
+| Hermes 短任务 | `in 3.2M · ctx 12%` | `in 120.0k · ctx 12%` |
+| Claude Code | `in 1 cw 971 cr 40.8k · ctx 4%` | 完全不变 |
+
+**验证**：新增三个单测锁死行为——
+`TestBuildClaudeStatusLineFooter_CumulativeInputUsesContextSize`（21.1M 不泄漏、in 取 UsedTokens）、
+`_WithoutUsedTokensSkipsIn`（无占用时不编造 in/ctx）、
+`_SkipsCacheTierGrouping`（累计时不落进 Anthropic 的 `in X cw Y cr Z` 分组）。
+
 
 ### 4.14 ACP `/stop` 后 session 坏死
 

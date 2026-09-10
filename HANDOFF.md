@@ -1,10 +1,10 @@
 # HANDOFF — cc-connect
 
-更新时间：2026-09-06 17:15。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
+更新时间：2026-09-10 23:10。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
 
 ## 当前目标
 1. **【已修复并上线】问题 A**：Hermes(ACP) 长任务结束后「最终回复在飞书发两遍」。三层修复 + 回归测试完成，全量测试全绿，已交叉编译部署（PID 5849，projects=4）。
-2. **【待用户拍板·未修】问题 B**：ACP 状态行 `in/cr` 显示整轮累计值（出现 in 21.1M，超 1M 窗口）；ctx% 正常。用户已明确压缩边界 7%↔47% 瞬时错位「不改」。
+2. **【已修复·未部署】问题 B**（2026-09-10 用户拍板走方案 A）：ACP 状态行 `in` 显示会话累计值（in 21.1M 超 1M 窗口）。已在 cc-connect 侧修复：`ContextUsage` 加 `CumulativeInputTokens` 标记，ACP 置位，footer 的 `in` 改用 `UsedTokens`、`cw/cr` 省略。go build + go test（core/acp）全绿。**未编译部署、未 commit**，待飞书实测。
 3. 本分支全部源码改动**仍未 commit / push**（等用户指令，建议拆 commit）。
 
 ## 当前分支
@@ -30,8 +30,28 @@
    - `core/cuj_test.go`：13 处 `NewEngine` 统一补 `t.Cleanup(func(){ x.Stop() })`（**注意：在 newCUJEnv 这类 helper 里必须用 t.Cleanup 而非 defer，defer 会在 helper 返回时就 Stop，导致 engine 当场报废、所有用例收不到回复——已踩过并修正**）。
 
 ## 未完成
-### B. ACP 状态行 in/cr 累计虚高（in 21.1M）
-- 根因方向：`agent/acp/session.go::absorbPromptUsage` 取 session/prompt 终态 usage，疑似整 turn 多次子调用累计；应对标 claudecode 只用最后一次单次值。下一步读 `~/.hermes/hermes-agent/acp_adapter/server.py`（约 917-923、345-357）确认，查 ACP session/update 有无 per-call usage。ctx 通道不动。改不改待用户拍板。
+### B. ACP 状态行 in/cr 累计虚高（in 21.1M）— 已修，待实测
+- **结论（2026-09-10 已核实上游源码）**：不是 bug，是 ACP 协议口径。`acp/schema.py::Usage` 明确写
+  `inputTokens` = "Total input tokens **across all turns**"；Hermes `turn_finalizer.py` 取
+  `agent.session_prompt_tokens`，该计数器在 `turn_usage.py` 只 `+=`、`agent_init.py` 初始化后
+  **整个会话从不重置**。长 turn 累加破窗是必然。`cachedReadTokens/WriteTokens` 同源累计，
+  且是 prompt 的子集。
+- **为何 ctx% 正常**：占用走另一条通道 `usage_update.used`（`server.py::_build_usage_update` 用
+  `_estimate_tokens(history)` 估算当前上下文），与 prompt usage 互不覆盖。
+- **采用方案 A（不改 ~/.hermes 第三方源码）**：cc-connect 侧标记 + 换口径。
+  - `core/interfaces.go`：`ContextUsage` 新增 `CumulativeInputTokens bool`。
+  - `agent/acp/session.go::absorbPromptUsage`：吸收 prompt usage 时置位。
+  - `core/engine.go` 两处渲染：`in` 改用 `UsedTokens`；`cw/cr` 整段省略；累计且无 `UsedTokens`
+    时 `in`/`ctx%` 均不渲染（fallback 求和会凭空编造占用，故限定 `!CumulativeInputTokens`）；
+    `out` 保留（输出是真实新增，非重复计数）。
+  - 单测 3 个：`_CumulativeInputUsesContextSize` / `_WithoutUsedTokensSkipsIn` /
+    `_SkipsCacheTierGrouping`；文档 §4.13.1。
+- **验证状态**：`go build ./...` OK；`gofmt` 干净；`go test ./core/ ./agent/acp/ -count=1` 全绿。
+  **未编译部署、未 commit**。端到端待飞书给 hermes 项目发长消息，看 `in` 不再破窗。
+- 已明确「不改」的相邻项：压缩边界 7%↔47% 瞬时错位（用户拍板不改），与本题无关。
+- 备份文件（临时，勿提交）：`core/interfaces.go.bak-planA-20260910_225721`、
+  `core/engine.go.bak-planA-20260910_225721`、`core/claude_status_footer_test.go.bak-planA-20260910_225721`、
+  `agent/acp/session.go.bak-planA-20260910_225721`。
 ### C. 提交 / 推送 / 仓库卫生
 - 全部未 commit；**切勿 `git add cc-connect-arm64*`（69MB 二进制）**。
 - 建议拆 commit：ack 开关 / outbox 互斥+uuid+关停治理 / ACP resume·死锁 / ACP 压缩·model 透传 / ACP 状态行 / 文档。
@@ -47,7 +67,9 @@
 
 ## 下一步（按优先级）
 1. 飞书「卢松林助手通知」群跑一个 5 分钟以上长任务，实测最终回复**只回一条**（无法代发，需用户实测）；可 grep `~/.cc-connect/logs/cc-connect.log` 的 `outbox:` 与 uuid。
-2. 用户拍板问题 B 是否修。
+2. ~~用户拍板问题 B 是否修~~ → 已拍板（方案 A）并修复，转下条实测。
+2b. 编译 arm64 + launchctl 重启部署问题 B 修复，**挑群里无在跑会话时**（重启会 kill hermes/claude 子进程）；
+    然后飞书给 hermes 项目发一条长任务消息，确认状态行 `in` 不再破窗口。
 3. 拆 commit、push；按需二进制脱钩。
 
 ## 验证命令

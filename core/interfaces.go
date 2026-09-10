@@ -525,9 +525,17 @@ type ContextUsage struct {
 	// BaselineTokens is the portion of the context window always occupied by
 	// fixed runtime/system instructions and therefore excluded from user-visible
 	// "left" calculations when the agent provides it.
-	BaselineTokens           int
-	TotalTokens              int
-	InputTokens              int
+	BaselineTokens int
+	TotalTokens    int
+	InputTokens    int
+	// CumulativeInputTokens marks InputTokens as a SESSION-CUMULATIVE value
+	// (summed across every API sub-call in the turn/session) rather than the
+	// prompt size of the most recent request. Set by agents whose protocol only
+	// reports running totals — notably ACP/Hermes, whose PromptResponse.usage
+	// documents inputTokens as "Total input tokens across all turns". When true,
+	// the footer renders the "in" segment from UsedTokens (the honest
+	// "context size right now") instead of the inflated cumulative counter.
+	CumulativeInputTokens    bool
 	CachedInputTokens        int // cache-read tokens (prior context retrieved from cache)
 	CacheCreationInputTokens int // cache-write tokens (new content written to cache)
 	OutputTokens             int

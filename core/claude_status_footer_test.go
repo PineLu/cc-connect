@@ -78,6 +78,114 @@ func TestBuildClaudeStatusLineFooter_NoCacheTokens(t *testing.T) {
 	}
 }
 
+// TestBuildClaudeStatusLineFooter_CumulativeInputUsesContextSize covers the
+// ACP/Hermes case: PromptResponse.usage reports inputTokens as a SESSION-
+// CUMULATIVE total (Hermes feeds it from agent.session_prompt_tokens, which
+// only ever increments), so a long agentic turn can report far more input than
+// the context window can hold (observed: in 21.1M on a 1M window). The footer
+// must render "in" from UsedTokens — the context size right now — and drop the
+// equally-cumulative cw/cr tiers. ctx% is unaffected (it already uses UsedTokens).
+func TestBuildClaudeStatusLineFooter_CumulativeInputUsesContextSize(t *testing.T) {
+	session := &controllableAgentSession{
+		model:   "glm-5.3-flash",
+		workDir: "/tmp/ws",
+		contextUsage: &ContextUsage{
+			// 21.1M cumulative input vs a 1M window — the exact symptom.
+			InputTokens:              21_100_000,
+			CumulativeInputTokens:    true,
+			OutputTokens:             1200,
+			CachedInputTokens:        19_800_000,
+			CacheCreationInputTokens: 40_000,
+			ContextWindow:            1_000_000,
+			UsedTokens:               471_000,
+		},
+	}
+	e := newClaudeFooterEngine()
+	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{})
+	lines := strings.Split(got, "\n")
+	line1 := lines[0]
+
+	// "in" must show the honest context size, never the cumulative counter.
+	if !strings.Contains(line1, "in 471.0k") {
+		t.Errorf("line1 = %q, want in 471.0k (UsedTokens, not cumulative input)", line1)
+	}
+	if strings.Contains(line1, "21.1M") || strings.Contains(line1, "in 21100") {
+		t.Errorf("line1 = %q must not leak the cumulative input total", line1)
+	}
+	// Cumulative cache tiers are a subset of that same running total: omit them.
+	if strings.Contains(line1, "cw ") || strings.Contains(line1, "cr ") {
+		t.Errorf("cumulative footer must not render cw/cr: %q", line1)
+	}
+	// Output is additive and genuine — keep it.
+	if !strings.Contains(line1, "out 1.2k") {
+		t.Errorf("line1 = %q, want out 1.2k", line1)
+	}
+	// ctx% unchanged: 471000/1000000 = 47%.
+	if !strings.Contains(line1, "ctx 47%") {
+		t.Errorf("line1 = %q, want ctx 47%%", line1)
+	}
+}
+
+// TestBuildClaudeStatusLineFooter_CumulativeInputWithoutUsedTokensSkipsIn
+// covers the degenerate cumulative case: the agent flagged its input counter
+// as cumulative but never supplied a used-context figure. Rendering "in" from
+// the cumulative total would be claiming a prompt bigger than the window, so
+// the segment is omitted entirely. ctx% is omitted too — on this path every
+// remaining counter (TotalTokens included) is itself cumulative, so occupancy
+// is genuinely unknown until a usage_update arrives.
+func TestBuildClaudeStatusLineFooter_CumulativeInputWithoutUsedTokensSkipsIn(t *testing.T) {
+	session := &controllableAgentSession{
+		model:   "glm-5.3-flash",
+		workDir: "/tmp/ws",
+		contextUsage: &ContextUsage{
+			InputTokens:           21_100_000,
+			CumulativeInputTokens: true,
+			OutputTokens:          800,
+			TotalTokens:           21_100_800,
+			ContextWindow:         1_000_000,
+		},
+	}
+	e := newClaudeFooterEngine()
+	got := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{})
+	line1 := strings.Split(got, "\n")[0]
+	if strings.Contains(line1, "in ") {
+		t.Errorf("line1 = %q, want no 'in' segment without an honest per-request figure", line1)
+	}
+	if strings.Contains(line1, "ctx ") {
+		t.Errorf("line1 = %q, want no ctx segment when occupancy is unknown", line1)
+	}
+	if !strings.Contains(line1, "out 800") {
+		t.Errorf("line1 = %q, want out 800 (additive output survives)", line1)
+	}
+}
+
+// TestBuildClaudeStatusLineFooter_CumulativeInputSkipsCacheTierGrouping
+// guards against regression in the Anthropic branch: when input is cumulative
+// we must NOT fall into the "in X cw Y cr Z" grouping even though cache tiers
+// are present (they are, after all, non-zero here).
+func TestBuildClaudeStatusLineFooter_CumulativeInputSkipsCacheTierGrouping(t *testing.T) {
+	session := &controllableAgentSession{
+		model:   "glm-5.3-flash",
+		workDir: "/tmp/ws",
+		contextUsage: &ContextUsage{
+			InputTokens:              21_100_000,
+			CumulativeInputTokens:    true,
+			OutputTokens:             1200,
+			CachedInputTokens:        19_800_000,
+			CacheCreationInputTokens: 40_000,
+			ContextWindow:            1_000_000,
+			UsedTokens:               471_000,
+		},
+	}
+	e := newClaudeFooterEngine()
+	line1 := strings.Split(e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{}), "\n")[0]
+	for _, forbidden := range []string{"cw ", "cr ", "19.8M", "40.0k"} {
+		if strings.Contains(line1, forbidden) {
+			t.Errorf("line1 = %q, must not render cumulative cache tier %q", line1, forbidden)
+		}
+	}
+}
+
 // TestBuildClaudeStatusLineFooter_WindowOccupancyOnlyFallsThrough covers an
 // agent that reports only window occupancy (UsedTokens/ContextWindow) but no
 // per-turn input/output tokens and no cache tiers: it must fall through to the

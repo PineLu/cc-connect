@@ -7550,6 +7550,10 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 //   - token counts: out (output) · in (new input) · cw (cache create) · cr (cache read)
 //   - ctx %: UsedTokens / ContextWindow, capped at 100%
 //
+// Agents whose input counter is session-cumulative (CumulativeInputTokens, see
+// core.ContextUsage) report a running total that can dwarf the window, so their
+// "in" is rendered from UsedTokens and the cw/cr tiers are omitted outright.
+//
 // Returns "" when usage is nil and no model is known.
 func buildClaudeStatusLineFooter(model, effort string, usage *ContextUsage) string {
 	var parts []string
@@ -7561,17 +7565,29 @@ func buildClaudeStatusLineFooter(model, effort string, usage *ContextUsage) stri
 	}
 	if usage != nil {
 		var counts []string
-		if usage.OutputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
+		// The "in" segment must show the prompt size of the most recent
+		// request. When InputTokens is flagged cumulative (ACP/Hermes reports
+		// a running session total that can exceed the window), substitute
+		// UsedTokens — the same value ctx% uses — and skip the segment when
+		// no honest per-request figure is available.
+		inputCount := usage.InputTokens
+		if usage.CumulativeInputTokens {
+			inputCount = usage.UsedTokens
 		}
-		if usage.InputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("in %s", formatStatusTokenCount(usage.InputTokens)))
+		if inputCount > 0 {
+			counts = append(counts, fmt.Sprintf("in %s", formatStatusTokenCount(inputCount)))
 		}
-		if usage.CacheCreationInputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("cw %s", formatStatusTokenCount(usage.CacheCreationInputTokens)))
-		}
-		if usage.CachedInputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("cr %s", formatStatusTokenCount(usage.CachedInputTokens)))
+		// cw/cr on the ACP path carry the same "across all turns" semantics as
+		// InputTokens (and on OpenAI-style usage cached tokens are a SUBSET of
+		// the prompt, so they would double-report regardless) — omit them when
+		// the input counter is known to be cumulative.
+		if !usage.CumulativeInputTokens {
+			if usage.CacheCreationInputTokens > 0 {
+				counts = append(counts, fmt.Sprintf("cw %s", formatStatusTokenCount(usage.CacheCreationInputTokens)))
+			}
+			if usage.CachedInputTokens > 0 {
+				counts = append(counts, fmt.Sprintf("cr %s", formatStatusTokenCount(usage.CachedInputTokens)))
+			}
 		}
 		if len(counts) > 0 {
 			parts = append(parts, strings.Join(counts, " "))
@@ -7918,7 +7934,10 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 
 	// Context-window percentage.
 	used := usage.UsedTokens
-	if used <= 0 {
+	if used <= 0 && !usage.CumulativeInputTokens {
+		// Only Anthropic-style disjoint buckets are safe to sum as a fallback:
+		// on the cumulative path they are running totals, so summing them would
+		// fabricate an occupancy far beyond the real context.
 		used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
 	}
 	pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
@@ -7930,11 +7949,21 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	}
 	ctxPct := fmt.Sprintf("%d", pct)
 
-	// Token counts as formatted strings.
+	// Token counts as formatted strings. When the input counter is flagged
+	// session-cumulative (ACP/Hermes), "in" must render the honest per-request
+	// figure — UsedTokens, the same value ctx% uses — and cw/cr (equally
+	// cumulative, and a subset of the prompt on OpenAI-style usage) are
+	// dropped entirely.
 	outStr := formatStatusTokenCount(usage.OutputTokens)
 	inStr := formatStatusTokenCount(usage.InputTokens)
 	cwStr := formatStatusTokenCount(usage.CacheCreationInputTokens)
 	crStr := formatStatusTokenCount(usage.CachedInputTokens)
+	inValid := usage.InputTokens > 0
+	if usage.CumulativeInputTokens {
+		inStr = formatStatusTokenCount(usage.UsedTokens)
+		inValid = usage.UsedTokens > 0
+		cwStr, crStr = "", ""
+	}
 
 	// Template path: render via user-supplied Go template.
 	if e.footerTemplate != "" {
@@ -7975,12 +8004,13 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 			line1Parts = append(line1Parts, fmt.Sprintf("out %s", outStr))
 		}
 		switch {
-		case hasCacheTokens:
+		case !usage.CumulativeInputTokens && hasCacheTokens:
 			// Anthropic path: keep the CCD-style "in X cw Y cr Z" grouping
 			// (zero tiers still shown) once any cache tier is present.
 			line1Parts = append(line1Parts, fmt.Sprintf("in %s cw %s cr %s", inStr, cwStr, crStr))
-		case usage.InputTokens > 0:
+		case inValid:
 			// Cache-less agents (ACP/Hermes, …): plain input count, no cw/cr.
+			// Cumulative-flagged input arrives here after substitution.
 			line1Parts = append(line1Parts, fmt.Sprintf("in %s", inStr))
 		}
 		if used > 0 {
