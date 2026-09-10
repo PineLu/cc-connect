@@ -2593,3 +2593,33 @@ func TestAckFooter_ShowSessionKeySwitch(t *testing.T) {
 		}
 	})
 }
+
+func TestStripModelFillerLines(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no filler untouched", "hello\nworld", "hello\nworld"},
+		{"leading fillers removed", "\n\n◼\n\n◼\n\n修好了", "修好了"},
+		{"mid-text filler removed", "a\n◼\nb", "a\nb"},
+		{"multi-marker line removed", "a\n◼◼\nb", "a\nb"},
+		{"padded filler removed", "a\n  ◼  \nb", "a\nb"},
+		{"lookalike kept", "◼ text\n■ kept", "◼ text\n■ kept"},
+		{"only filler becomes blank guard", "◼\n◼", " "},
+		{"empty stays empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripModelFillerLines(c.in); got != c.want {
+				t.Fatalf("stripModelFillerLines(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	if _, body := buildReplyContent("\n\n◼\n\nplain reply"); body == "" {
+		t.Fatal("buildReplyContent must not return empty body")
+	} else if strings.Contains(body, "◼") {
+		t.Fatalf("buildReplyContent body still contains filler: %q", body)
+	}
+}
