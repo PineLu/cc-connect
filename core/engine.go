@@ -567,6 +567,7 @@ type interactiveState struct {
 	sideText                 string
 	deleteMode               *deleteModeState
 	modelSwitch              *modelSwitchState
+	modelsList               *modelsListState
 	pendingProviderAdd       *pendingProviderAddState
 	lastAutoCompressAt       time.Time
 	lastAutoCompressTokens   int
@@ -707,6 +708,13 @@ type modelSwitchState struct {
 	phase  string
 	target string
 	result string
+}
+
+// modelsListState remembers the flattened /models listing behind a rendered
+// card so a dropdown selection ("act:/models switch <n>") can be resolved back
+// to the exact switch command without re-reading config or cache.
+type modelsListState struct {
+	items []ModelDetail
 }
 
 // pendingPermission represents a permission request waiting for user response.
@@ -6601,6 +6609,7 @@ var builtinCommands = []struct {
 	{[]string{"history"}, "history"},
 	{[]string{"allow"}, "allow"},
 	{[]string{"model"}, "model"},
+	{[]string{"models"}, "models"},
 	{[]string{"reasoning", "effort"}, "reasoning"},
 	{[]string{"mode"}, "mode"},
 	{[]string{"lang"}, "lang"},
@@ -6810,6 +6819,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdAllow(p, msg, args)
 	case "model":
 		e.cmdModel(p, msg, args)
+	case "models":
+		e.cmdModels(p, msg, args)
 	case "reasoning":
 		e.cmdReasoning(p, msg, args)
 	case "mode":
@@ -9444,6 +9455,10 @@ func (e *Engine) modelCardBackButton() CardButton {
 	return DefaultBtn(e.i18n.T(MsgCardBack), "nav:/model")
 }
 
+func (e *Engine) modelsCardBackButton() CardButton {
+	return DefaultBtn(e.i18n.T(MsgCardBack), "nav:/models")
+}
+
 func (e *Engine) cardPrevButton(action string) CardButton {
 	return DefaultBtn(e.i18n.T(MsgCardPrev), action)
 }
@@ -10212,6 +10227,340 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChanged, target))
 }
 
+// cmdModels renders the switchable-model list as an interactive card with a
+// dropdown: picking an entry switches to it directly. The listing always
+// reflects the agent this project's engine is bound to (resolved through the
+// normal command context), so no selector argument is needed. Platforms
+// without card support fall back to text.
+func (e *Engine) cmdModels(p Platform, msg *Message, args []string) {
+	agent, _, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	_ = args
+
+	if !supportsCards(p) {
+		e.cmdModelsText(p, msg, agent)
+		return
+	}
+	e.replyWithCard(p, msg.ReplyCtx, e.renderModelsCard(msg.SessionKey, agent))
+}
+
+// cmdModelsText is the text fallback for /models on platforms without cards.
+func (e *Engine) cmdModelsText(p Platform, msg *Message, agent Agent) {
+	groups, total := e.collectModelDetails(agent)
+	if total == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelsNotSupported))
+		return
+	}
+
+	var sb strings.Builder
+	for _, g := range groups {
+		sb.WriteString(fmt.Sprintf("**%s**\n", g.title))
+		for _, d := range g.details {
+			sb.WriteString("`" + d.SwitchCommand + "`")
+			if d.Current {
+				sb.WriteString(" ← 当前")
+			}
+			if d.Note != "" {
+				sb.WriteString("  " + d.Note)
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(e.i18n.T(MsgModelsUsage))
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// renderModelsCard builds the /models dropdown card and remembers the flattened
+// listing in interactive state so a selection resolves to the exact detail.
+func (e *Engine) renderModelsCard(sessionKey string, agent Agent) *Card {
+	groups, total := e.collectModelDetails(agent)
+	if total == 0 {
+		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelsNotSupported))
+	}
+
+	var opts []CardSelectOption
+	var flat []ModelDetail
+	initVal := ""
+	n := 0
+	var sb strings.Builder
+	for _, g := range groups {
+		sb.WriteString(fmt.Sprintf("**%s** (%d)\n", g.title, len(g.details)))
+	}
+	var currentLine string
+	for _, g := range groups {
+		for _, d := range g.details {
+			n++
+			flat = append(flat, d)
+			label := d.Name
+			if d.ProviderLabel != "" {
+				label = d.ProviderLabel + " · " + d.Name
+			} else if d.Provider != "" {
+				label = d.Provider + " · " + d.Name
+			}
+			val := fmt.Sprintf("act:/models switch %d", n)
+			opts = append(opts, CardSelectOption{Text: label, Value: val})
+			if d.Current {
+				initVal = val
+				currentLine = d.SwitchCommand
+			}
+		}
+	}
+
+	// Remember the listing for the selection callback.
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	if state == nil {
+		state = &interactiveState{}
+		e.interactiveStates[interactiveKey] = state
+	}
+	e.interactiveMu.Unlock()
+	state.mu.Lock()
+	state.modelsList = &modelsListState{items: flat}
+	state.mu.Unlock()
+
+	body := e.i18n.T(MsgModelDefault)
+	if currentLine != "" {
+		body = e.i18n.Tf(MsgModelCurrent, currentLine)
+	}
+	cb := NewCard().Title(e.i18n.T(MsgCardTitleModel), "indigo").
+		Markdown(body + "\n" + sb.String()).
+		Select(e.i18n.T(MsgModelSelectPlaceholder), opts, initVal).
+		Buttons(e.cardBackButton())
+	cb.Note(e.i18n.T(MsgModelsUsage))
+	return cb.Build()
+}
+
+// handleModelsCardAction switches to the model chosen in the /models dropdown.
+// "switch <n>" resolves against the listing remembered at render time; unknown
+// selections re-render the card.
+func (e *Engine) handleModelsCardAction(args, sessionKey string) *Card {
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+
+	fields := strings.Fields(args)
+	if len(fields) < 2 || !strings.EqualFold(fields[0], "switch") {
+		agent, _ := e.sessionContextForKey(sessionKey)
+		return e.renderModelsCard(sessionKey, agent)
+	}
+	idx, err := strconv.Atoi(fields[1])
+	if err != nil || state == nil {
+		agent, _ := e.sessionContextForKey(sessionKey)
+		return e.renderModelsCard(sessionKey, agent)
+	}
+	state.mu.Lock()
+	var items []ModelDetail
+	if state.modelsList != nil {
+		items = append([]ModelDetail(nil), state.modelsList.items...)
+	}
+	state.mu.Unlock()
+	if len(items) == 0 || idx < 1 || idx > len(items) {
+		agent, _ := e.sessionContextForKey(sessionKey)
+		return e.renderModelsCard(sessionKey, agent)
+	}
+	target := items[idx-1]
+
+	// ACP/command-driven agents (Hermes): forward the full switch command over
+	// the live session and report the running state; the agent's own reply
+	// carries the confirmation.
+	if passer, ok := e.agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+		e.interactiveMu.Lock()
+		st := e.interactiveStates[interactiveKey]
+		if st == nil {
+			st = &interactiveState{}
+			e.interactiveStates[interactiveKey] = st
+		}
+		e.interactiveMu.Unlock()
+		st.mu.Lock()
+		alive := st.agentSession != nil && st.agentSession.Alive()
+		st.mu.Unlock()
+		if !alive {
+			// No live agent session (e.g. right after a restart): forwarding
+			// would nil-deref on state.agentSession. Tell the user to send a
+			// message first, same as the typed /model path (MsgModelNoSession).
+			return NewCard().
+				Title(e.i18n.T(MsgCardTitleModel), "red").
+				Markdown(e.i18n.T(MsgModelNoSession)).
+				Buttons(e.modelsCardBackButton()).
+				Build()
+		}
+		st.mu.Lock()
+		st.modelSwitch = &modelSwitchState{phase: "switching", target: target.SwitchCommand}
+		st.mu.Unlock()
+		go e.forwardModelsSwitchAsync(sessionKey, st, target.SwitchCommand, target.Name)
+		return e.renderModelSwitchingCard(target.SwitchCommand)
+	}
+
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	if _, ok := agent.(ModelSwitcher); !ok {
+		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
+	}
+	model := target.Name
+	resolved, serr := e.switchModelOnAgent(agent, model, agent == e.agent)
+	if serr == nil {
+		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
+		sessions.Save()
+	}
+	e.cleanupInteractiveState(interactiveKey)
+	return e.renderModelsSwitchResultCard(resolved, serr)
+}
+
+// renderModelsSwitchResultCard reports the /models switch outcome; its back
+// button returns to the model list rather than the main help menu.
+func (e *Engine) renderModelsSwitchResultCard(target string, err error) *Card {
+	if err != nil {
+		return NewCard().
+			Title(e.i18n.T(MsgCardTitleModel), "red").
+			Markdown(e.i18n.Tf(MsgModelCardSwitchFailed, err)).
+			Buttons(e.modelsCardBackButton()).
+			Build()
+	}
+	return NewCard().
+		Title(e.i18n.T(MsgCardTitleModel), "green").
+		Markdown(e.i18n.Tf(MsgModelCardSwitched, target)).
+		Buttons(e.modelsCardBackButton()).
+		Build()
+}
+
+// forwardModelsSwitchAsync forwards a full "/model ..." switch command to the
+// live ACP session (Hermes) and refreshes the card with the agent's reply.
+func (e *Engine) forwardModelsSwitchAsync(sessionKey string, state *interactiveState, command, label string) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	alive := state.agentSession != nil && state.agentSession.Alive()
+	state.mu.Unlock()
+	if !alive {
+		// Session died between selection and forward: never touch a nil/dead
+		// agentSession (would panic). Just drop the pending switch state.
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	passer, ok := agent.(ModelCommand)
+	if !ok || passer.ModelCommand() == "" {
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	platformName := extractPlatformName(sessionKey)
+	var targetPlatform Platform
+	for _, p := range e.platforms {
+		if p.Name() == platformName {
+			targetPlatform = p
+			break
+		}
+	}
+	if targetPlatform == nil {
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	session := sessions.GetOrCreateActive(sessionKey)
+	if !session.TryLock() {
+		e.pushModelSwitchResultCard(sessionKey, e.renderModelsSwitchResultCard("", fmt.Errorf("%s", e.i18n.T(MsgPreviousProcessing))))
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	iKey := e.interactiveKeyForSessionKey(sessionKey)
+	// Card callbacks carry no usable reply context (nil after a restart), so
+	// the switch result text would never reach the user. Reconstruct one.
+	state.mu.Lock()
+	replyCtx := state.replyCtx
+	state.mu.Unlock()
+	if rc, ok := targetPlatform.(ReplyContextReconstructor); ok {
+		if rctx, err := rc.ReconstructReplyCtx(sessionKey); err != nil {
+			slog.Warn("models switch: reconstruct reply ctx failed, using card ctx", "error", err)
+		} else {
+			replyCtx = rctx
+		}
+	}
+	_, rerr := e.runForwardedCommand(state, session, sessions, iKey, targetPlatform, replyCtx, command, false, "")
+	if e.ctx.Err() != nil || state.isStopped() {
+		e.cleanupInteractiveState(iKey, state)
+		return
+	}
+	resolved := label
+	if rerr != nil {
+		resolved = ""
+	} else if as := func() AgentSession {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		return state.agentSession
+	}(); as != nil {
+		// Keep the reply footer accurate without waiting for a session
+		// restart; the agent only announces its model on session new/load.
+		if setter, ok := as.(interface{ SetModel(string) }); ok {
+			setter.SetModel(label)
+		}
+	}
+	e.pushModelSwitchResultCard(sessionKey, e.renderModelsSwitchResultCard(resolved, rerr))
+	e.cleanupInteractiveState(iKey, state)
+}
+
+// renderModelsCardSafe resolves the agent for a session key before rendering,
+// for nav: re-renders where no agent is passed explicitly.
+func (e *Engine) renderModelsCardSafe(sessionKey string) *Card {
+	agent, _ := e.sessionContextForKey(sessionKey)
+	return e.renderModelsCard(sessionKey, agent)
+}
+
+type modelGroup struct {
+	title   string
+	details []ModelDetail
+}
+
+// collectModelDetails pulls the model list from whichever optional interface the
+// agent implements: ModelLister (provider-aware, offline-safe) is preferred,
+// ModelSwitcher.AvailableModels is the fallback for agents without one.
+func (e *Engine) collectModelDetails(agent Agent) ([]modelGroup, int) {
+	ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
+	defer cancel()
+
+	var details []ModelDetail
+	if lister, ok := agent.(ModelLister); ok {
+		details = lister.ListModelsDetail(ctx)
+	} else if switcher, ok := agent.(ModelSwitcher); ok {
+		for _, m := range switcher.AvailableModels(ctx) {
+			details = append(details, ModelDetail{
+				Name:          m.Name,
+				Note:          m.Desc,
+				SwitchCommand: "/model " + m.Name,
+			})
+		}
+	}
+	if len(details) == 0 {
+		return nil, 0
+	}
+
+	// Group by provider, preserving first-seen order so the primary/current
+	// provider stays at the top of the reply.
+	var groups []modelGroup
+	index := map[string]int{}
+	for _, d := range details {
+		title := d.ProviderLabel
+		if title == "" {
+			title = d.Provider
+		}
+		if title == "" {
+			title = "默认"
+		}
+		i, seen := index[title]
+		if !seen {
+			i = len(groups)
+			index[title] = i
+			groups = append(groups, modelGroup{title: title})
+		}
+		groups[i].details = append(groups[i].details, d)
+	}
+	return groups, len(details)
+}
+
 // resolveModelAlias resolves a user-supplied string to a model name.
 // It first checks for an exact alias match, then falls back to the original value
 // (which may be a direct model name).
@@ -10834,7 +11183,7 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 // deferred fallback on an early-return path. When auto is true the command
 // runs silently. emptyText is shown only when the command produces no text;
 // pass "" to stay silent in that case.
-func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, command string, auto bool, emptyText string) {
+func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, command string, auto bool, emptyText string) (string, error) {
 	commandUnlocked := false
 	defer func() {
 		if !commandUnlocked {
@@ -10859,10 +11208,10 @@ func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, 
 		if !state.agentSession.Alive() {
 			e.cleanupInteractiveState(iKey)
 		}
-		return
+		return "", err
 	}
 
-	e.processForwardedEvents(state, session, sessions, iKey, p, replyCtx, &commandUnlocked, auto, emptyText)
+	return e.processForwardedEvents(state, session, sessions, iKey, p, replyCtx, &commandUnlocked, auto, emptyText)
 }
 
 // processForwardedEvents drains agent events after a forwarded slash command
@@ -10870,7 +11219,7 @@ func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, 
 // does NOT record history and treats an empty result as success rather than
 // "(empty response)". emptyText is relayed only when no text comes back; an
 // empty emptyText means "stay silent".
-func (e *Engine) processForwardedEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, emptyText string) {
+func (e *Engine) processForwardedEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, emptyText string) (string, error) {
 
 	var textParts []string
 	events := state.agentSession.Events()
@@ -10890,7 +11239,7 @@ func (e *Engine) processForwardedEvents(state *interactiveState, session *Sessio
 
 		select {
 		case <-stopCh:
-			return
+			return "", nil
 		case event, ok = <-events:
 			if !ok {
 				e.cleanupInteractiveState(sessionKey, state)
@@ -10901,22 +11250,24 @@ func (e *Engine) processForwardedEvents(state *interactiveState, session *Sessio
 						e.reply(p, replyCtx, emptyText)
 					}
 				}
-				e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited during compress"))
-				return
+				forwardErr := fmt.Errorf("agent process exited during forwarded command")
+				e.notifyDroppedQueuedMessages(state, forwardErr)
+				return strings.Join(textParts, ""), forwardErr
 			}
 		case <-idleCh:
 			if !auto {
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
 			}
+			forwardErr := fmt.Errorf("forwarded command timed out")
 			e.cleanupInteractiveState(sessionKey, state)
-			e.notifyDroppedQueuedMessages(state, fmt.Errorf("compress timed out"))
-			return
+			e.notifyDroppedQueuedMessages(state, forwardErr)
+			return strings.Join(textParts, ""), forwardErr
 		case <-e.ctx.Done():
-			return
+			return "", nil
 		}
 
 		if state.isStopped() {
-			return
+			return "", nil
 		}
 
 		if idleTimer != nil {
@@ -10964,7 +11315,7 @@ func (e *Engine) processForwardedEvents(state *interactiveState, session *Sessio
 
 			// After compress succeeds, process any queued messages instead of dropping them.
 			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked)
-			return
+			return result, nil
 		case EventError:
 			if !auto && event.Error != nil {
 				e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
@@ -10977,7 +11328,10 @@ func (e *Engine) processForwardedEvents(state *interactiveState, session *Sessio
 				// Agent survived — try to process queued messages.
 				e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked)
 			}
-			return
+			if event.Error != nil {
+				return "", event.Error
+			}
+			return "", fmt.Errorf("agent error during forwarded command")
 		case EventPermissionRequest:
 			_ = state.agentSession.RespondPermission(event.RequestID, PermissionResult{
 				Behavior:     "allow",
@@ -12514,6 +12868,10 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.handleModelCardAction(args, sessionKey)
 	}
 
+	if prefix == "act" && cmd == "/models" {
+		return e.handleModelsCardAction(args, sessionKey)
+	}
+
 	if prefix == "act" {
 		e.executeCardAction(cmd, args, sessionKey)
 	}
@@ -12523,6 +12881,8 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.renderHelpGroupCard(args)
 	case "/model":
 		return e.renderModelCard(sessionKey)
+	case "/models":
+		return e.renderModelsCardSafe(sessionKey)
 	case "/reasoning":
 		return e.renderReasoningCard()
 	case "/mode":

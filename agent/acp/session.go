@@ -316,6 +316,15 @@ func (s *acpSession) absorbModel(block *acpModelBlock) {
 		return
 	}
 	if m := strings.TrimSpace(block.CurrentModelID); m != "" {
+		s.SetModel(m)
+	}
+}
+
+// SetModel overrides the cached current model id (e.g. after a successful
+// /models card switch, so the reply footer shows the new model without
+// waiting for a session restart). Empty input is ignored.
+func (s *acpSession) SetModel(model string) {
+	if m := strings.TrimSpace(model); m != "" {
 		s.modelMu.Lock()
 		s.currentModel = m
 		s.modelMu.Unlock()

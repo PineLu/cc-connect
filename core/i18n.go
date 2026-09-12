@@ -339,6 +339,8 @@ const (
 	MsgModelCardSwitched     MsgKey = "model_card_switched"
 	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
 	MsgModelNotSupported     MsgKey = "model_not_supported"
+	MsgModelsNotSupported   MsgKey = "models_not_supported"
+	MsgModelsUsage          MsgKey = "models_usage"
 	MsgReasoningCurrent      MsgKey = "reasoning_current"
 	MsgReasoningChanged      MsgKey = "reasoning_changed"
 	MsgReasoningNotSupported MsgKey = "reasoning_not_supported"
@@ -2307,6 +2309,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "當前 Agent 不支援模型切換。",
 		LangJapanese:           "このエージェントはモデルの切り替えをサポートしていません。",
 		LangSpanish:            "Este agente no soporta el cambio de modelo.",
+	},
+	MsgModelsNotSupported: {
+		LangEnglish:            "This agent does not report a model list.",
+		LangChinese:            "当前 Agent 不支持列出模型列表。",
+		LangTraditionalChinese: "當前 Agent 不支援列出模型列表。",
+		LangJapanese:           "このエージェントはモデル一覧を提供していません。",
+		LangSpanish:            "Este agente no informa una lista de modelos.",
+	},
+	MsgModelsUsage: {
+		LangEnglish:            "Copy a line and send it to switch models.",
+		LangChinese:            "复制其中一行发送即可切换模型。",
+		LangTraditionalChinese: "複製其中一行傳送即可切換模型。",
+		LangJapanese:           "いずれかの行をコピーして送信するとモデルを切り替えられます。",
+		LangSpanish:            "Copia una línea y envíala para cambiar de modelo.",
 	},
 	MsgReasoningCurrent: {
 		LangEnglish:            "Current reasoning effort: %s",

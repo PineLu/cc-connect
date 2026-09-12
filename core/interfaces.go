@@ -455,6 +455,44 @@ type ModelSwitcher interface {
 	AvailableModels(ctx context.Context) []ModelOption
 }
 
+// ModelLister is an optional interface for agents that can enumerate every
+// switchable model together with the provider each one belongs to. Unlike
+// ModelSwitcher.AvailableModels, which returns a flat list meant for the /model
+// picker, ListModelsDetail preserves the provider grouping a multi-provider
+// agent needs and is expected to work without contacting the network (so it
+// still answers while the currently selected model is unreachable).
+//
+// The engine uses it for the /models command. Agents that also implement
+// ModelLister are preferred over the ModelSwitcher fallback; agents that do not
+// still get a reasonable answer when they implement ModelSwitcher.
+type ModelLister interface {
+	ListModelsDetail(ctx context.Context) []ModelDetail
+}
+
+// ModelDetail is one switchable model together with the routing information
+// needed to build a copy-pasteable switch command.
+type ModelDetail struct {
+	// Name is the model identifier as the agent expects it.
+	Name string
+	// Provider is the agent's provider slug, empty when the agent has a single
+	// implicit provider.
+	Provider string
+	// ProviderLabel is a human-readable provider name for display; falls back
+	// to Provider when empty.
+	ProviderLabel string
+	// CustomProvider marks a user-defined endpoint, which must be addressed as
+	// "custom:<Provider>:<Name>" rather than "<Provider>:<Name>".
+	CustomProvider bool
+	// SwitchCommand is the command the user can copy to select this model,
+	// formatted for the agent's own switch syntax (e.g. "/model provider:name").
+	SwitchCommand string
+	// Note carries an optional caveat for this model (e.g. cache-only, switch
+	// unconfirmed).
+	Note string
+	// Current marks the model the agent currently has selected.
+	Current bool
+}
+
 // ReasoningEffortSwitcher is an optional interface for agents that support
 // runtime switching of reasoning effort.
 type ReasoningEffortSwitcher interface {
