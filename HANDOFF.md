@@ -1,21 +1,28 @@
 # HANDOFF — cc-connect
 
-更新时间：2026-09-11。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
+更新时间：2026-09-12。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
 
 ## 当前目标
-1. **【已修复并上线】问题 A**：Hermes(ACP) 长任务结束后「最终回复在飞书发两遍」。三层修复 + 回归测试完成，已上线（提交 `6157c133`）。
-2. **【已部署·待实测】问题 B**（已提交 `aba8824c`）：ACP 状态行 `in` 显示会话累计值（in 21.1M 超 1M 窗口）。
+1. **【已提交·未验证未部署】`/models` 内置命令**（提交 `d96e5972`，10 文件 +969/−14）：
+   `core/interfaces.go` 新增 `ModelLister`/`ModelDetail`；`core/engine.go` 内置 `/models`
+   （卡片下拉选中直切，无卡片平台降级文本）；`agent/acp/model_list.go` 读 Hermes
+   profile 配置+缓存（离线可用）；`agent/claudecode` 包 `AvailableModels()`；footer
+   切后即时刷新（`acpSession.SetModel`）；`runForwardedCommand` 改返回 `(string,error)`。
+   回归测试 3 项全绿。**二进制尚未编译部署**（当前运行仍是 16:13 版），已 push（2026-09-13）。
+   详见知识库 `cc-connect-knowledge.md` §十二。
+2. **【已修复并上线】问题 A**：Hermes(ACP) 长任务结束后「最终回复在飞书发两遍」。三层修复 + 回归测试完成，已上线（提交 `6157c133`）。
+3. **【已部署·待实测】问题 B**（已提交 `aba8824c`）：ACP 状态行 `in` 显示会话累计值（in 21.1M 超 1M 窗口）。
    修复方式：`ContextUsage` 加 `CumulativeInputTokens` 标记，ACP 置位，footer 的 `in` 改用 `UsedTokens`、`cw/cr` 省略。
    **已编译 arm64 并重启部署（PID 7830，2026-09-10 23:14:02 启动）**，待飞书给 hermes-tujia 发长任务消息实测。
-3. **【已部署·已提交】`stripModelFillerLines` 过滤**（`53fc21ea` + 注释修复 `d7adf66a`，与问题 B 同一次部署）：
+4. **【已部署·已提交】`stripModelFillerLines` 过滤**（`53fc21ea` + 注释修复 `d7adf66a`，与问题 B 同一次部署）：
    部分模型（实测 muse-spark / provider=opencode-free，低频偶发）在 tool call 间吐 U+25FC "◼" 进度符号，污染飞书可见消息。
    过滤纯 ◼ 行（入口 `buildReplyContent`、`buildCardJSON`），日志/存档保留原始内容。
    **注意**：当前日志里能查到的 6 个 ◼ 均为用户自己发的飞书消息原文（2026-09-09 讨论本问题时的发言），不是模型输出残留；
    新二进制上线后再出现泄漏才算真触发。
-4. 工作区干净，**未 push**（等用户指令）。
+5. 工作区干净，本轮改动随 `feat/strip-model-filler` 已 push（2026-09-13）。
 
 ## 当前分支
-`feat/strip-model-filler`（本波为它建的）。`sync-upstream-0905` 仍在本地保留。两个分支均**未 push**。
+`feat/strip-model-filler`（本波为它建的）。`sync-upstream-0905` 仍在本地保留。两个分支均**已 push**（2026-09-13）。
 
 ## 当前 commit
 - HEAD=`96d2a0ee`。本波 4 个提交：
@@ -66,9 +73,8 @@
   - ◼ 过滤：回复中不再出现纯 ◼ 行。
 - 短消息可能触发不到累计虚高，需真实长 turn。
 
-### 2. 推送 / 仓库卫生（待用户指令）
-- 4 个提交均在本地 `feat/strip-model-filler`，未 push。
-- 待定：是推 `feat/strip-model-filler`、还是合回 `sync-upstream-0905`、还是按原计划拆更细的 commit。
+### 2. 推送 / 仓库卫生（2026-09-13 已 push）
+- 本地提交均已推远端（`feat/strip-model-filler` + `sync-upstream-0905`）。
 - **切勿 `git add cc-connect-arm64*`**（二进制不入库，已在 .gitignore）。
 - 清理二进制备份 `cc-connect-arm64.bak-*`（确认新版稳定后）。
 
