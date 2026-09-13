@@ -3225,7 +3225,10 @@ func extractInteractiveCardText(content string) string {
 	}
 
 	var parts []string
-	walkCardValue(v, &parts)
+	unpaired := walkCardValue(v, &parts)
+	// Anything still unpaired at the top level has no sibling text anywhere
+	// in the card — append bare so the link survives instead of being dropped.
+	parts = append(parts, unpaired...)
 
 	if len(parts) == 0 {
 		return "[interactive card]"
@@ -3240,10 +3243,16 @@ func extractInteractiveCardText(content string) string {
 // Markdown links [text](url). This handles Feishu card v2 raw_card_content
 // format where links are not inlined in the markdown content string but
 // stored in dedicated fields.
-func walkCardValue(v any, parts *[]string) {
+//
+// Orphan action URLs (e.g. {"type":"open_url","action":{"url":...}}) whose
+// visible label lives in a sibling node bubble up as the return value when
+// the current scope has no linkable text; each ancestor scope gets a chance
+// to pair them before they fall back to bare URLs at the top level.
+func walkCardValue(v any, parts *[]string) []string {
 	switch x := v.(type) {
 	case map[string]any:
 		startIdx := len(*parts)
+		var orphanURLs []string
 		for k, val := range x {
 			lk := strings.ToLower(k)
 			switch lk {
@@ -3252,15 +3261,90 @@ func walkCardValue(v any, parts *[]string) {
 					*parts = append(*parts, strings.TrimSpace(s))
 				}
 			}
-			walkCardValue(val, parts)
+			before := len(*parts)
+			childUnpaired := walkCardValue(val, parts)
+			orphanURLs = append(orphanURLs, childUnpaired...)
+			// Sibling pairing: an action-only child (e.g.
+			// {"type":"open_url","action":{"url":...}}) produces no text
+			// segments of its own — the visible label ("报警链接") lives
+			// in a sibling text node. Without this, the URL is silently
+			// dropped because applyCardLinks only fires when the SAME map
+			// produced text. Skip the direct extract when the child
+			// already bubbled its URL up (avoids double counting).
+			if len(*parts) == before && len(childUnpaired) == 0 {
+				if child, ok := val.(map[string]any); ok {
+					if u := extractOrphanActionURL(child); u != "" {
+						orphanURLs = append(orphanURLs, u)
+					}
+				}
+			}
 		}
 		endIdx := len(*parts)
 		applyCardLinks(x, parts, startIdx, endIdx)
+		return pairOrphanActionURLs(parts, startIdx, orphanURLs)
 	case []any:
+		var unpaired []string
 		for _, item := range x {
-			walkCardValue(item, parts)
+			unpaired = append(unpaired, walkCardValue(item, parts)...)
+		}
+		return unpaired
+	}
+	return nil
+}
+
+// extractOrphanActionURL extracts a URL from an action-only child node that
+// produced no text segments, e.g. {"type":"open_url","action":{"url":...}}.
+// Nodes that produced their own text are handled by applyCardLinks and must
+// not reach here (the caller guarantees zero new segments).
+func extractOrphanActionURL(child map[string]any) string {
+	if u, ok := child["url"]; ok {
+		if url := extractURLFromLinkValue(u); url != "" {
+			return url
 		}
 	}
+	if mu, ok := child["multi_url"]; ok {
+		if url := extractURLFromLinkValue(mu); url != "" {
+			return url
+		}
+	}
+	if action, ok := child["action"].(map[string]any); ok {
+		if u, ok := action["url"]; ok {
+			if url := extractURLFromLinkValue(u); url != "" {
+				return url
+			}
+		}
+		if mu, ok := action["multi_url"]; ok {
+			if url := extractURLFromLinkValue(mu); url != "" {
+				return url
+			}
+		}
+	}
+	return ""
+}
+
+// pairOrphanActionURLs attaches orphan action URLs (collected from text-less
+// sibling nodes) to text segments produced by sibling nodes within the same
+// map scope. Each URL rewrites the last not-yet-linked segment in
+// parts[startIdx:]; URLs with no linkable segment are returned so the caller
+// can bubble them up to an ancestor scope (or fall back to bare URLs at the
+// top level) instead of silently dropping them.
+func pairOrphanActionURLs(parts *[]string, startIdx int, urls []string) []string {
+	var unpaired []string
+	for _, url := range urls {
+		paired := false
+		for i := len(*parts) - 1; i >= startIdx; i-- {
+			if strings.Contains((*parts)[i], "](") {
+				continue
+			}
+			(*parts)[i] = "[" + (*parts)[i] + "](" + url + ")"
+			paired = true
+			break
+		}
+		if !paired {
+			unpaired = append(unpaired, url)
+		}
+	}
+	return unpaired
 }
 
 // applyCardLinks resolves hyperlink fields on a card element and rewrites

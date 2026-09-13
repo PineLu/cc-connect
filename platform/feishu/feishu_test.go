@@ -2367,6 +2367,51 @@ func TestExtractInteractiveCardText_MultipleURLObjects(t *testing.T) {
 	}
 }
 
+// TestExtractInteractiveCardText_SiblingActionURL verifies the shape used by
+// real watcher alarm cards (2026-09-13 ta_has_order): the visible label and
+// the open_url action live in SIBLING nodes —
+// {"elements":[{"content":"报警链接"},{"type":"open_url","action":{"url":...}}]}.
+// Before the fix, the action node produced zero text segments, applyCardLinks
+// early-returned, and the URL was silently dropped.
+func TestExtractInteractiveCardText_SiblingActionURL(t *testing.T) {
+	card := `{
+		"elements": [
+			{"content": "2026-09-13 17:46:17，名称：ta_has_order 猫途鹰有单了"},
+			{"tag": "button", "property": {
+				"text": {"tag": "plain_text", "property": {"content": "报警链接"}},
+				"actions": [{"type": "open_url", "action": {"url": "https://opsai.cn/d7sULM"}}]
+			}},
+			{"tag": "button", "property": {
+				"text": {"tag": "plain_text", "property": {"content": "aio时间线"}},
+				"actions": [{"type": "open_url", "action": {"url": "https://aio.corp.qunar.com/action?event_id=xxx", "pcURL": "https://pc.example.com/yyy"}}]
+			}}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	for _, want := range []string{
+		"[报警链接](https://opsai.cn/d7sULM)",
+		"[aio时间线](https://aio.corp.qunar.com/action?event_id=xxx)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, got)
+		}
+	}
+}
+
+// TestExtractInteractiveCardText_OrphanURLFallback verifies that an action URL
+// with no linkable sibling text is appended bare instead of being dropped.
+func TestExtractInteractiveCardText_OrphanURLFallback(t *testing.T) {
+	card := `{
+		"elements": [
+			{"type": "open_url", "action": {"url": "https://example.com/lonely"}}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "https://example.com/lonely") {
+		t.Errorf("expected bare URL to be preserved, got:\n%s", got)
+	}
+}
+
 func TestFormatQuotedEcho(t *testing.T) {
 	t.Run("single quote", func(t *testing.T) {
 		in := "[Quoted message from 卢松林]:\n雷达P1报警 body\n\n"
