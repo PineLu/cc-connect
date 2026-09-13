@@ -2377,13 +2377,21 @@ func TestExtractInteractiveCardText_SiblingActionURL(t *testing.T) {
 	card := `{
 		"elements": [
 			{"content": "2026-09-13 17:46:17，名称：ta_has_order 猫途鹰有单了"},
-			{"tag": "button", "property": {
-				"text": {"tag": "plain_text", "property": {"content": "报警链接"}},
-				"actions": [{"type": "open_url", "action": {"url": "https://opsai.cn/d7sULM"}}]
-			}},
-			{"tag": "button", "property": {
-				"text": {"tag": "plain_text", "property": {"content": "aio时间线"}},
-				"actions": [{"type": "open_url", "action": {"url": "https://aio.corp.qunar.com/action?event_id=xxx", "pcURL": "https://pc.example.com/yyy"}}]
+			{"tag": "column_set", "property": {
+				"columns": [
+					{"tag": "column", "property": {
+						"elements": [
+							{"tag": "button", "property": {
+								"text": {"tag": "plain_text", "property": {"content": "报警链接"}},
+								"actions": [{"type": "open_url", "action": {"url": "https://opsai.cn/d7sULM"}}]
+							}},
+							{"tag": "button", "property": {
+								"text": {"tag": "plain_text", "property": {"content": "aio时间线"}},
+								"actions": [{"type": "open_url", "action": {"url": "https://aio.corp.qunar.com/action?event_id=xxx", "pcURL": "https://pc.example.com/yyy"}}]
+							}}
+						]
+					}}
+				]
 			}}
 		]
 	}`
