@@ -1,6 +1,6 @@
 # HANDOFF — cc-connect
 
-更新时间：2026-09-12。仓库：origin=kleinlsl/cc-connect（fork），upstream=chenhg5/cc-connect（主仓库）。
+更新时间：2026-09-13。仓库：origin=kleinlsl/cc-connect（fork，已迁往 PineLu/cc-connect，push 有重定向提醒但可用），upstream=chenhg5/cc-connect（主仓库）。
 
 ## 当前目标
 1. **【已提交·未验证未部署】`/models` 内置命令**（提交 `d96e5972`，10 文件 +969/−14）：
@@ -19,13 +19,22 @@
    过滤纯 ◼ 行（入口 `buildReplyContent`、`buildCardJSON`），日志/存档保留原始内容。
    **注意**：当前日志里能查到的 6 个 ◼ 均为用户自己发的飞书消息原文（2026-09-09 讨论本问题时的发言），不是模型输出残留；
    新二进制上线后再出现泄漏才算真触发。
-5. 工作区干净，本轮改动随 `feat/strip-model-filler` 已 push（2026-09-13）。
+5. 工作区干净。**【已上线】sync-upstream-0913**（提交 `3de24d79`，12 文件 +1426/−70，已推远端，已编译部署）：
+   上游 3 commit（`3a6534d5` 飞书回执 reaction + `312144c2` codex stdio + `757b4df0` cron 睡眠钳制）。
+   `feishu.go` 1 文件冲突（replyContext 结构体 + dispatch 入口），解法：字段全保留，dispatch 经新增
+   `dispatchWithReceiptAck` 让文本 ack 与 reaction 共存；`sendAckAndGetThreadID` 加 `client nil` 保护。
+   上游 receipt 测试 13 FAIL + 1 hang：根因是分支文本 ack 同步发 reply，抢了 mock 的一次性 `close(started)`；
+   修法是 mock 加 reply 路径放行（5 处，`receipt_ack_test.go`），产品逻辑不动。全量 `go test ./platform/feishu/...` 绿（65s）。
+   线上 hermes-tujia 已配 `ack_emoji = "Get"`，回执 reaction 飞书实测生效。
 
 ## 当前分支
-`feat/strip-model-filler`（本波为它建的）。`sync-upstream-0905` 仍在本地保留。两个分支均**已 push**（2026-09-13）。
+`sync-upstream-0913`（本次 sync 分支，HEAD=`3de24d79`，已 push）。`feat/strip-model-filler`、`sync-upstream-0905`、`main` 均已 push（2026-09-13）。
 
 ## 当前 commit
-- HEAD=`96d2a0ee`。本波 4 个提交：
+- HEAD=`3de24d79`（`sync-upstream-0913`）。本波新增：
+  - `1603e948` docs: HANDOFF push 状态同步（`feat/strip-model-filler` 上）
+  - `3de24d79` merge: upstream/main 2026-09-13（12 文件，receipt reaction + codex stdio + cron sleep）
+- 之前：HEAD=`96d2a0ee`。本波 4 个提交：
   - `aba8824c` fix(acp): 状态行 in 改用上下文占用（问题 B，6 文件 +213/−18）
   - `d7adf66a` docs(feishu): stripModelFillerLines 注释断句笔误修复
   - `53fc21ea` feat(feishu): 过滤模型进度符号 ◼ 纯符号行（feishu.go +37 / feishu_test.go +30）
@@ -74,7 +83,8 @@
 - 短消息可能触发不到累计虚高，需真实长 turn。
 
 ### 2. 推送 / 仓库卫生（2026-09-13 已 push）
-- 本地提交均已推远端（`feat/strip-model-filler` + `sync-upstream-0905`）。
+- 本地提交均已推远端（`sync-upstream-0913` + `feat/strip-model-filler` + `sync-upstream-0905` + `main`）。
+- GitHub 提醒 origin 已迁移 `kleinlsl/cc-connect` → `PineLu/cc-connect`，当前 remote 仍可用（重定向），空闲时可改 remote URL。
 - **切勿 `git add cc-connect-arm64*`**（二进制不入库，已在 .gitignore）。
 - 清理二进制备份 `cc-connect-arm64.bak-*`（确认新版稳定后）。
 
@@ -91,6 +101,10 @@ grep "is running" ~/.cc-connect/logs/cc-connect.log   # projects=3
 ```
 
 ## 验证结果
+- **2026-09-13（sync-upstream-0913，已上线）**：main fast-forward 同步上游 3 commit 无冲突；
+  `feishu.go` 冲突解完 `go build ./...` + `go vet` + `gofmt` 全干净；`go test ./core/...` 绿（19.7s）；
+  `go test ./platform/feishu/...` 全绿（65s，含上游新增 receipt 7 用例）；交叉编译 arm64（50.3M）
+  原子替换后重启，16:24:39 `cc-connect is running`，projects=3；hermes-tujia 配 `ack_emoji="Get"` 后飞书回执 reaction 实测生效。
 - **2026-09-10（本波）**：`go build ./...` OK；`gofmt` 仅动过文件干净；`go test ./core/ ./agent/acp/ -count=1` 全绿；
   `go test ./platform/feishu/ -run TestStripModelFillerLines` 通过。交叉编译 arm64 成功（47.7M，Mach-O arm64），
   原子替换后重启，PID 7830，23:14:02 `cc-connect is running`，飞书消息正常接收处理。
