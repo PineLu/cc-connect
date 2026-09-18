@@ -9,10 +9,10 @@
 
 1. [仓库关系](#1-仓库关系)
 2. [同步上游仓库到 Fork](#2-同步上游仓库到-fork)
-3. [合并上游更新到开发分支](#3-合并上游更新到开发分支)
+3. [合并上游更新到维护分支](#3-合并上游更新到维护分支)
 4. [修复合并冲突](#4-修复合并冲突)
 5. [编译与运行](#5-编译与运行)
-6. [当前开发分支功能说明](#6-当前开发分支功能说明)
+6. [当前维护分支功能说明](#6-当前维护分支功能说明)
 7. [常用命令速查](#7-常用命令速查)
 
 ---
@@ -20,16 +20,16 @@
 ## 1. 仓库关系
 
 ```
-上游仓库 (upstream)     你的 Fork (origin)          本地开发分支
-chenhg5/cc-connect  →  kleinlsl/cc-connect  →  feat/card-message-and-thread-session
+上游仓库 (upstream)     你的 Fork (origin)          当前维护分支
+chenhg5/cc-connect  →  PineLu/cc-connect     →  sync-upstream-0913
      ↑                      ↑                          ↑
-   官方代码              同步后的 fork              魔改 + 合并上游
+   官方代码              个人 Fork                 魔改 + 上游同步验证
 ```
 
 **远程仓库配置：**
 
 ```bash
-origin    git@github.com:kleinlsl/cc-connect.git      # 你的 fork
+origin    git@github.com:PineLu/cc-connect.git        # 你的 fork
 upstream  git@github.com:chenhg5/cc-connect.git       # 上游官方
 ```
 
@@ -65,27 +65,62 @@ git push origin main
 
 ---
 
-## 3. 合并上游更新到开发分支
+## 3. 合并上游更新到维护分支
 
-### 3.1 切到开发分支
+当前已验证并部署的同步分支为：
 
-```bash
-git checkout feat/card-message-and-thread-session
+```text
+sync-upstream-0913
 ```
 
-### 3.2 合并上游 main
+后续同步建议不要直接在已部署分支上继续堆叠，而是每次创建新的日期分支，例如 `sync-upstream-0918`。
+
+### 3.1 更新 main
 
 ```bash
+git fetch upstream
+git checkout main
 git merge upstream/main
+git push origin main
+```
+
+### 3.2 从当前维护分支创建新的同步分支
+
+```bash
+git checkout sync-upstream-0913
+git pull origin sync-upstream-0913
+
+# 示例：2026-09-18 同步
+git checkout -b sync-upstream-0918
+```
+
+> 如果后续已有更新的已验证同步分支，应从“最新已验证分支”创建，而不是固定从 `sync-upstream-0913` 创建。
+
+### 3.3 合并最新 main
+
+```bash
+git merge main
 ```
 
 如果出现冲突，需要手动解决（见第 4 节）。
 
-### 3.3 推送到 Fork
+### 3.4 完整验证
 
 ```bash
-git push origin feat/card-message-and-thread-session
+gofmt -w <本次修改的 Go 文件>
+go build ./...
+go vet ./...
+go test ./core/... -count=1
+go test ./platform/feishu/... -count=1
 ```
+
+### 3.5 推送新的同步分支
+
+```bash
+git push -u origin sync-upstream-0918
+```
+
+确认编译、测试、飞书实测均通过后，再把该分支作为新的维护基线。
 
 ---
 
@@ -262,11 +297,13 @@ launchctl load ~/Library/LaunchAgents/com.cc-connect.service.plist
 
 ---
 
-## 6. 当前开发分支功能说明
+## 6. 当前维护分支功能说明
 
-**分支名：** `feat/card-message-and-thread-session`
+**当前维护分支：** `sync-upstream-0913`
 
-**基于：** upstream/main (2026-08-27) + 自定义魔改
+**当前状态：** 已推送、已编译、已部署，飞书回执 reaction 已实测通过。
+
+**基线：** upstream/main（同步至 2026-09-13）+ 自定义魔改
 
 ### 6.1 核心功能
 
@@ -348,6 +385,18 @@ allow_p2p_from = "user_id_1,user_id_2"
 
 ---
 
+### 6.4 sync-upstream-0913 已验证内容
+
+- 合并上游飞书回执 reaction、Codex stdio、cron 睡眠恢复相关更新
+- 保留现有 Thread 隔离、ACK、allow_p2p_from、threadIDAliases 等自定义逻辑
+- `go build ./...`、`go vet ./...`、`go test ./core/...`、`go test ./platform/feishu/...` 已通过
+- macOS arm64 二进制已重新编译并通过 launchd 部署
+- 飞书 ACK/reaction 已在线验证
+
+> 历史同步分支 `sync-upstream-0805`、`sync-upstream-0827`、`sync-upstream-0905` 保留用于追溯，不再作为新的同步起点。
+
+---
+
 ## 7. 常用命令速查
 
 ```bash
@@ -355,12 +404,16 @@ allow_p2p_from = "user_id_1,user_id_2"
 git fetch upstream
 git checkout main && git merge upstream/main && git push origin main
 
-# ========== 合并到开发分支 ==========
-git checkout feat/card-message-and-thread-session
-git merge sync-upstream-0827
+# ========== 创建新的同步分支（示例：2026-09-18） ==========
+git checkout sync-upstream-0913
+git pull origin sync-upstream-0913
+git checkout -b sync-upstream-0918
+git merge main
+
 # 解决冲突后：
-git add -A && git commit -m "merge: 合并 upstream/main"
-git push origin feat/card-message-and-thread-session
+git add -A
+git commit -m "merge: upstream/main 2026-09-18"
+git push -u origin sync-upstream-0918
 
 # ========== 编译 ==========
 cd ~/tujia_workspace/cc-connect
