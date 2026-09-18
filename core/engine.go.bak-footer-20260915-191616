@@ -5956,7 +5956,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir, turnStart); status != "" {
 					statusFooter = status
-				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext, turnStart); footer != "" {
+				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext); footer != "" {
 					statusFooter = footer
 					legacyStatusFooter = footer
 				}
@@ -7451,75 +7451,9 @@ func (e *Engine) commandWorkDir(agent Agent, msg *Message) string {
 	return ""
 }
 
-// buildFooterTemplateData assembles the placeholder values for a custom footer
-// template from whatever context is available on the legacy (non-statusline)
-// footer path. Fields that cannot be derived are left empty so the template's
-// own {{if}} guards can skip them.
-//
-// contextLeft is the legacy status text (e.g. "[ctx: ~7%]" or "100% left"); it
-// is used as a fallback source for {{.Ctx}} when the session exposes no real
-// context usage.
-func (e *Engine) buildFooterTemplateData(session AgentSession, agent Agent, workspaceDir, contextLeft string, turnStart time.Time) footerTemplateData {
-	data := footerTemplateData{
-		Model:   strings.TrimSpace(replyFooterModel(session, agent)),
-		Effort:  strings.TrimSpace(replyFooterReasoningEffort(session, agent)),
-		Workdir: replyFooterWorkDir(session, agent, workspaceDir),
-	}
-	if !turnStart.IsZero() {
-		data.Elapsed = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang())
-	}
-
-	usage := replyFooterSessionContextUsage(session)
-	if usage == nil || usage.ContextWindow <= 0 {
-		// No real usage data: fall back to the self-reported "[ctx: ~N%]" marker
-		// so a template that only asks for {{.Ctx}} still renders a value.
-		if v := parseSelfReportedCtx(contextLeft); v > 0 {
-			data.Ctx = fmt.Sprintf("%d", v)
-		}
-		return data
-	}
-
-	used := usage.UsedTokens
-	if used <= 0 && !usage.CumulativeInputTokens {
-		// Only Anthropic-style disjoint buckets are safe to sum as a fallback;
-		// on the cumulative path they are running totals (see ContextUsage).
-		used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
-	}
-	pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
-	if pct < 0 {
-		pct = 0
-	}
-	if pct > 100 {
-		pct = 100
-	}
-	data.Ctx = fmt.Sprintf("%d", pct)
-	data.Out = formatStatusTokenCount(usage.OutputTokens)
-	data.In = formatStatusTokenCount(usage.InputTokens)
-	data.CW = formatStatusTokenCount(usage.CacheCreationInputTokens)
-	data.CR = formatStatusTokenCount(usage.CachedInputTokens)
-	if usage.CumulativeInputTokens {
-		// Cumulative counters would overstate the current request; report the
-		// same honest per-request figure that ctx% uses and drop cw/cr.
-		data.In = formatStatusTokenCount(usage.UsedTokens)
-		data.CW, data.CR = "", ""
-	}
-	return data
-}
-
-func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string, turnStart time.Time) string {
+func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string) string {
 	if !e.replyFooterEnabled || agent == nil {
 		return ""
-	}
-
-	// A user-supplied footer template takes precedence over the built-in legacy
-	// format: when configured, it fully defines the footer and its own {{if}}
-	// guards decide which fields appear. Rendering failure (or an empty result)
-	// falls through to the legacy format below, matching the graceful
-	// degradation used by buildClaudeStatusLineFooter.
-	if e.footerTemplate != "" {
-		if s := e.renderFooterTemplate(e.buildFooterTemplateData(session, agent, workspaceDir, contextLeft, turnStart)); s != "" {
-			return s
-		}
 	}
 
 	var parts []string

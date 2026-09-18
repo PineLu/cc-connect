@@ -3399,6 +3399,29 @@ func applyCardLinks(x map[string]any, parts *[]string, startIdx, endIdx int) {
 			(*parts)[lastIdx] = "[" + lastText + "](" + elemURL + ")"
 		}
 	}
+
+	// 3. URLs in nested actions array (Feishu button/column_set elements
+	//    with property.actions[].action.url). Pair each URL with the last
+	//    not-yet-linked text segment.
+	if actionsRaw, ok := x["actions"]; ok {
+		if actions, ok := actionsRaw.([]any); ok {
+			for _, a := range actions {
+				if actionMap, ok := a.(map[string]any); ok {
+					if action, ok := actionMap["action"].(map[string]any); ok {
+						if u, ok := action["url"].(string); ok && u != "" {
+							for i := endIdx - 1; i >= startIdx; i-- {
+								if strings.Contains((*parts)[i], "](") {
+									continue
+								}
+								(*parts)[i] = "[" + (*parts)[i] + "](" + u + ")"
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // extractURLFromLinkValue extracts a URL string from a Feishu link value

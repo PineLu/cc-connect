@@ -383,7 +383,7 @@ func TestBuildReplyFooter_LegacyAllSegments(t *testing.T) {
 	e := newLegacyFooterEngine()
 	e.i18n = NewI18n(LangEnglish)
 	agent := &stubFooterAgent{model: "gpt-5.4", effort: "xhigh", workDir: "/tmp/ws"}
-	got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left")
+	got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left", time.Time{})
 	wantSubs := []string{"gpt-5.4", "xhigh", "100% left", "ws"}
 	for _, sub := range wantSubs {
 		if !strings.Contains(got, sub) {
@@ -418,7 +418,7 @@ func TestBuildReplyFooter_LegacyHidesContextSegments(t *testing.T) {
 	agent := &stubFooterAgent{model: "gpt-5.4", effort: "xhigh", workDir: "/tmp/ws"}
 	// With model/effort/contextLeft all suppressed, only cwd would remain —
 	// and a workdir-only footer is suppressed entirely (regression #701).
-	if got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left"); got != "" {
+	if got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left", time.Time{}); got != "" {
 		t.Errorf("legacy footer with show_context_indicator=false = %q, want empty (workdir-only suppressed)", got)
 	}
 }
@@ -428,7 +428,7 @@ func TestBuildReplyFooter_LegacyHidesWorkdirSegment(t *testing.T) {
 	e.SetShowWorkdirIndicator(false)
 	e.i18n = NewI18n(LangEnglish)
 	agent := &stubFooterAgent{model: "gpt-5.4", effort: "xhigh", workDir: "/tmp/ws"}
-	got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left")
+	got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left", time.Time{})
 	if got == "" {
 		t.Fatalf("legacy footer should still render line-1 segments")
 	}
@@ -447,7 +447,7 @@ func TestBuildReplyFooter_LegacyMasterToggleOff(t *testing.T) {
 	e.SetReplyFooterEnabled(false)
 	e.i18n = NewI18n(LangEnglish)
 	agent := &stubFooterAgent{model: "gpt-5.4", effort: "xhigh", workDir: "/tmp/ws"}
-	if got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left"); got != "" {
+	if got := e.buildReplyFooter(agent, nil, "/tmp/ws", "100% left", time.Time{}); got != "" {
 		t.Errorf("reply_footer=false must short-circuit, got %q", got)
 	}
 }
