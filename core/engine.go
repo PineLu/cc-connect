@@ -10434,8 +10434,11 @@ func (e *Engine) handleModelsCardAction(args, sessionKey string) *Card {
 
 	// ACP/command-driven agents (Hermes): forward the full switch command over
 	// the live session and report the running state; the agent's own reply
-	// carries the confirmation.
-	if passer, ok := e.agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+	// carries the confirmation. Resolve the agent for this session/workspace
+	// first; using e.agent here breaks multi-workspace projects whose bound
+	// workspace agent differs from the engine's global/default agent.
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
 		e.interactiveMu.Lock()
 		st := e.interactiveStates[interactiveKey]
 		if st == nil {
@@ -10463,7 +10466,6 @@ func (e *Engine) handleModelsCardAction(args, sessionKey string) *Card {
 		return e.renderModelSwitchingCard(target.SwitchCommand)
 	}
 
-	agent, sessions := e.sessionContextForKey(sessionKey)
 	if _, ok := agent.(ModelSwitcher); !ok {
 		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
 	}
