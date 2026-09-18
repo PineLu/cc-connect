@@ -120,6 +120,70 @@ func TestListModelsDetail_Hermes(t *testing.T) {
 	}
 }
 
+
+func TestListModelsDetail_MultipleCustomProvidersDoNotShareCache(t *testing.T) {
+	home := t.TempDir()
+	dir := hermesProfileDir(home, "tujia")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "model:\n" +
+		"  default: shared-model\n" +
+		"  provider: provider-b\n" +
+		"providers:\n" +
+		"  provider-a:\n" +
+		"    base_url: https://a.example/v1\n" +
+		"  provider-b:\n" +
+		"    base_url: https://b.example/v1\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := `{
+	  "custom:https://a.example/v1#aaa": {"at": 1789196822.1, "models": ["shared-model", "only-a"]},
+	  "custom:https://b.example/v1#bbb": {"at": 1789196823.1, "models": ["shared-model", "only-b"]}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, "provider_models_cache.json"), []byte(cache), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERMES_HOME", home)
+
+	agent, err := New(map[string]any{
+		"command": "sh",
+		"args":    []any{"-p", "tujia", "acp"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	got := agent.(core.ModelLister).ListModelsDetail(t.Context())
+
+	byCommand := map[string]core.ModelDetail{}
+	for _, d := range got {
+		byCommand[d.SwitchCommand] = d
+	}
+	for _, want := range []string{
+		"/model custom:provider-a:only-a",
+		"/model custom:provider-b:only-b",
+	} {
+		if _, ok := byCommand[want]; !ok {
+			t.Fatalf("missing %q; got %v", want, keysOf(byCommand))
+		}
+	}
+	for _, wrong := range []string{
+		"/model custom:provider-a:only-b",
+		"/model custom:provider-b:only-a",
+	} {
+		if _, ok := byCommand[wrong]; ok {
+			t.Fatalf("provider cache leaked across endpoints: unexpectedly found %q", wrong)
+		}
+	}
+	if byCommand["/model custom:provider-a:shared-model"].Current {
+		t.Fatal("provider-a shared model must not be marked current when provider-b is active")
+	}
+	if !byCommand["/model custom:provider-b:shared-model"].Current {
+		t.Fatal("provider-b shared model should be marked current")
+	}
+}
+
 func TestListModelsDetail_MissingProfile(t *testing.T) {
 	t.Setenv("HERMES_HOME", filepath.Join(t.TempDir(), "does-not-exist"))
 	agent, err := New(map[string]any{"command": "sh", "args": []any{"-p", "tujia", "acp"}})
