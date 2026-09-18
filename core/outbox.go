@@ -254,10 +254,34 @@ func (o *Outbox) Add(platform, sessionKey string, encodedReplyCtx []byte, body, 
 		NextAt:        now.Add(grace), // grace period so immediate send can Complete before sweep picks up
 	}
 	o.mu.Lock()
-	if err := os.MkdirAll(o.dir, 0o755); err == nil {
-		o.items[it.ID] = it
-		o.persistLocked(it)
+	if o.stopped {
+		o.mu.Unlock()
+		return ""
 	}
+	if err := os.MkdirAll(o.dir, 0o755); err != nil {
+		o.mu.Unlock()
+		slog.Error("outbox: create directory failed; reliable delivery unavailable",
+			"dir", o.dir, "platform", platform, "session", sessionKey, "error", err)
+		return ""
+	}
+	// Persist before publishing the item in memory. Returning a non-empty id
+	// promises the caller that outbox durability is active; if the first write
+	// fails (permissions/disk-full/etc.), report failure instead of leaving an
+	// in-memory-only item that will disappear on restart.
+	b, err := json.Marshal(it)
+	if err != nil {
+		o.mu.Unlock()
+		slog.Error("outbox: encode item failed; reliable delivery unavailable",
+			"platform", platform, "session", sessionKey, "error", err)
+		return ""
+	}
+	if err := AtomicWriteFile(it.file(o.dir), b, 0o600); err != nil {
+		o.mu.Unlock()
+		slog.Error("outbox: initial persist failed; reliable delivery unavailable",
+			"id", it.ID, "dir", o.dir, "platform", platform, "session", sessionKey, "error", err)
+		return ""
+	}
+	o.items[it.ID] = it
 	o.mu.Unlock()
 	o.Kick()
 	slog.Debug("outbox: final reply parked for immediate send",
