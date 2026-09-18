@@ -16,6 +16,43 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
+
+func TestApplyCardLinks_NestedActionsPreserveOrder(t *testing.T) {
+	parts := []string{"按钮A", "按钮B"}
+	node := map[string]any{
+		"actions": []any{
+			map[string]any{"action": map[string]any{"url": "https://a.example"}},
+			map[string]any{"action": map[string]any{"url": "https://b.example"}},
+		},
+	}
+
+	applyCardLinks(node, &parts, 0, len(parts))
+
+	if got, want := parts[0], "[按钮A](https://a.example)"; got != want {
+		t.Fatalf("parts[0] = %q, want %q", got, want)
+	}
+	if got, want := parts[1], "[按钮B](https://b.example)"; got != want {
+		t.Fatalf("parts[1] = %q, want %q", got, want)
+	}
+}
+
+func TestApplyCardLinks_NestedActionsSupportsMultiURL(t *testing.T) {
+	parts := []string{"打开"}
+	node := map[string]any{
+		"actions": []any{
+			map[string]any{"action": map[string]any{
+				"multi_url": map[string]any{"url": "https://multi.example"},
+			}},
+		},
+	}
+
+	applyCardLinks(node, &parts, 0, len(parts))
+
+	if got, want := parts[0], "[打开](https://multi.example)"; got != want {
+		t.Fatalf("parts[0] = %q, want %q", got, want)
+	}
+}
+
 func TestOnMessageRecalledDispatchesCoreRecallMessage(t *testing.T) {
 	got := make(chan *core.Message, 1)
 	p := &Platform{
