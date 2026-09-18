@@ -455,6 +455,12 @@ type stubStrictModelAgent struct {
 	calls  int
 }
 
+type stubCommandModelAgent struct {
+	stubModelModeAgent
+}
+
+func (a *stubCommandModelAgent) ModelCommand() string { return "/model" }
+
 type stubLiveModeSession struct {
 	stubAgentSession
 	modes []string
@@ -4693,6 +4699,40 @@ func TestCmdModel_DoesNotClaimSuccessWhenModelSaveFails(t *testing.T) {
 	}
 	if !strings.Contains(sent[0], "Failed to change model") {
 		t.Fatalf("reply = %q, want model change failure message", sent[0])
+	}
+}
+
+
+func TestHandleModelsCardAction_MultiWorkspaceUsesBoundAgentType(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	globalAgent := &stubCommandModelAgent{}
+	e := NewEngine("test", globalAgent, []Platform{p}, "", LangEnglish)
+
+	baseDir := t.TempDir()
+	bindingPath := filepath.Join(t.TempDir(), "bindings.json")
+	e.SetMultiWorkspace(baseDir, bindingPath)
+
+	wsDir := normalizeWorkspacePath(t.TempDir())
+	channelID := "C-models-card"
+	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
+
+	ws := e.workspacePool.GetOrCreate(wsDir)
+	wsAgent := &stubModelModeAgent{model: "old-model"}
+	ws.agent = wsAgent
+	ws.sessions = NewSessionManager("")
+
+	sessionKey := "feishu:" + channelID + ":u1"
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	e.interactiveStates[interactiveKey] = &interactiveState{
+		modelsList: &modelsListState{items: []ModelDetail{{Name: "new-model"}}},
+	}
+	e.interactiveMu.Unlock()
+
+	_ = e.handleModelsCardAction("switch 1", sessionKey)
+
+	if got := wsAgent.model; got != "new-model" {
+		t.Fatalf("workspace agent model = %q, want new-model; card action likely used global agent type", got)
 	}
 }
 
