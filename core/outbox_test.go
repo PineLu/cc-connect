@@ -21,6 +21,23 @@ func testOutboxCfg() OutboxConfig {
 	}
 }
 
+
+func TestOutbox_AddReturnsEmptyWhenInitialPersistFails(t *testing.T) {
+	parent := t.TempDir()
+	blocker := filepath.Join(parent, "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := NewOutbox(filepath.Join(blocker, "outbox"), testOutboxCfg())
+
+	if id := o.Add("feishu", "k", []byte(`{}`), "body", ""); id != "" {
+		t.Fatalf("Add returned %q, want empty when initial persistence fails", id)
+	}
+	if got := o.PendingCount(); got != 0 {
+		t.Fatalf("PendingCount = %d, want 0 after failed initial persistence", got)
+	}
+}
+
 func TestOutbox_AddAndCompleteRemovesFile(t *testing.T) {
 	dir := t.TempDir()
 	o := NewOutbox(dir, testOutboxCfg())
