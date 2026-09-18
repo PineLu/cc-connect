@@ -3401,24 +3401,37 @@ func applyCardLinks(x map[string]any, parts *[]string, startIdx, endIdx int) {
 	}
 
 	// 3. URLs in nested actions array (Feishu button/column_set elements
-	//    with property.actions[].action.url). Pair each URL with the last
-	//    not-yet-linked text segment.
+	//    with property.actions[].action.url). Preserve action/text ordering:
+	//    action[0] belongs to the first not-yet-linked text segment, action[1]
+	//    to the next, etc. Walking text backwards swaps links when a card has
+	//    multiple buttons.
 	if actionsRaw, ok := x["actions"]; ok {
 		if actions, ok := actionsRaw.([]any); ok {
+			nextText := startIdx
 			for _, a := range actions {
-				if actionMap, ok := a.(map[string]any); ok {
-					if action, ok := actionMap["action"].(map[string]any); ok {
-						if u, ok := action["url"].(string); ok && u != "" {
-							for i := endIdx - 1; i >= startIdx; i-- {
-								if strings.Contains((*parts)[i], "](") {
-									continue
-								}
-								(*parts)[i] = "[" + (*parts)[i] + "](" + u + ")"
-								break
-							}
-						}
-					}
+				actionMap, ok := a.(map[string]any)
+				if !ok {
+					continue
 				}
+				action, ok := actionMap["action"].(map[string]any)
+				if !ok {
+					continue
+				}
+				u := extractURLFromLinkValue(action["url"])
+				if u == "" {
+					u = extractURLFromLinkValue(action["multi_url"])
+				}
+				if u == "" {
+					continue
+				}
+				for nextText < endIdx && strings.Contains((*parts)[nextText], "](") {
+					nextText++
+				}
+				if nextText >= endIdx {
+					break
+				}
+				(*parts)[nextText] = "[" + (*parts)[nextText] + "](" + u + ")"
+				nextText++
 			}
 		}
 	}
