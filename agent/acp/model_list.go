@@ -49,14 +49,21 @@ func hermesProfileDir(home, profile string) string {
 	return filepath.Join(home, "profiles", profile)
 }
 
+type hermesProviderConfig struct {
+	DefaultModel string   `yaml:"default_model"`
+	API          string   `yaml:"api"`
+	BaseURL      string   `yaml:"base_url"`
+	URL          string   `yaml:"url"`
+	Models       []string `yaml:"models"`
+}
+
 type hermesModelConfig struct {
 	Model struct {
 		Default  string `yaml:"default"`
 		Provider string `yaml:"provider"`
+		BaseURL  string `yaml:"base_url"`
 	} `yaml:"model"`
-	Providers map[string]struct {
-		DefaultModel string `yaml:"default_model"`
-	} `yaml:"providers"`
+	Providers map[string]hermesProviderConfig `yaml:"providers"`
 	FallbackProviders []struct {
 		Provider string `yaml:"provider"`
 		Model    string `yaml:"model"`
@@ -66,6 +73,42 @@ type hermesModelConfig struct {
 type hermesModelCacheEntry struct {
 	At     float64  `json:"at"`
 	Models []string `json:"models"`
+}
+
+func normalizeHermesEndpoint(v string) string {
+	return strings.TrimRight(strings.TrimSpace(v), "/")
+}
+
+func hermesProviderEndpoint(p hermesProviderConfig) string {
+	for _, v := range []string{p.API, p.BaseURL, p.URL} {
+		if v = normalizeHermesEndpoint(v); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func customCacheEndpoint(key string) string {
+	if !strings.HasPrefix(key, "custom:") {
+		return ""
+	}
+	v := strings.TrimPrefix(key, "custom:")
+	if i := strings.LastIndex(v, "#"); i >= 0 {
+		v = v[:i]
+	}
+	return normalizeHermesEndpoint(v)
+}
+
+func hermesCurrentModel(cfg hermesModelConfig, providerName, providerEndpoint, model string) bool {
+	if model == "" || model != cfg.Model.Default {
+		return false
+	}
+	if cfg.Model.Provider == providerName {
+		return true
+	}
+	return cfg.Model.Provider == "custom" &&
+		normalizeHermesEndpoint(cfg.Model.BaseURL) != "" &&
+		normalizeHermesEndpoint(cfg.Model.BaseURL) == normalizeHermesEndpoint(providerEndpoint)
 }
 
 func beijingTime(ts float64) string {
@@ -118,29 +161,51 @@ func (a *Agent) ListModelsDetail(ctx context.Context) []core.ModelDetail {
 	var out []core.ModelDetail
 
 	// Custom (user-defined) endpoints carry the live /v1/models listing under
-	// the "custom:*" cache key.
-	var customModels []string
-	var customAt float64
+	// cache keys shaped like "custom:<endpoint>#<fingerprint>". Match those
+	// entries back to the named provider's configured endpoint instead of
+	// reusing the first custom cache entry for every provider.
+	customByEndpoint := make(map[string]hermesModelCacheEntry)
+	var singleCustom *hermesModelCacheEntry
+	customCount := 0
 	for key, entry := range cache {
-		if strings.HasPrefix(key, "custom:") {
-			customModels, customAt = entry.Models, entry.At
-			break
+		endpoint := customCacheEndpoint(key)
+		if endpoint == "" {
+			continue
 		}
+		customByEndpoint[endpoint] = entry
+		entryCopy := entry
+		singleCustom = &entryCopy
+		customCount++
 	}
-	for prov := range cfg.Providers {
+	for prov, providerCfg := range cfg.Providers {
 		prefix := "custom:" + prov
-		if len(customModels) > 0 {
-			for _, m := range customModels {
-				out = append(out, core.ModelDetail{
-					Name:           m,
-					Provider:       prov,
-					ProviderLabel:  prov + " 自定源",
-					CustomProvider: true,
-					SwitchCommand:  acpSwitchCommand(prefix, m),
-					Note:           "缓存 " + beijingTime(customAt),
-					Current:        m == cfg.Model.Default,
-				})
+		endpoint := hermesProviderEndpoint(providerCfg)
+		entry, ok := customByEndpoint[endpoint]
+		// Backward-compatible fallback for older/minimal Hermes configs that
+		// omit the endpoint: it is only safe when both sides are unambiguous.
+		if !ok && endpoint == "" && len(cfg.Providers) == 1 && customCount == 1 && singleCustom != nil {
+			entry = *singleCustom
+			ok = true
+		}
+		models := entry.Models
+		if !ok || len(models) == 0 {
+			// A declared static model list/default is still useful when model
+			// discovery is disabled or its cache is unavailable.
+			models = append([]string(nil), providerCfg.Models...)
+			if len(models) == 0 && providerCfg.DefaultModel != "" {
+				models = []string{providerCfg.DefaultModel}
 			}
+		}
+		for _, m := range models {
+			out = append(out, core.ModelDetail{
+				Name:           m,
+				Provider:       prov,
+				ProviderLabel:  prov + " 自定源",
+				CustomProvider: true,
+				SwitchCommand:  acpSwitchCommand(prefix, m),
+				Note:           func() string { if ok { return "缓存 " + beijingTime(entry.At) }; return "config 指定" }(),
+				Current:        hermesCurrentModel(cfg, prov, endpoint, m),
+			})
 		}
 	}
 
@@ -154,7 +219,7 @@ func (a *Agent) ListModelsDetail(ctx context.Context) []core.ModelDetail {
 			ProviderLabel:  fb.Provider,
 			SwitchCommand:  acpSwitchCommand(fb.Provider, fb.Model),
 			Note:           "fallback，config 指定",
-			Current:        fb.Model == cfg.Model.Default,
+			Current:        fb.Model == cfg.Model.Default && fb.Provider == cfg.Model.Provider,
 		})
 	}
 
@@ -173,7 +238,7 @@ func (a *Agent) ListModelsDetail(ctx context.Context) []core.ModelDetail {
 				ProviderLabel:  key,
 				SwitchCommand:  acpSwitchCommand(key, m),
 				Note:           "仅缓存有、config 未声明，能否切换不确定，缓存 " + beijingTime(entry.At),
-				Current:        m == cfg.Model.Default,
+				Current:        m == cfg.Model.Default && key == cfg.Model.Provider,
 			})
 		}
 	}
