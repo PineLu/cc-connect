@@ -1181,6 +1181,19 @@ func TestSessionManager_StopPersistenceFreezesFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected an initial persisted file: %v", err)
 	}
+
+	sm.StopPersistence()
+	sm.NewSession("u1", "second") // would normally rewrite; must be a no-op now
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("file must remain readable after StopPersistence: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("sessions.json changed after StopPersistence; saves should be frozen")
+	}
+	sm.StopPersistence() // idempotent
+}
+
 // TestSession_ForceUnlock covers the /stop path release (#1830): a held lock
 // is released unconditionally, the generation is bumped so the interrupted
 // turn's late Unlock is dropped, and ForceUnlock on an unlocked session is a
