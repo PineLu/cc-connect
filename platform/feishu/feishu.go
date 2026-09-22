@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -110,9 +109,67 @@ type replyContext struct {
 	messageID        string
 	chatID           string
 	sessionKey       string
+	threadID         string
+	replyInThread    bool
 	bootstrapThread  bool
 	receiptEmoji     string // persistent reaction owned by the accepted-message callback
 	receiptMessageID string
+}
+
+type replyResult struct {
+	messageID string
+	threadID  string
+}
+
+// replyContextDTO is the JSON-serializable form of replyContext used for the
+// core outbox (replyContext's fields are unexported, so it can't be marshaled
+// directly).
+type replyContextDTO struct {
+	MessageID       string `json:"message_id"`
+	ChatID          string `json:"chat_id"`
+	SessionKey      string `json:"session_key"`
+	ThreadID        string `json:"thread_id"`
+	ReplyInThread   bool   `json:"reply_in_thread"`
+	BootstrapThread bool   `json:"bootstrap_thread"`
+}
+
+// EncodeReplyCtx implements core.ReplyContextCodec for durable redelivery.
+func (p *Platform) EncodeReplyCtx(rctx any) ([]byte, error) {
+	rc, ok := rctx.(replyContext)
+	if !ok {
+		return nil, fmt.Errorf("%s: cannot encode reply context of type %T", p.tag(), rctx)
+	}
+	return json.Marshal(replyContextDTO{
+		MessageID:       rc.messageID,
+		ChatID:          rc.chatID,
+		SessionKey:      rc.sessionKey,
+		ThreadID:        rc.threadID,
+		ReplyInThread:   rc.replyInThread,
+		BootstrapThread: rc.bootstrapThread,
+	})
+}
+
+// DecodeReplyCtx implements core.ReplyContextCodec.
+func (p *Platform) DecodeReplyCtx(b []byte) (any, error) {
+	var d replyContextDTO
+	if err := json.Unmarshal(b, &d); err != nil {
+		return nil, fmt.Errorf("%s: decode reply context: %w", p.tag(), err)
+	}
+	return replyContext{
+		messageID:       d.MessageID,
+		chatID:          d.ChatID,
+		sessionKey:      d.SessionKey,
+		threadID:        d.ThreadID,
+		replyInThread:   d.ReplyInThread,
+		bootstrapThread: d.BootstrapThread,
+	}, nil
+}
+
+// IsRetryableSendError implements core.SendErrorClassifier. Only transient
+// network/transport failures warrant durable redelivery; permanent API errors
+// (e.g. bot removed from chat, invalid params, missing permission) do not.
+func (p *Platform) IsRetryableSendError(err error) bool {
+	return isTransientError(err)
 }
 
 type Platform struct {
@@ -130,11 +187,22 @@ type Platform struct {
 	allowFrom                  string
 	allowChat                  string
 	groupOnly                  bool
+	allowP2PFrom               string // comma-separated user IDs allowed in p2p when group_only=true
 	groupReplyAll              bool
 	respondToAtEveryoneAndHere bool
 	shareSessionInChannel      bool
 	threadIsolation            bool
-	groupChatHistoryShare      bool
+	// cardRequiresMention: when true, interactive (card) messages in a group must
+	// @mention the bot just like plain text — disables the default card auto-pass.
+	cardRequiresMention bool
+	// echoQuotedInThread: when true, a freshly created thread echoes the quoted
+	// parent content once, so the topic is self-contained and the human reader
+	// does not have to jump out to the original (often off-topic) message.
+	echoQuotedInThread    bool
+	groupChatHistoryShare bool
+	// ackShowSessionKey: when true (default), ack messages carry a "[session: ..]"
+	// footer; set ack_show_session_key=false to hide it.
+	ackShowSessionKey bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
 	resolveMentions  bool
@@ -186,6 +254,9 @@ type Platform struct {
 	// stale entries can be expired by a future TTL sweep if needed.
 	activeThreadSessions sync.Map // sessionKey -> time.Time
 
+	// Session key strategy: empty uses legacy thread_isolation/share_session_in_channel behavior.
+	// Explicit values: "hybrid" (group thread, p2p user), "user", "thread", or "chat".
+	sessionKeyStrategy string
 	// pendingGroupHistory keeps text/post messages that were observed in an
 	// allowed group chat without an explicit bot trigger. It is deliberately
 	// platform-local and in-memory: the next accepted agent turn consumes the
@@ -200,6 +271,13 @@ type Platform struct {
 	richCardImageFailed     map[string]struct{}
 	richCardImageUploadFunc func(context.Context, string) (string, error)
 
+	// ackThrottle tracks the last ack send time per session to avoid spam
+	ackThrottle sync.Map // sessionKey -> time.Time
+
+	// threadIDAliases maps Feishu message/root/parent IDs to the real thread_id
+	// returned by Reply API. It is only used for session routing, never for quote
+	// expansion.
+	threadIDAliases sync.Map // chatID:id -> threadID
 	// imageBatch coalesces consecutive image messages from the same session
 	// arriving within imageBatchWindow. Without this, sending N images in rapid
 	// succession from the Feishu mobile client (which posts each as a separate
@@ -366,6 +444,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	core.CheckAllowFrom(name, allowFrom)
 	allowChat, _ := opts["allow_chat"].(string)
 	groupOnly, _ := opts["group_only"].(bool)
+	allowP2PFrom, _ := opts["allow_p2p_from"].(string)
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	// require_mention = false is equivalent to group_reply_all = true:
 	// both mean "respond to all group messages without needing an @mention".
@@ -375,11 +454,32 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	respondToAtEveryoneAndHere, _ := opts["respond_to_at_everyone_and_here"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	threadIsolation, _ := opts["thread_isolation"].(bool)
+	cardRequiresMention, _ := opts["card_requires_mention"].(bool)
+	echoQuotedInThread, _ := opts["echo_quoted_in_thread"].(bool)
 	groupChatHistoryShare, _ := opts["group_chat_history_share"].(bool)
+	// The "[session: ..]" ack footer is shown by default; only an explicit
+	// ack_show_session_key=false turns it off.
+	ackShowSessionKey := true
+	if v, ok := opts["ack_show_session_key"].(bool); ok {
+		ackShowSessionKey = v
+	}
 	resolveMentionsOpt, _ := opts["resolve_mentions"].(bool)
 	noReplyToTrigger := false
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
 		noReplyToTrigger = true
+	}
+
+	// Empty preserves legacy thread_isolation/share_session_in_channel behavior.
+	sessionKeyStrategy := ""
+	if v, ok := opts["session_key_strategy"].(string); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "", "legacy":
+			sessionKeyStrategy = ""
+		case "hybrid", "user", "thread", "chat":
+			sessionKeyStrategy = strings.ToLower(strings.TrimSpace(v))
+		default:
+			return nil, fmt.Errorf("%s: invalid session_key_strategy %q (want legacy, hybrid, user, thread, or chat)", name, v)
+		}
 	}
 
 	peerBots := map[string]string{}
@@ -485,13 +585,18 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		allowFrom:                  allowFrom,
 		allowChat:                  allowChat,
 		groupOnly:                  groupOnly,
+		allowP2PFrom:               allowP2PFrom,
 		groupReplyAll:              groupReplyAll,
 		respondToAtEveryoneAndHere: respondToAtEveryoneAndHere,
 		shareSessionInChannel:      shareSessionInChannel,
 		threadIsolation:            threadIsolation,
+		cardRequiresMention:        cardRequiresMention,
+		echoQuotedInThread:         echoQuotedInThread,
 		groupChatHistoryShare:      groupChatHistoryShare,
+		ackShowSessionKey:          ackShowSessionKey,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
+		sessionKeyStrategy:         sessionKeyStrategy,
 		client:                     lark.NewClient(appID, appSecret, clientOpts...),
 		replayClient:               newFeishuReplayClient(appID, appSecret, domain),
 		dedup:                      &core.MessageDedup{},
@@ -768,9 +873,18 @@ func (p *Platform) onCardAction(event *callback.CardActionTriggerEvent) (*callba
 		return nil, nil
 	}
 
-	// Check allow_chat filter: skip card actions from chats this platform doesn't own.
-	if event.Event.Context != nil && event.Event.Context.OpenChatID != "" {
-		if !core.AllowList(p.allowChat, event.Event.Context.OpenChatID) {
+	// Check allow_chat / allow_p2p_from, mirroring the inbound message path
+	// (handleIncomingMessage): group chats must be in allow_chat; p2p chats pass
+	// when group_only is off or the operator is in allow_p2p_from. Skipping
+	// unowned chats lets sibling platforms sharing the WebSocket keep their own
+	// card callbacks.
+	if event.Event.Context != nil && event.Event.Context.OpenChatID != "" &&
+		!core.AllowList(p.allowChat, event.Event.Context.OpenChatID) {
+		op := ""
+		if event.Event.Operator != nil {
+			op = event.Event.Operator.OpenID
+		}
+		if p.groupOnly && !core.AllowList(p.allowP2PFrom, op) {
 			return nil, nil
 		}
 	}
@@ -1210,6 +1324,236 @@ func (p *Platform) dispatchCoreMessage(msg *core.Message) {
 		slog.Debug(p.tag()+": recalled message dispatch dropped", "message_id", msg.MessageID)
 		return
 	}
+
+	// Thread-style strategies send ack FIRST to create the thread, then
+	// dispatch with the real thread_id as the session boundary.
+	if p.shouldSendAck(msg) && p.usesThreadSessionStrategy() {
+		if rc, ok := msg.ReplyCtx.(replyContext); ok {
+			ackResult := p.sendAckAndGetThreadID(context.Background(), msg.Content, rc)
+			if ackResult.threadID != "" {
+				oldKey := msg.SessionKey
+				if chatID, ok := chatIDFromSessionKey(oldKey); ok {
+					newKey := fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, ackResult.threadID)
+					msg.SessionKey = newKey
+					rc.sessionKey = newKey
+					rc.threadID = ackResult.threadID
+					rc.replyInThread = true
+					msg.ReplyCtx = rc
+					p.rememberThreadAliases(chatID, ackResult.threadID,
+						threadIDFromSessionKey(oldKey),
+						rc.messageID,
+						ackResult.messageID,
+					)
+					p.ackThrottle.Store(newKey, time.Now())
+					// Optionally echo the quoted parent once into a FRESHLY created
+					// thread so the topic is self-contained (the quoted original
+					// usually sits outside the new topic). Only on thread creation:
+					// the temporary key's thread segment equals the trigger message
+					// id; an already-existing thread carries the real omt_ id instead.
+					isFreshThread := threadIDFromSessionKey(oldKey) == rc.messageID
+					if p.echoQuotedInThread && isFreshThread && strings.TrimSpace(msg.ExtraContent) != "" {
+						p.echoQuotedIntoThread(context.Background(), rc, msg.ExtraContent)
+					}
+					slog.Debug(p.tag()+": session key updated with real thread_id",
+						"old", oldKey, "new", newKey)
+				}
+			}
+		}
+	} else if p.shouldSendAck(msg) {
+		p.sendAckMessage(msg)
+	}
+
+	p.dispatchWithReceiptAck(msg, h)
+}
+
+// shouldSendAck determines if an ack message should be sent for this message
+func (p *Platform) shouldSendAck(msg *core.Message) bool {
+	// Don't ack bot's own messages
+	if msg.FromVoice {
+		return false
+	}
+
+	// Don't ack permission responses
+	if msg.IsPermissionResponse {
+		return false
+	}
+
+	// Don't ack recalled messages
+	if msg.Recalled {
+		return false
+	}
+
+	// Check throttle: 30 seconds per session
+	sessionKey := msg.SessionKey
+	if lastAck, ok := p.ackThrottle.Load(sessionKey); ok {
+		if time.Since(lastAck.(time.Time)) < 30*time.Second {
+			return false
+		}
+	}
+
+	// Don't ack very short messages (ack only for substantive messages)
+	// Exception: thread strategy needs ack to create the thread even for empty content.
+	content := strings.TrimSpace(msg.Content)
+	if len(content) < 3 && !p.usesThreadSessionStrategy() {
+		return false
+	}
+
+	return true
+}
+
+// sendAckMessage sends the ack message and records throttle timestamp
+func (p *Platform) sendAckMessage(msg *core.Message) {
+	// Lightweight in-memory test platforms build a Platform without a real lark
+	// client; there is nothing to send an ack through, so skip instead of
+	// dereferencing a nil client inside the reply call chain.
+	if p.client == nil {
+		return
+	}
+	ackText := p.buildAckText(msg.Content)
+	ackTextWithKey := ackText + p.ackFooter(msg.SessionKey, "")
+	if err := p.Send(context.Background(), msg.ReplyCtx, ackTextWithKey); err != nil {
+		slog.Debug(p.tag()+": send ack failed", "error", err, "session_key", msg.SessionKey)
+		return
+	}
+	p.ackThrottle.Store(msg.SessionKey, time.Now())
+	slog.Debug(p.tag()+": ack sent", "session_key", msg.SessionKey, "text", ackText)
+}
+
+// sendAckAndGetThreadID sends the ack as a reply and returns the ack message_id
+// plus real thread_id.
+func (p *Platform) sendAckAndGetThreadID(ctx context.Context, content string, rctx replyContext) replyResult {
+	// Same guard as sendAckMessage: lightweight in-memory test platforms have
+	// no real lark client; skip instead of hitting a mock/real API. Upstream
+	// receipt-ack tests (receipt_ack_test.go) assert no reply calls in these
+	// scenarios, so an unguarded send breaks them and can hang typing cleanup.
+	if p.client == nil {
+		return replyResult{}
+	}
+	if !p.shouldSendAckForContent(content) {
+		return replyResult{}
+	}
+	ackText := p.buildAckText(content)
+	// Under the thread strategy, the first message in a NEW topic has no topic id
+	// yet, so its session key is temporary (built from the trigger message id). The
+	// real omt_ topic id only exists AFTER this ack is sent, and Feishu's PATCH API
+	// cannot edit a plain-text ack (error 230001 "This message is NOT a card"). So
+	// suppress the [session:] footer on that fresh-topic ack; on follow-ups inside
+	// an existing topic the key already is the real omt_ id and the footer is shown.
+	ackTextWithKey := ackText + p.ackFooter(rctx.sessionKey, rctx.messageID)
+	msgType, msgBody := buildReplyContent(ackTextWithKey)
+	result, err := p.replyMessage(ctx, rctx, msgType, msgBody)
+	if err != nil {
+		slog.Debug(p.tag()+": send ack failed", "error", err)
+		return replyResult{}
+	}
+	p.ackThrottle.Store(rctx.sessionKey, time.Now())
+	return result
+}
+
+// ackSessionFooter renders the "\n[session: ..]" suffix appended to an ack. It
+// returns "" for the temporary fresh-topic session key (whose thread segment equals
+// the trigger message id): that id is replaced by the real omt_ topic id only after
+// the ack is sent, and a text ack cannot be edited afterwards — so showing it would
+// expose a stale om_ id that disagrees with the real session. Follow-up messages
+// inside an existing topic already carry the real omt_ id and get the footer.
+func ackSessionFooter(sessionKey, triggerMessageID string) string {
+	if sessionKey == "" {
+		return ""
+	}
+	if triggerMessageID != "" && threadIDFromSessionKey(sessionKey) == triggerMessageID {
+		return ""
+	}
+	return fmt.Sprintf("\n[session: %s]", sessionKey)
+}
+
+// ackFooter wraps ackSessionFooter with the ack_show_session_key switch. When
+// the footer is disabled it returns "" regardless of the session key, so acks
+// read as plain text and no internal session identifier is exposed to the chat.
+func (p *Platform) ackFooter(sessionKey, triggerMessageID string) string {
+	if !p.ackShowSessionKey {
+		return ""
+	}
+	return ackSessionFooter(sessionKey, triggerMessageID)
+}
+
+// quotedEchoMaxRunes caps how much quoted parent text is echoed into a freshly
+// created thread. Alert cards are typically 1-2 KB; this only guards against a
+// pathologically long quote.
+const quotedEchoMaxRunes = 4000
+
+// echoQuotedIntoThread posts the quoted parent content once into the thread that
+// was just created by the ack, so the topic is self-contained for human readers.
+// rc must already carry the real thread id and replyInThread=true.
+func (p *Platform) echoQuotedIntoThread(ctx context.Context, rc replyContext, extra string) {
+	body := formatQuotedEcho(extra)
+	if body == "" {
+		return
+	}
+	msgType, msgBody := buildReplyContent(body)
+	if _, err := p.replyMessage(ctx, rc, msgType, msgBody); err != nil {
+		slog.Warn(p.tag()+": echo quoted into thread failed", "error", err)
+	}
+}
+
+// formatQuotedEcho turns the agent-facing ExtraContent string (whose shape is
+// produced by formatReplyChain) into a human-readable note for the thread.
+func formatQuotedEcho(extra string) string {
+	s := strings.TrimSpace(extra)
+	if s == "" {
+		return ""
+	}
+	var body string
+	switch {
+	case strings.HasPrefix(s, "[Quoted message from "):
+		// Single quote: "[Quoted message from SENDER]:\nBODY"
+		if idx := strings.Index(s, "]:\n"); idx != -1 {
+			sender := strings.TrimSpace(strings.TrimPrefix(s[:idx], "[Quoted message from "))
+			rest := strings.TrimSpace(s[idx+len("]:\n"):])
+			if sender != "" {
+				body = "📎 引用内容（来自 " + sender + "）：\n" + rest
+			} else {
+				body = "📎 引用内容：\n" + rest
+			}
+		} else {
+			body = "📎 引用内容：\n" + s
+		}
+	case strings.HasPrefix(s, "--- Reply chain"):
+		body = "📎 引用消息链：\n" + s
+	default:
+		body = "📎 引用内容：\n" + s
+	}
+	r := []rune(body)
+	if len(r) > quotedEchoMaxRunes {
+		body = string(r[:quotedEchoMaxRunes]) + "\n…（引用内容过长，已截断）"
+	}
+	return body
+}
+
+// buildAckText determines the ack text based on message content
+func (p *Platform) buildAckText(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if strings.Contains(trimmed, "报警") || strings.Contains(trimmed, "告警") || strings.Contains(trimmed, "alert") {
+		return "收到报警，正在排查中..."
+	}
+	if strings.Contains(trimmed, "订单") || strings.Contains(trimmed, "order") {
+		return "收到，正在查询中..."
+	}
+	return "收到，正在处理中..."
+}
+
+// shouldSendAckForContent checks if an ack should be sent for this content
+func (p *Platform) shouldSendAckForContent(content string) bool {
+	// Thread strategy always needs ack to create the thread, even for empty content.
+	if p.usesThreadSessionStrategy() {
+		return true
+	}
+	trimmed := strings.TrimSpace(content)
+	return len(trimmed) >= 3
+}
+
+// dispatchWithReceiptAck runs the text-ack flow above, then arms the upstream
+// receipt-reaction acknowledgement before handing off to the engine.
+func (p *Platform) dispatchWithReceiptAck(msg *core.Message, h func(core.Platform, *core.Message)) {
 	p.prepareReceiptAcknowledgement(msg)
 	h(p.dispatchPlatform(), msg)
 }
@@ -1686,6 +2030,17 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	msg := event.Event.Message
 	sender := event.Event.Sender
 
+	// Log raw event at entry point to distinguish "not received" vs "filtered"
+	slog.Debug(p.tag()+": onMessage entry",
+		"message_id", stringValue(msg.MessageId),
+		"chat_id", stringValue(msg.ChatId),
+		"msg_type", stringValue(msg.MessageType),
+		"parent_id", stringValue(msg.ParentId),
+		"root_id", stringValue(msg.RootId),
+		"thread_id", stringValue(msg.ThreadId),
+		"content_len", len(stringValue(msg.Content)),
+	)
+
 	msgType := ""
 	if msg.MessageType != nil {
 		msgType = *msg.MessageType
@@ -1702,6 +2057,10 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	}
 	// userName and chatName are resolved in dispatchMessage to avoid blocking
 	// the SDK dispatcher goroutine with synchronous HTTP calls.
+	if botOpenID := p.getBotOpenID(); botOpenID != "" && userID == botOpenID {
+		slog.Debug(p.tag()+": ignoring bot's own message", "user", userID)
+		return nil
+	}
 
 	messageID := ""
 	if msg.MessageId != nil {
@@ -1793,6 +2152,12 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 			case p.threadIsolation && isAttachmentMsgType(msgType) && p.isActiveThreadSession(sessionKey):
 				slog.Debug(p.tag()+": passing attachment through active thread without mention",
 					"chat_id", chatID, "session_key", sessionKey, "msg_type", msgType, "message_id", messageID)
+			// Allow interactive (card) messages through without @bot mention
+			// Card messages are typically alerts/notifications that should be processed.
+			// Set card_requires_mention=true to also require an @mention for cards.
+			case msgType == "interactive" && !p.cardRequiresMention:
+				slog.Debug(p.tag()+": passing interactive card message without mention",
+					"chat_id", chatID, "msg_type", msgType, "message_id", messageID)
 			default:
 				if p.IsGroupFilterDegraded() && botOpenID == "" {
 					// Fail closed: drop the message. Use WARN (not
@@ -1821,7 +2186,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 		slog.Debug(p.tag()+": message from unauthorized chat", "chat_id", chatID)
 		return nil
 	}
-	if chatType != "group" && p.groupOnly {
+	if chatType != "group" && p.groupOnly && !core.AllowList(p.allowP2PFrom, userID) {
 		slog.Debug(p.tag()+": p2p message skipped (group_only=true)", "chat_type", chatType)
 		return nil
 	}
@@ -1839,7 +2204,7 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	mentions := msg.Mentions
 	parentID := stringValue(msg.ParentId)
 
-	rctx := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	rctx := p.makeReplyContext(msg, messageID, chatID, sessionKey)
 	var groupHistoryCtx groupHistoryContext
 	if p.groupChatHistoryShare && chatType == "group" && !p.groupReplyAll && botOpenID != "" && (botMentioned || atEveryone) {
 		scope := p.groupHistoryScope(msg, chatID)
@@ -2191,6 +2556,24 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 			UserMessageTimeMs: createTimeMs,
 		})
 
+	case "interactive":
+		text := extractInteractiveCardText(content)
+		if text == "" || text == "[interactive card]" {
+			text = "[卡片消息]"
+		}
+		slog.Debug(p.tag()+": extracted card text",
+			"message_id", messageID,
+			"text_len", len(text),
+			"text_preview", text[:min(100, len(text))],
+		)
+		p.dispatchCoreMessage(&core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName, ChatName: chatName,
+			Content: text, ExtraContent: quoted.text, ReplyCtx: rctx,
+			UserMessageTimeMs: createTimeMs,
+		})
+
 	default:
 		slog.Debug(p.tag()+": ignoring unsupported message type", "type", msgType)
 	}
@@ -2362,9 +2745,9 @@ func (p *Platform) getChatMembers(ctx context.Context, chatID string) map[string
 
 // resolveMentionsInContent replaces @name with Feishu at tags in raw content
 // (before JSON serialization). Reverse-matches against the chat member list,
-// longest name first. Always emits the MsgTypeText at syntax
-// (<at user_id="...">name</at>) because Feishu only fires mention events for
-// <at> inside MsgTypeText — not inside cards or post messages.
+// longest name first. Emits the card-compatible at syntax (<at id=open_id></at>)
+// which works in both card markdown and MsgTypeText, and triggers real mention
+// notifications in both cases.
 func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content string) string {
 	if !p.resolveMentions || chatID == "" || !strings.Contains(content, "@") {
 		return content
@@ -2410,18 +2793,16 @@ func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content
 		if openID == "" {
 			continue // ambiguous member, skip
 		}
-		// Always use the MsgTypeText at syntax so Feishu fires a mention
-		// event. The card variant (<at id=...></at>) renders the name but
-		// does NOT notify the target, which defeats bot-to-bot mentions.
-		escapedName := html.EscapeString(name)
-		atTag := fmt.Sprintf(`<at user_id="%s">%s</at>`, openID, escapedName)
+		// Use card-compatible at syntax which triggers real mention
+		// notifications in both card markdown and MsgTypeText messages.
+		atTag := fmt.Sprintf(`<at id=%s></at>`, openID)
 		result = strings.ReplaceAll(result, pattern, atTag)
 	}
 	return result
 }
 
-// chainMessage holds extracted data from one message in a reply chain.
-type chainMessage struct {
+// quotedParent holds extracted data from the directly quoted parent message.
+type quotedParent struct {
 	senderName string
 	senderType string // "user" or "app"
 	senderID   string // Feishu open_id (or app_id for bots) — used by the caller
@@ -2452,6 +2833,11 @@ type quotedMessage struct {
 	images []core.ImageAttachment
 	files  []quotedFileMeta
 }
+
+// chainMessage is an alias used by the reply-chain traversal helpers. The
+// underlying quotedParent struct already carries the same fields upstream's
+// chainMessage uses, so the alias keeps both naming styles compiling.
+type chainMessage = quotedParent
 
 // maxPendingGroupHistoryEntries bounds the per-scope in-memory buffer. The
 // feature is intentionally a small recent-context window rather than a chat
@@ -2514,9 +2900,9 @@ func (p *Platform) resolveBotSenderName(appID string) string {
 	return "Bot[" + appID + "]"
 }
 
-// fetchSingleMessage retrieves one message by ID from the Feishu API and
-// returns its extracted content as a chainMessage. Returns nil on any failure.
-func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *chainMessage {
+// fetchSingleMessage retrieves one message by ID from the Feishu API and returns
+// its extracted content. Returns nil on any failure.
+func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *quotedParent {
 	apiPath := fmt.Sprintf("/open-apis/im/v1/messages/%s?card_msg_content_type=raw_card_content", messageID)
 	apiResp, err := p.client.Get(ctx, apiPath, nil, larkcore.AccessTokenTypeTenant)
 	if err != nil {
@@ -2527,9 +2913,8 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		Code int `json:"code"`
 		Data struct {
 			Items []struct {
-				MsgType  string `json:"msg_type"`
-				ParentID string `json:"parent_id"`
-				Sender   struct {
+				MsgType string `json:"msg_type"`
+				Sender  struct {
 					ID         string `json:"id"`
 					SenderType string `json:"sender_type"`
 				} `json:"sender"`
@@ -2537,6 +2922,7 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 					Content string `json:"content"`
 				} `json:"body"`
 				Mentions []*larkim.Mention `json:"mentions"`
+				ParentID string            `json:"parent_id"`
 			} `json:"items"`
 		} `json:"data"`
 	}
@@ -2651,7 +3037,7 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		senderName = "unknown"
 	}
 
-	return &chainMessage{
+	return &quotedParent{
 		senderName: senderName,
 		senderType: item.Sender.SenderType,
 		senderID:   item.Sender.ID,
@@ -2816,208 +3202,272 @@ func extractPostPlainText(content string) string {
 }
 
 // extractInteractiveCardText extracts readable text from a Feishu interactive card JSON.
-// With raw_card_content, the response wraps the card in {"json_card": "...", ...}.
-// Supports schema 2.0 (body.property.elements with recursive nesting) and
-// legacy format (top-level title + elements).
+// Strategy: unescape nested JSON strings if present (json_card / user_dsl),
+// then recursively walk all map/list values collecting string content
+// from content/text/title/plain_text keys.
 func extractInteractiveCardText(content string) string {
-	// Try raw_card_content format: {"json_card": "<escaped JSON>", ...}
 	var wrapper struct {
 		JsonCard string `json:"json_card"`
+		UserDSL  string `json:"user_dsl"`
 	}
 	cardJSON := content
-	if json.Unmarshal([]byte(content), &wrapper) == nil && wrapper.JsonCard != "" {
-		cardJSON = wrapper.JsonCard
+	if json.Unmarshal([]byte(content), &wrapper) == nil {
+		if wrapper.JsonCard != "" {
+			cardJSON = wrapper.JsonCard
+		} else if wrapper.UserDSL != "" {
+			cardJSON = wrapper.UserDSL
+		}
 	}
 
-	var card map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+	var v any
+	if err := json.Unmarshal([]byte(cardJSON), &v); err != nil {
 		return "[interactive card]"
 	}
 
 	var parts []string
-
-	// Schema 2.0: body may use property.elements (standard) or direct elements (simplified).
-	if raw, ok := card["body"]; ok {
-		var body struct {
-			Tag      string            `json:"tag"`
-			Elements []json.RawMessage `json:"elements"`
-			Property struct {
-				Elements []json.RawMessage `json:"elements"`
-			} `json:"property"`
-		}
-		if json.Unmarshal(raw, &body) == nil {
-			if body.Tag == "body" && len(body.Property.Elements) > 0 {
-				extractCardElements(body.Property.Elements, &parts)
-			} else if len(body.Elements) > 0 {
-				extractCardElements(body.Elements, &parts)
-			}
-		}
-	}
-
-	// Legacy: direct title string + flat/nested elements.
-	if len(parts) == 0 {
-		if raw, ok := card["header"]; ok {
-			var header struct {
-				Title struct {
-					Content string `json:"content"`
-				} `json:"title"`
-			}
-			if json.Unmarshal(raw, &header) == nil && header.Title.Content != "" {
-				parts = append(parts, header.Title.Content)
-			}
-		}
-		if len(parts) == 0 {
-			if raw, ok := card["title"]; ok {
-				var title string
-				if json.Unmarshal(raw, &title) == nil && title != "" {
-					parts = append(parts, title)
-				}
-			}
-		}
-		var elements []json.RawMessage
-		if raw, ok := card["elements"]; ok {
-			var nested [][]json.RawMessage
-			if json.Unmarshal(raw, &nested) == nil && len(nested) > 0 {
-				for _, row := range nested {
-					elements = append(elements, row...)
-				}
-			} else {
-				_ = json.Unmarshal(raw, &elements)
-			}
-		}
-		for _, raw := range elements {
-			var elem struct {
-				Tag  string `json:"tag"`
-				Text string `json:"text"`
-			}
-			if json.Unmarshal(raw, &elem) == nil && elem.Tag == "text" && strings.TrimSpace(elem.Text) != "" {
-				parts = append(parts, elem.Text)
-			}
-		}
-	}
+	unpaired := walkCardValue(v, &parts)
+	// Anything still unpaired at the top level has no sibling text anywhere
+	// in the card — append bare so the link survives instead of being dropped.
+	parts = append(parts, unpaired...)
 
 	if len(parts) == 0 {
 		return "[interactive card]"
 	}
-	return strings.Join(parts, "\n")
+	return strings.Join(dedupeStrings(parts), "\n")
 }
 
-// extractCardElements recursively extracts text from schema 2.0 card elements.
-// Handles: property.content, property.text (nested element), property.elements (recursive),
-// code_span, code_block (with tokenized contents), text_tag, hr, button (with open_url), etc.
-func extractCardElements(elements []json.RawMessage, parts *[]string) {
-	for _, raw := range elements {
-		var elem struct {
-			Tag      string `json:"tag"`
-			Content  string `json:"content"`
-			Property struct {
-				Content   string            `json:"content"`
-				Contents  json.RawMessage   `json:"contents"`
-				Language  string            `json:"language"`
-				Elements  []json.RawMessage `json:"elements"`
-				Text      json.RawMessage   `json:"text"`
-				Items     json.RawMessage   `json:"items"`
-				Columns   json.RawMessage   `json:"columns"`
-				Rows      json.RawMessage   `json:"rows"`
-				Behaviors json.RawMessage   `json:"behaviors"`
-			} `json:"property"`
-		}
-		if json.Unmarshal(raw, &elem) != nil {
-			continue
-		}
-		switch elem.Tag {
-		case "button":
-			// Extract button label text and open_url from behaviors.
-			label := elem.Property.Content
-			if label == "" {
-				// label may be in property.text.property.content
-				var textElem struct {
-					Property struct {
-						Content string `json:"content"`
-					} `json:"property"`
-				}
-				if json.Unmarshal(elem.Property.Text, &textElem) == nil {
-					label = textElem.Property.Content
+// walkCardValue recursively walks any JSON value and collects
+// string values from content/text/title/plain_text keys.
+// It also resolves hyperlinks stored in separate fields (href map,
+// url, multi_url) and appends them to the corresponding text as
+// Markdown links [text](url). This handles Feishu card v2 raw_card_content
+// format where links are not inlined in the markdown content string but
+// stored in dedicated fields.
+//
+// Orphan action URLs (e.g. {"type":"open_url","action":{"url":...}}) whose
+// visible label lives in a sibling node bubble up as the return value when
+// the current scope has no linkable text; each ancestor scope gets a chance
+// to pair them before they fall back to bare URLs at the top level.
+func walkCardValue(v any, parts *[]string) []string {
+	switch x := v.(type) {
+	case map[string]any:
+		startIdx := len(*parts)
+		var orphanURLs []string
+		for k, val := range x {
+			lk := strings.ToLower(k)
+			switch lk {
+			case "content", "text", "title", "plain_text":
+				if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
+					*parts = append(*parts, strings.TrimSpace(s))
 				}
 			}
-			var openURL string
-			if len(elem.Property.Behaviors) > 0 {
-				var behaviors []struct {
-					Type string `json:"type"`
-					URL  string `json:"url"`
-				}
-				if json.Unmarshal(elem.Property.Behaviors, &behaviors) == nil {
-					for _, b := range behaviors {
-						if b.Type == "open_url" && b.URL != "" {
-							openURL = b.URL
-							break
-						}
+			before := len(*parts)
+			childUnpaired := walkCardValue(val, parts)
+			orphanURLs = append(orphanURLs, childUnpaired...)
+			// Sibling pairing: an action-only child (e.g.
+			// {"type":"open_url","action":{"url":...}}) produces no text
+			// segments of its own — the visible label ("报警链接") lives
+			// in a sibling text node. Without this, the URL is silently
+			// dropped because applyCardLinks only fires when the SAME map
+			// produced text. Skip the direct extract when the child
+			// already bubbled its URL up (avoids double counting).
+			if len(*parts) == before && len(childUnpaired) == 0 {
+				if child, ok := val.(map[string]any); ok {
+					if u := extractOrphanActionURL(child); u != "" {
+						orphanURLs = append(orphanURLs, u)
 					}
 				}
 			}
-			if label != "" && openURL != "" {
-				*parts = append(*parts, fmt.Sprintf("[%s](%s)", label, openURL))
-			} else if label != "" {
-				*parts = append(*parts, label)
-			}
-		case "code_block":
-			var lines []struct {
-				Contents []struct {
-					Content string `json:"content"`
-				} `json:"contents"`
-			}
-			if json.Unmarshal(elem.Property.Contents, &lines) == nil {
-				var codeLines []string
-				for _, line := range lines {
-					var lineText string
-					for _, tok := range line.Contents {
-						lineText += tok.Content
-					}
-					codeLines = append(codeLines, lineText)
-				}
-				code := strings.Join(codeLines, "")
-				if strings.TrimSpace(code) != "" {
-					lang := elem.Property.Language
-					if lang != "" {
-						*parts = append(*parts, fmt.Sprintf("```%s\n%s```", lang, code))
-					} else {
-						*parts = append(*parts, fmt.Sprintf("```\n%s```", code))
-					}
-				}
-			}
-		case "code_span":
-			if elem.Property.Content != "" {
-				*parts = append(*parts, "`"+elem.Property.Content+"`")
-			}
-		case "hr":
-			*parts = append(*parts, "---")
-		case "table":
-			extractCardTable(elem.Property.Columns, elem.Property.Rows, parts)
-		case "list":
-			extractCardListItems(elem.Property.Items, parts)
-		default:
-			content := elem.Property.Content
-			if content == "" {
-				content = elem.Content
-			}
-			if content != "" {
-				*parts = append(*parts, content)
-			}
-			if len(elem.Property.Text) > 0 {
-				var textElem struct {
-					Property struct {
-						Content string `json:"content"`
-					} `json:"property"`
-				}
-				if json.Unmarshal(elem.Property.Text, &textElem) == nil && textElem.Property.Content != "" {
-					*parts = append(*parts, textElem.Property.Content)
-				}
-			}
 		}
-		if len(elem.Property.Elements) > 0 {
-			extractCardElements(elem.Property.Elements, parts)
+		endIdx := len(*parts)
+		applyCardLinks(x, parts, startIdx, endIdx)
+		return pairOrphanActionURLs(parts, startIdx, orphanURLs)
+	case []any:
+		var unpaired []string
+		for _, item := range x {
+			unpaired = append(unpaired, walkCardValue(item, parts)...)
+		}
+		return unpaired
+	}
+	return nil
+}
+
+// extractOrphanActionURL extracts a URL from an action-only child node that
+// produced no text segments, e.g. {"type":"open_url","action":{"url":...}}.
+// Nodes that produced their own text are handled by applyCardLinks and must
+// not reach here (the caller guarantees zero new segments).
+func extractOrphanActionURL(child map[string]any) string {
+	if u, ok := child["url"]; ok {
+		if url := extractURLFromLinkValue(u); url != "" {
+			return url
 		}
 	}
+	if mu, ok := child["multi_url"]; ok {
+		if url := extractURLFromLinkValue(mu); url != "" {
+			return url
+		}
+	}
+	if action, ok := child["action"].(map[string]any); ok {
+		if u, ok := action["url"]; ok {
+			if url := extractURLFromLinkValue(u); url != "" {
+				return url
+			}
+		}
+		if mu, ok := action["multi_url"]; ok {
+			if url := extractURLFromLinkValue(mu); url != "" {
+				return url
+			}
+		}
+	}
+	return ""
+}
+
+// pairOrphanActionURLs attaches orphan action URLs (collected from text-less
+// sibling nodes) to text segments produced by sibling nodes within the same
+// map scope. Each URL rewrites the last not-yet-linked segment in
+// parts[startIdx:]; URLs with no linkable segment are returned so the caller
+// can bubble them up to an ancestor scope (or fall back to bare URLs at the
+// top level) instead of silently dropping them.
+func pairOrphanActionURLs(parts *[]string, startIdx int, urls []string) []string {
+	var unpaired []string
+	for _, url := range urls {
+		paired := false
+		for i := len(*parts) - 1; i >= startIdx; i-- {
+			if strings.Contains((*parts)[i], "](") {
+				continue
+			}
+			(*parts)[i] = "[" + (*parts)[i] + "](" + url + ")"
+			paired = true
+			break
+		}
+		if !paired {
+			unpaired = append(unpaired, url)
+		}
+	}
+	return unpaired
+}
+
+// applyCardLinks resolves hyperlink fields on a card element and rewrites
+// the text segments produced by that element (parts[startIdx:endIdx]) to
+// include Markdown links.
+//
+// Supported link field shapes:
+//   - href: map[string]any where each key is the link text and the value
+//     is an object with a "url" field (Feishu card v2 markdown element).
+//     Every occurrence of the link text within the produced segments is
+//     replaced with [text](url).
+//   - url: string — the last produced text segment is rewritten as
+//     [text](url) (button / column / action elements).
+//   - multi_url: map[string]any with a "url" field — same as url but for
+//     multi-platform links (pc / ios / android), we take the generic url.
+func applyCardLinks(x map[string]any, parts *[]string, startIdx, endIdx int) {
+	if endIdx <= startIdx {
+		return
+	}
+
+	// 1. href map (Feishu card v2 markdown element): {"链接文字": {"url": "..."}}
+	if hrefRaw, ok := x["href"]; ok {
+		if hrefMap, ok := hrefRaw.(map[string]any); ok {
+			for linkText, linkVal := range hrefMap {
+				if linkText == "" {
+					continue
+				}
+				url := extractURLFromLinkValue(linkVal)
+				if url == "" {
+					continue
+				}
+				replacement := "[" + linkText + "](" + url + ")"
+				for i := startIdx; i < endIdx; i++ {
+					(*parts)[i] = strings.ReplaceAll((*parts)[i], linkText, replacement)
+				}
+			}
+		}
+	}
+
+	// 2. url / multi_url (button, column, action elements): attach to last text
+	elemURL := ""
+	if u, ok := x["url"]; ok {
+		elemURL = extractURLFromLinkValue(u)
+	} else if mu, ok := x["multi_url"]; ok {
+		elemURL = extractURLFromLinkValue(mu)
+	}
+	if elemURL != "" {
+		lastIdx := endIdx - 1
+		lastText := (*parts)[lastIdx]
+		// Avoid double-wrapping if the text already looks like a markdown link
+		if !strings.HasPrefix(lastText, "[") || !strings.Contains(lastText, "](") {
+			(*parts)[lastIdx] = "[" + lastText + "](" + elemURL + ")"
+		}
+	}
+
+	// 3. URLs in nested actions array (Feishu button/column_set elements
+	//    with property.actions[].action.url). Preserve action/text ordering:
+	//    action[0] belongs to the first not-yet-linked text segment, action[1]
+	//    to the next, etc. Walking text backwards swaps links when a card has
+	//    multiple buttons.
+	if actionsRaw, ok := x["actions"]; ok {
+		if actions, ok := actionsRaw.([]any); ok {
+			nextText := startIdx
+			for _, a := range actions {
+				actionMap, ok := a.(map[string]any)
+				if !ok {
+					continue
+				}
+				action, ok := actionMap["action"].(map[string]any)
+				if !ok {
+					continue
+				}
+				u := extractURLFromLinkValue(action["url"])
+				if u == "" {
+					u = extractURLFromLinkValue(action["multi_url"])
+				}
+				if u == "" {
+					continue
+				}
+				for nextText < endIdx && strings.Contains((*parts)[nextText], "](") {
+					nextText++
+				}
+				if nextText >= endIdx {
+					break
+				}
+				(*parts)[nextText] = "[" + (*parts)[nextText] + "](" + u + ")"
+				nextText++
+			}
+		}
+	}
+}
+
+// extractURLFromLinkValue extracts a URL string from a Feishu link value
+// which may be either a plain string or an object with "url" / "pc_url"
+// / "ios_url" / "android_url" fields (multi_url shape).
+func extractURLFromLinkValue(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case map[string]any:
+		// Prefer generic "url", fall back to pc_url
+		if u, ok := val["url"].(string); ok && u != "" {
+			return u
+		}
+		if u, ok := val["pc_url"].(string); ok && u != "" {
+			return u
+		}
+	}
+	return ""
+}
+
+// dedupeStrings removes adjacent duplicates from a string slice.
+func dedupeStrings(s []string) []string {
+	if len(s) < 2 {
+		return s
+	}
+	r := make([]string, 0, len(s))
+	for i, v := range s {
+		if i == 0 || v != s[i-1] {
+			r = append(r, v)
+		}
+	}
+	return r
 }
 
 // extractCardTable extracts text from a Feishu card table element.
@@ -3056,7 +3506,7 @@ func extractCardTable(columnsRaw, rowsRaw json.RawMessage, parts *[]string) {
 		for i, col := range columns {
 			cell := row[col.Name]
 			var cellParts []string
-			extractCardElements([]json.RawMessage{cell.Data}, &cellParts)
+			walkCardValue(cell.Data, &cellParts)
 			cells[i] = strings.Join(cellParts, " ")
 		}
 		*parts = append(*parts, "| "+strings.Join(cells, " | ")+" |")
@@ -3074,7 +3524,9 @@ func extractCardListItems(itemsRaw json.RawMessage, parts *[]string) {
 	}
 	for _, item := range items {
 		var itemParts []string
-		extractCardElements(item.Elements, &itemParts)
+		for _, elem := range item.Elements {
+			walkCardValue(elem, &itemParts)
+		}
 		if len(itemParts) > 0 {
 			*parts = append(*parts, "- "+strings.Join(itemParts, " "))
 		}
@@ -3270,7 +3722,8 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 	if !p.shouldUseThreadOrReplyAPI(rc) {
 		return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
 	}
-	return p.replyMessage(ctx, rc, msgType, msgBody)
+	_, err := p.replyMessage(ctx, rc, msgType, msgBody)
+	return err
 }
 
 // Send sends a message. When the original message ID is available, the message
@@ -3294,27 +3747,26 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
 // the body content followed by a small/dim status-footer block. Always uses
 // the interactive card path so the footer can render with text_size:
-// "notation". Falls back to plain Send when the footer is empty or the content
-// contains a resolved @mention (Feishu only fires mention events for <at> tags
-// inside MsgTypeText, not inside cards).
+// "notation". Falls back to plain Send when the footer is empty.
 func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, footer string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
 	}
-	// Resolve mentions first so we can detect whether a real @mention is
+	// Resolve mentions in content.
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
-	if strings.TrimSpace(footer) == "" || strings.Contains(content, `<at user_id=`) || strings.Contains(content, `<at id=`) {
-		if strings.TrimSpace(footer) != "" {
-			content += "\n\n" + footer
-		}
+	if strings.TrimSpace(footer) == "" {
 		return p.Send(ctx, rctx, content)
 	}
+	// Don't append footer to content here — buildCardJSONWithStatusFooter
+	// renders it as a separate "notation"-sized element below an <hr>.
 	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
 	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
 	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
+
 	if p.shouldUseThreadOrReplyAPI(rc) {
-		return p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+		_, err := p.replyMessage(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
+		return err
 	}
 	return p.sendNewMessageToChat(ctx, rc, larkim.MsgTypeInteractive, cardJSON)
 }
@@ -3416,7 +3868,8 @@ func (p *Platform) SendFile(ctx context.Context, rctx any, file core.FileAttachm
 
 func (p *Platform) sendMediaMessage(ctx context.Context, rc replyContext, msgType, content string) error {
 	if p.shouldUseThreadOrReplyAPI(rc) {
-		return p.replyMessage(ctx, rc, msgType, content)
+		_, err := p.replyMessage(ctx, rc, msgType, content)
+		return err
 	}
 	return p.createMessage(ctx, rc.chatID, msgType, content, "send media message")
 }
@@ -3519,15 +3972,44 @@ func detectMimeType(data []byte) string {
 	return "image/png"
 }
 
+// stripModelFillerLines removes lines composed solely of single-glyph model
+// progress markers (e.g. U+25FC BLACK MEDIUM SMALL SQUARE "◼") that some
+// models (observed: muse-spark on the opencode-free provider) emit between
+// tool calls. They carry no information yet leak into the user-visible reply.
+// The stored transcript keeps the original (see turn-complete block in
+// core/engine.go); only the platform-facing text is cleaned here.
+func stripModelFillerLines(s string) string {
+	if !strings.ContainsRune(s, '◼') {
+		return s
+	}
+	kept := make([]string, 0, len(s)/16)
+	for _, ln := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(ln)
+		if t == "" {
+			kept = append(kept, ln)
+			continue
+		}
+		filler := true
+		for _, r := range t {
+			if r != '◼' {
+				filler = false
+				break
+			}
+		}
+		if !filler {
+			kept = append(kept, ln)
+		}
+	}
+	out := strings.TrimLeft(strings.Join(kept, "\n"), "\n")
+	if strings.TrimSpace(out) == "" {
+		return " "
+	}
+	return out
+}
+
 func buildReplyContent(content string) (msgType string, body string) {
-	// Feishu does not generate mention events for <at> tags in card/post
-	// messages sent by bots. Force MsgTypeText when a real mention is present
-	// (resolved to an <at user_id="..."> or <at id=...> tag) so Feishu
-	// recognizes it and notifies the target bot. Checking the resolved tag
-	// instead of a bare "@" avoids false positives on email addresses, URLs,
-	// and escaped characters.
-	hasMention := strings.Contains(content, `<at user_id=`) || strings.Contains(content, `<at id=`)
-	if !containsMarkdown(content) || hasMention {
+	content = stripModelFillerLines(content)
+	if !containsMarkdown(content) {
 		b, _ := json.Marshal(map[string]string{"text": content})
 		return larkim.MsgTypeText, string(b)
 	}
@@ -4043,6 +4525,44 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 // TODO: Session-key derivation and reply-thread behavior are split across multiple code paths here.
 // Should revisit thread/root handling without changing thread_isolation=false behavior.
 func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID string) string {
+	if p.sessionKeyStrategy != "" {
+		switch p.sessionKeyStrategy {
+		case "hybrid":
+			if msg != nil && stringValue(msg.ChatType) == "group" {
+				if threadID := p.resolveThreadID(msg, chatID); threadID != "" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
+				}
+				// Group chat with no thread yet: use msg_id as a temporary
+				// thread key. dispatchCoreMessage will send the ack first and
+				// replace it with the real thread_id before handing off to core.
+				if messageID := stringValue(msg.MessageId); messageID != "" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, messageID)
+				}
+			}
+			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
+
+		case "thread":
+			if msg != nil {
+				if threadID := p.resolveThreadID(msg, chatID); threadID != "" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, threadID)
+				}
+				// Group chat with no thread yet: use msg_id as temporary thread ID.
+				// dispatchCoreMessage will recompute with real thread_id after ack.
+				if stringValue(msg.ChatType) == "group" {
+					return fmt.Sprintf("%s:%s:thread:%s", p.tag(), chatID, stringValue(msg.MessageId))
+				}
+			}
+			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
+
+		case "chat":
+			return fmt.Sprintf("%s:%s", p.tag(), chatID)
+
+		case "user":
+			return fmt.Sprintf("%s:%s:user:%s", p.tag(), chatID, userID)
+		}
+	}
+
+	// Legacy behavior: threadIsolation uses rootID
 	if p.threadIsolation && msg != nil && stringValue(msg.ChatType) == "group" {
 		rootID := stringValue(msg.RootId)
 		if rootID == "" {
@@ -4056,6 +4576,100 @@ func (p *Platform) makeSessionKey(msg *larkim.EventMessage, chatID, userID strin
 		return fmt.Sprintf("%s:%s", p.tag(), chatID)
 	}
 	return fmt.Sprintf("%s:%s:%s", p.tag(), chatID, userID)
+}
+
+func (p *Platform) usesThreadSessionStrategy() bool {
+	return p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread"
+}
+
+func (p *Platform) resolveThreadID(msg *larkim.EventMessage, chatID string) string {
+	if msg == nil {
+		return ""
+	}
+	if threadID := stringValue(msg.ThreadId); threadID != "" {
+		p.rememberThreadAliases(chatID, threadID,
+			stringValue(msg.MessageId),
+			stringValue(msg.RootId),
+			stringValue(msg.ParentId),
+		)
+		return threadID
+	}
+	for _, id := range []string{
+		stringValue(msg.RootId),
+		stringValue(msg.ParentId),
+		stringValue(msg.MessageId),
+	} {
+		if threadID := p.lookupThreadAlias(chatID, id); threadID != "" {
+			p.rememberThreadAliases(chatID, threadID,
+				stringValue(msg.MessageId),
+				stringValue(msg.RootId),
+				stringValue(msg.ParentId),
+			)
+			return threadID
+		}
+	}
+	return ""
+}
+
+func (p *Platform) rememberThreadAliases(chatID, threadID string, ids ...string) {
+	if chatID == "" || threadID == "" {
+		return
+	}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		p.threadIDAliases.Store(chatID+":"+id, threadID)
+	}
+}
+
+func (p *Platform) lookupThreadAlias(chatID, id string) string {
+	if chatID == "" || id == "" {
+		return ""
+	}
+	if v, ok := p.threadIDAliases.Load(chatID + ":" + id); ok {
+		if threadID, ok := v.(string); ok {
+			return threadID
+		}
+	}
+	return ""
+}
+
+func chatIDFromSessionKey(sessionKey string) (string, bool) {
+	parts := strings.Split(sessionKey, ":")
+	if len(parts) < 3 || parts[1] == "" {
+		return "", false
+	}
+	return parts[1], true
+}
+
+func threadIDFromSessionKey(sessionKey string) string {
+	parts := strings.Split(sessionKey, ":")
+	if len(parts) >= 4 && parts[2] == "thread" {
+		return parts[3]
+	}
+	return ""
+}
+
+func (p *Platform) makeReplyContext(msg *larkim.EventMessage, messageID, chatID, sessionKey string) replyContext {
+	rc := replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey}
+	if msg == nil {
+		return rc
+	}
+	if p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread" {
+		if stringValue(msg.ChatType) == "group" {
+			rc.threadID = p.resolveThreadID(msg, chatID)
+			// Always reply in thread for thread strategy — first message creates
+			// the thread, subsequent messages reuse the threadID.
+			rc.replyInThread = true
+		}
+		return rc
+	}
+	if p.threadIsolation && isThreadSessionKey(sessionKey) {
+		rc.threadID = p.resolveThreadID(msg, chatID)
+		rc.replyInThread = true
+	}
+	return rc
 }
 
 func (p *Platform) sessionKeyFromCardAction(chatID, userID string, value map[string]any) string {
@@ -4073,6 +4687,12 @@ func (p *Platform) sessionKeyFromCardAction(chatID, userID string, value map[str
 func (p *Platform) shouldReplyInThread(rc replyContext) bool {
 	if rc.messageID == "" {
 		return false
+	}
+	if rc.replyInThread {
+		return true
+	}
+	if p.sessionKeyStrategy == "hybrid" || p.sessionKeyStrategy == "thread" {
+		return isThreadSessionKey(rc.sessionKey)
 	}
 	return p.threadIsolation && isThreadSessionKey(rc.sessionKey)
 }
@@ -4092,22 +4712,28 @@ func (p *Platform) sendNewMessageToChat(ctx context.Context, rc replyContext, ms
 	return p.createMessage(ctx, rc.chatID, msgType, content, "send")
 }
 
-func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content string) *larkim.ReplyMessageReqBody {
+func (p *Platform) buildReplyMessageReqBody(rc replyContext, msgType, content, uuid string) *larkim.ReplyMessageReqBody {
 	body := larkim.NewReplyMessageReqBodyBuilder().
 		MsgType(msgType).
 		Content(content)
+	if uuid != "" {
+		body.Uuid(uuid)
+	}
 	if p.shouldReplyInThread(rc) {
 		body.ReplyInThread(true)
 	}
 	return body.Build()
 }
 
-func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) error {
+// replyMessage sends a reply and returns the created message_id plus real
+// thread_id if a new thread was created.
+func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, content string) (replyResult, error) {
 	req := larkim.NewReplyMessageReqBuilder().
 		MessageId(rc.messageID).
-		Body(p.buildReplyMessageReqBody(rc, msgType, content)).
+		Body(p.buildReplyMessageReqBody(rc, msgType, content, core.OutboxUUIDFromContext(ctx))).
 		Build()
-	return p.withTransientRetry(ctx, "reply", func() error {
+	var result replyResult
+	err := p.withTransientRetry(ctx, "reply", func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Reply(ctx, req, options...)
 			if err != nil {
@@ -4116,19 +4742,29 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if !resp.Success() {
 				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
 			}
+			if resp.Data != nil && resp.Data.MessageId != nil && *resp.Data.MessageId != "" {
+				result.messageID = *resp.Data.MessageId
+			}
+			if resp.Data != nil && resp.Data.ThreadId != nil && *resp.Data.ThreadId != "" {
+				result.threadID = *resp.Data.ThreadId
+			}
 			return nil
 		})
 	})
+	return result, err
 }
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
+	createBody := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(chatID).
+		MsgType(msgType).
+		Content(content)
+	if u := core.OutboxUUIDFromContext(ctx); u != "" {
+		createBody.Uuid(u)
+	}
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(larkim.ReceiveIdTypeChatId).
-		Body(larkim.NewCreateMessageReqBodyBuilder().
-			ReceiveId(chatID).
-			MsgType(msgType).
-			Content(content).
-			Build()).
+		Body(createBody.Build()).
 		Build()
 	return p.withTransientRetry(ctx, op, func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, op, func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
@@ -4206,9 +4842,12 @@ func isTenantAccessTokenInvalid(err error) bool {
 // const) so tests can shrink the retry window; production callers never
 // touch them after init.
 var (
-	maxTransientRetries    = 3
+	// Synchronous in-request retry window. These defaults cover short blips
+	// (~1 minute total: 0.5s→1s→2s→4s→8s→16s→30s cap); longer outages and
+	// process restarts are covered by the core outbox redelivery layer.
+	maxTransientRetries    = 6
 	transientRetryInitial  = 500 * time.Millisecond
-	transientRetryMaxDelay = 5 * time.Second
+	transientRetryMaxDelay = 30 * time.Second
 )
 
 // isTransientError returns true if the error is a transient network error
@@ -4502,6 +5141,8 @@ func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {
 	if len(parts) == 3 {
 		if rootID, ok := parseThreadRootID(parts[2]); ok {
 			rc.messageID = rootID
+			rc.threadID = rootID
+			rc.replyInThread = true
 		}
 	}
 	return rc, nil
@@ -4542,12 +5183,19 @@ func parseThreadRootID(sessionTail string) (string, bool) {
 }
 
 func isThreadSessionKey(sessionKey string) bool {
-	parts := strings.SplitN(sessionKey, ":", 3)
-	if len(parts) != 3 {
-		return false
+	// Support both old format "platform:chatID:root:xxx" and new format "platform:chatID:thread:xxx"
+	parts := strings.SplitN(sessionKey, ":", 4)
+	if len(parts) == 4 {
+		// New format: platform:chatID:thread:threadID or platform:chatID:root:rootID
+		return parts[2] == "thread" || parts[2] == "root"
 	}
-	_, ok := parseThreadRootID(parts[2])
-	return ok
+	if len(parts) == 3 {
+		// Old format: platform:chatID:root:xxx (SplitN with limit 4 would give 4 parts)
+		// This branch handles legacy format without the prefix
+		_, ok := parseThreadRootID(parts[2])
+		return ok
+	}
+	return false
 }
 
 // feishuPreviewHandle stores the message ID for an editable preview message.
@@ -4567,12 +5215,19 @@ type feishuPreviewHandle struct {
 	sequence    int    // cardkit-v1 streaming text monotonic counter (++ before use; first call = 1)
 	status      core.CardStatus
 	lastContent string
+
+	// lastCardBody / lastCardFooter cache the last (body, footer) pair rendered
+	// via UpdateMessageWithStatusFooter so an identical repeat can be skipped.
+	// See UpdateMessageWithStatusFooter idempotency guard.
+	lastCardBody   string
+	lastCardFooter string
 }
 
 // buildCardJSON builds a Feishu interactive card JSON string with a markdown element.
 // Uses schema 2.0 which supports code blocks, tables, and inline formatting.
 // Card font is inherently smaller than Post/Text — this is a Feishu platform limitation.
 func buildCardJSON(content string) string {
+	content = stripModelFillerLines(content)
 	content = sanitizeCardMarkdownForCard(content)
 	card := map[string]any{
 		"schema": "2.0",
@@ -5153,7 +5808,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 	if p.shouldUseThreadOrReplyAPI(rc) {
 		req := larkim.NewReplyMessageReqBuilder().
 			MessageId(rc.messageID).
-			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent)).
+			Body(p.buildReplyMessageReqBody(rc, larkim.MsgTypeInteractive, sendContent, core.OutboxUUIDFromContext(ctx))).
 			Build()
 		var resp *larkim.ReplyMessageResp
 		if err := p.withTransientRetry(ctx, "send preview", func() error {
@@ -5375,11 +6030,29 @@ func (p *Platform) UpdateMessageWithStatusFooter(ctx context.Context, previewHan
 	// resolve since the matching Send path resolves on the chat-thread API.
 	processedBody := sanitizeMarkdownURLs(preprocessFeishuMarkdown(content))
 	processedFooter := sanitizeMarkdownURLs(preprocessFeishuMarkdown(footer))
-	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
-	// Same card-entity routing as UpdateMessage above.
+
+	// Idempotency guard: if the exact same (body, footer) pair was already
+	// rendered to this preview card, skip the redundant Patch. The streaming
+	// preview already delivered the final body via UpdateMessage; the only
+	// remaining work is appending the footer. When the body hasn't changed
+	// since that last render, re-patching the identical card makes Feishu
+	// re-render the footer element, which the UI shows as a duplicate
+	// status-footer line (the "double-print" symptom). Tracking the last
+	// rendered pair and short-circuiting identical updates fixes it while
+	// keeping the status footer visible.
 	h.mu.Lock()
+	lastBody, lastFooter := h.lastCardBody, h.lastCardFooter
+	h.lastCardBody = processedBody
+	h.lastCardFooter = processedFooter
 	cardID := h.cardID
 	h.mu.Unlock()
+	if processedBody == lastBody && processedFooter == lastFooter {
+		slog.Debug("feishu: UpdateMessageWithStatusFooter skipped (body+footer unchanged)",
+			"body_len", len(processedBody), "footer_len", len(processedFooter))
+		return nil
+	}
+	cardJSON := buildCardJSONWithStatusFooter(processedBody, processedFooter)
+	// Same card-entity routing as UpdateMessage above.
 	if cardID != "" {
 		return p.updateCardEntity(ctx, h, cardJSON)
 	}

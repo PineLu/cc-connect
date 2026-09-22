@@ -43,7 +43,18 @@ func TestSkillsMetadataProcess(t *testing.T) {
 		}
 		cwd, _ := os.Getwd()
 		cwds, _ := req.Params["cwds"].([]any)
-		if len(cwds) != 1 || cwds[0] != cwd || req.Params["forceReload"] != true || os.Getenv("CODEX_HOME") != os.Getenv("CC_EXPECT_CODEX_HOME") {
+		cwdArg := ""
+		if len(cwds) == 1 {
+			cwdArg, _ = cwds[0].(string)
+		}
+		// On macOS, a TempDir path may be spelled /var/... by the parent while
+		// getcwd(3) in the child reports the same directory as /private/var/....
+		// Compare directory identity instead of raw path strings so the helper
+		// does not exit early and surface a misleading EOF to the caller.
+		argInfo, argErr := os.Stat(cwdArg)
+		cwdInfo, cwdErr := os.Stat(cwd)
+		sameCwd := argErr == nil && cwdErr == nil && os.SameFile(argInfo, cwdInfo)
+		if len(cwds) != 1 || !sameCwd || req.Params["forceReload"] != true || os.Getenv("CODEX_HOME") != os.Getenv("CC_EXPECT_CODEX_HOME") {
 			os.Exit(4)
 		}
 		if os.Getenv("CC_SKILLS_HANG") == "1" {

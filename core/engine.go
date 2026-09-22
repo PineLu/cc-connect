@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"text/template"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -453,6 +454,11 @@ type Engine struct {
 	showWorkdirIndicator bool
 	replyFooterEnabled   bool
 
+	// footerTemplate is a Go text/template for the CCD-style reply footer.
+	// Empty means use the built-in default.
+	footerTemplate     string
+	footerTemplateTmpl *template.Template // parsed template (lazy)
+
 	// When true, /list etc. only show sessions tracked by cc-connect,
 	// hiding sessions created by direct CLI usage in the same work_dir.
 	// Default false = show all sessions.
@@ -498,6 +504,7 @@ type Engine struct {
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
 	stopping            bool
+	turnWg              sync.WaitGroup // in-flight message processors, joined on Stop
 	replyFooterMu       sync.Mutex
 	replyFooterUsage    replyFooterUsageCache
 
@@ -521,6 +528,10 @@ type Engine struct {
 
 	// Data directory for socket path injection
 	dataDir string
+
+	// outbox durably redelivers final replies after transient send failures.
+	outboxCfg OutboxConfig
+	outbox    *Outbox
 }
 
 // workspaceInitFlow tracks a channel that is being onboarded to a workspace.
@@ -575,6 +586,7 @@ type interactiveState struct {
 	sideText                 string
 	deleteMode               *deleteModeState
 	modelSwitch              *modelSwitchState
+	modelsList               *modelsListState
 	pendingProviderAdd       *pendingProviderAddState
 	lastAutoCompressAt       time.Time
 	lastAutoCompressTokens   int
@@ -717,6 +729,13 @@ type modelSwitchState struct {
 	result string
 }
 
+// modelsListState remembers the flattened /models listing behind a rendered
+// card so a dropdown selection ("act:/models switch <n>") can be resolved back
+// to the exact switch command without re-reading config or cache.
+type modelsListState struct {
+	items []ModelDetail
+}
+
 // pendingPermission represents a permission request waiting for user response.
 type pendingPermission struct {
 	RequestID       string
@@ -792,6 +811,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		eventIdleTimeout:      defaultEventIdleTimeout,
 		staleLockBreakAfter:   busyStaleLockMaxHeld,
 		maxQueuedMessages:     defaultMaxQueuedMessages,
+		outboxCfg:             DefaultOutboxConfig(),
 		showContextIndicator:  true,
 		showWorkdirIndicator:  true,
 		shell:                 defaultShell(),
@@ -1029,6 +1049,15 @@ func (e *Engine) SetShowWorkdirIndicator(show bool) {
 // no-ops.
 func (e *Engine) SetReplyFooterEnabled(show bool) {
 	e.replyFooterEnabled = show
+}
+
+// SetFooterTemplate sets a Go text/template for the CCD-style reply footer.
+// Available placeholders: {{.Model}}, {{.Effort}}, {{.Out}}, {{.In}},
+// {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}.
+// Empty string resets to the built-in default format.
+func (e *Engine) SetFooterTemplate(tmpl string) {
+	e.footerTemplate = tmpl
+	e.footerTemplateTmpl = nil // force re-parse on next use
 }
 
 // SetFilterExternalSessions controls whether /list, /switch, /delete, etc.
@@ -1450,6 +1479,49 @@ func (e *Engine) SetProjectStateStore(store *ProjectStateStore) {
 
 func (e *Engine) SetDataDir(dir string) {
 	e.dataDir = dir
+}
+
+// SetOutboxConfig overrides durable-redelivery configuration. Must be called
+// before Start; zero-valued fields fall back to defaults.
+func (e *Engine) SetOutboxConfig(cfg OutboxConfig) {
+	if cfg.InitialDelay <= 0 {
+		def := DefaultOutboxConfig()
+		if cfg.MaxAge <= 0 {
+			cfg.MaxAge = def.MaxAge
+		}
+		if cfg.MaxAttempts == 0 {
+			cfg.MaxAttempts = def.MaxAttempts
+		}
+		cfg.InitialDelay = def.InitialDelay
+		if cfg.MaxDelay <= 0 {
+			cfg.MaxDelay = def.MaxDelay
+		}
+		if cfg.SweepInterval <= 0 {
+			cfg.SweepInterval = def.SweepInterval
+		}
+	}
+	e.outboxCfg = cfg
+}
+
+// initOutbox creates the durable outbox under <dataDir>/outbox, recovers any
+// persisted replies, and starts its replayer loop. It is idempotent. When the
+// outbox is disabled or no data directory is known, redelivery stays off and
+// sends keep their legacy fire-and-forget behaviour.
+func (e *Engine) initOutbox() {
+	if !e.outboxCfg.Enabled || e.outbox != nil {
+		return
+	}
+	dir := e.dataDir
+	if dir == "" {
+		slog.Warn("outbox disabled: no data directory configured", "project", e.name)
+		return
+	}
+	ob := NewOutbox(filepath.Join(dir, "outbox"), e.outboxCfg)
+	if err := ob.Load(); err != nil {
+		slog.Warn("outbox: load failed, starting empty", "dir", ob.dir, "error", err)
+	}
+	e.outbox = ob
+	go e.outbox.Run(e.ctx, e.replayOutboxItem)
 }
 
 // RemoveCommand removes a custom command by name. Returns false if not found.
@@ -2394,6 +2466,7 @@ func (e *Engine) Start() error {
 		return startErrs[0] // Return first error
 	}
 
+	e.initOutbox()
 	e.startObserver()
 	return nil
 }
@@ -2405,6 +2478,12 @@ func (e *Engine) Stop() error {
 
 	// Cancel first so late lifecycle callbacks observe shutdown immediately.
 	e.cancel()
+
+	// Stop persisting sessions first: after this, no background goroutine can
+	// write the sessions file while platforms/sessions unwind or tests clean up.
+	if e.sessions != nil {
+		e.sessions.StopPersistence()
+	}
 
 	if e.observeCancel != nil {
 		e.observeCancel()
@@ -2433,6 +2512,10 @@ func (e *Engine) Stop() error {
 		}
 	}
 
+	// Wait for in-flight message processors (unwound by cancel + session close
+	// above) so none is still persisting sessions/outbox when Stop returns.
+	e.turnWg.Wait()
+
 	if e.rateLimiter != nil {
 		e.rateLimiter.Stop()
 	}
@@ -2444,6 +2527,11 @@ func (e *Engine) Stop() error {
 
 	if err := e.agent.Stop(); err != nil {
 		errs = append(errs, fmt.Errorf("stop agent %s: %w", e.agent.Name(), err))
+	}
+	// Processors have drained above; halt the outbox replayer and quiesce its
+	// disk I/O last so the data directory is untouched once Stop returns.
+	if e.outbox != nil {
+		e.outbox.Stop()
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("engine stop errors: %v", errs)
@@ -2468,6 +2556,9 @@ func (e *Engine) OnPlatformUnavailable(p Platform, err error) {
 // ReceiveMessage delivers a message from a platform to the engine.
 // This is a public wrapper for use in integration tests and external callers.
 func (e *Engine) ReceiveMessage(p Platform, msg *Message) {
+	if e.outbox != nil {
+		e.outbox.Kick() // inbound traffic is a connectivity signal for redelivery
+	}
 	e.handleMessage(p, msg)
 }
 
@@ -3284,7 +3375,11 @@ sessionLocked:
 		"session", session.ID,
 	)
 
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey, lockGen)
+	e.turnWg.Add(1)
+	go func() {
+		defer e.turnWg.Done()
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey, lockGen)
+	}()
 }
 
 func runMessageAccepted(msg *Message) {
@@ -6135,9 +6230,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						footerContext = fmt.Sprintf("[ctx: ~%d%%]", selfPct)
 					}
 				}
-				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir); status != "" {
+				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir, turnStart); status != "" {
 					statusFooter = status
-				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext); footer != "" {
+				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext, turnStart); footer != "" {
 					statusFooter = footer
 					legacyStatusFooter = footer
 				}
@@ -6300,7 +6395,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if segmentStart < len(textParts) {
 					unsent := strings.Join(textParts[segmentStart:], "")
 					if unsent != "" {
-						if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, unsent, statusFooter, sendWorkspaceWithError) {
+						if !e.sendFinalWithOutbox(sessionKey, e.ctx, p, replyCtx, unsent, statusFooter, sendWorkspaceWithError) {
 							return
 						}
 					}
@@ -6309,7 +6404,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				sp.discard()
 				metaOnly := strings.TrimSpace(strings.TrimPrefix(fullResponse, baseResponse))
 				if metaOnly != "" || statusFooter != "" {
-					if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, metaOnly, statusFooter, sendWorkspaceWithError) {
+					if !e.sendFinalWithOutbox(sessionKey, e.ctx, p, replyCtx, metaOnly, statusFooter, sendWorkspaceWithError) {
 						return
 					}
 				}
@@ -6318,7 +6413,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse), "footer_len", len(statusFooter))
 			} else {
 				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "footer_len", len(statusFooter))
-				if !sendChunksWithStatusFooter(e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
+				if !e.sendFinalWithOutbox(sessionKey, e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
 					return
 				}
 			}
@@ -6790,6 +6885,7 @@ var builtinCommands = []struct {
 	{[]string{"history"}, "history"},
 	{[]string{"allow"}, "allow"},
 	{[]string{"model"}, "model"},
+	{[]string{"models"}, "models"},
 	{[]string{"reasoning", "effort"}, "reasoning"},
 	{[]string{"mode"}, "mode"},
 	{[]string{"lang"}, "lang"},
@@ -6999,6 +7095,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdAllow(p, msg, args)
 	case "model":
 		e.cmdModel(p, msg, args)
+	case "models":
+		e.cmdModels(p, msg, args)
 	case "reasoning":
 		e.cmdReasoning(p, msg, args)
 	case "mode":
@@ -7634,9 +7732,75 @@ func (e *Engine) commandWorkDir(agent Agent, msg *Message) string {
 	return ""
 }
 
-func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string) string {
+// buildFooterTemplateData assembles the placeholder values for a custom footer
+// template from whatever context is available on the legacy (non-statusline)
+// footer path. Fields that cannot be derived are left empty so the template's
+// own {{if}} guards can skip them.
+//
+// contextLeft is the legacy status text (e.g. "[ctx: ~7%]" or "100% left"); it
+// is used as a fallback source for {{.Ctx}} when the session exposes no real
+// context usage.
+func (e *Engine) buildFooterTemplateData(session AgentSession, agent Agent, workspaceDir, contextLeft string, turnStart time.Time) footerTemplateData {
+	data := footerTemplateData{
+		Model:   strings.TrimSpace(replyFooterModel(session, agent)),
+		Effort:  strings.TrimSpace(replyFooterReasoningEffort(session, agent)),
+		Workdir: replyFooterWorkDir(session, agent, workspaceDir),
+	}
+	if !turnStart.IsZero() {
+		data.Elapsed = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang())
+	}
+
+	usage := replyFooterSessionContextUsage(session)
+	if usage == nil || usage.ContextWindow <= 0 {
+		// No real usage data: fall back to the self-reported "[ctx: ~N%]" marker
+		// so a template that only asks for {{.Ctx}} still renders a value.
+		if v := parseSelfReportedCtx(contextLeft); v > 0 {
+			data.Ctx = fmt.Sprintf("%d", v)
+		}
+		return data
+	}
+
+	used := usage.UsedTokens
+	if used <= 0 && !usage.CumulativeInputTokens {
+		// Only Anthropic-style disjoint buckets are safe to sum as a fallback;
+		// on the cumulative path they are running totals (see ContextUsage).
+		used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
+	}
+	pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	data.Ctx = fmt.Sprintf("%d", pct)
+	data.Out = formatStatusTokenCount(usage.OutputTokens)
+	data.In = formatStatusTokenCount(usage.InputTokens)
+	data.CW = formatStatusTokenCount(usage.CacheCreationInputTokens)
+	data.CR = formatStatusTokenCount(usage.CachedInputTokens)
+	if usage.CumulativeInputTokens {
+		// Cumulative counters would overstate the current request; report the
+		// same honest per-request figure that ctx% uses and drop cw/cr.
+		data.In = formatStatusTokenCount(usage.UsedTokens)
+		data.CW, data.CR = "", ""
+	}
+	return data
+}
+
+func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string, turnStart time.Time) string {
 	if !e.replyFooterEnabled || agent == nil {
 		return ""
+	}
+
+	// A user-supplied footer template takes precedence over the built-in legacy
+	// format: when configured, it fully defines the footer and its own {{if}}
+	// guards decide which fields appear. Rendering failure (or an empty result)
+	// falls through to the legacy format below, matching the graceful
+	// degradation used by buildClaudeStatusLineFooter.
+	if e.footerTemplate != "" {
+		if s := e.renderFooterTemplate(e.buildFooterTemplateData(session, agent, workspaceDir, contextLeft, turnStart)); s != "" {
+			return s
+		}
 	}
 
 	var parts []string
@@ -7744,6 +7908,10 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 //   - token counts: out (output) · in (new input) · cw (cache create) · cr (cache read)
 //   - ctx %: UsedTokens / ContextWindow, capped at 100%
 //
+// Agents whose input counter is session-cumulative (CumulativeInputTokens, see
+// core.ContextUsage) report a running total that can dwarf the window, so their
+// "in" is rendered from UsedTokens and the cw/cr tiers are omitted outright.
+//
 // Returns "" when usage is nil and no model is known.
 func buildClaudeStatusLineFooter(model, effort string, usage *ContextUsage) string {
 	var parts []string
@@ -7755,17 +7923,29 @@ func buildClaudeStatusLineFooter(model, effort string, usage *ContextUsage) stri
 	}
 	if usage != nil {
 		var counts []string
-		if usage.OutputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
+		// The "in" segment must show the prompt size of the most recent
+		// request. When InputTokens is flagged cumulative (ACP/Hermes reports
+		// a running session total that can exceed the window), substitute
+		// UsedTokens — the same value ctx% uses — and skip the segment when
+		// no honest per-request figure is available.
+		inputCount := usage.InputTokens
+		if usage.CumulativeInputTokens {
+			inputCount = usage.UsedTokens
 		}
-		if usage.InputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("in %s", formatStatusTokenCount(usage.InputTokens)))
+		if inputCount > 0 {
+			counts = append(counts, fmt.Sprintf("in %s", formatStatusTokenCount(inputCount)))
 		}
-		if usage.CacheCreationInputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("cw %s", formatStatusTokenCount(usage.CacheCreationInputTokens)))
-		}
-		if usage.CachedInputTokens > 0 {
-			counts = append(counts, fmt.Sprintf("cr %s", formatStatusTokenCount(usage.CachedInputTokens)))
+		// cw/cr on the ACP path carry the same "across all turns" semantics as
+		// InputTokens (and on OpenAI-style usage cached tokens are a SUBSET of
+		// the prompt, so they would double-report regardless) — omit them when
+		// the input counter is known to be cumulative.
+		if !usage.CumulativeInputTokens {
+			if usage.CacheCreationInputTokens > 0 {
+				counts = append(counts, fmt.Sprintf("cw %s", formatStatusTokenCount(usage.CacheCreationInputTokens)))
+			}
+			if usage.CachedInputTokens > 0 {
+				counts = append(counts, fmt.Sprintf("cr %s", formatStatusTokenCount(usage.CachedInputTokens)))
+			}
 		}
 		if len(counts) > 0 {
 			parts = append(parts, strings.Join(counts, " "))
@@ -8079,13 +8259,16 @@ func replyFooterHomeRelativePath(path, home string) (string, bool) {
 // buildClaudeStatusLineFooter renders a CCD-statusline-style footer for the
 // reply, composed of two lines:
 //
-//	line 1 (controlled by show_context_indicator): <model id> · [effort:X ·] out N · in N cw N cr N · ctx N%
+//	line 1 (controlled by show_context_indicator): <model id> · [effort:X ·] out N · in N cw N cr N · ctx N% · elapsed
 //	line 2 (controlled by show_workdir_indicator): <workspace dir>
+//
+// If e.footerTemplate is set, the footer is rendered via Go text/template
+// instead of the built-in format.
 //
 // Returns "" if reply_footer is disabled, or if the active session does not
 // expose per-turn cache-token data (i.e. this is not claudecode or no result
 // event has arrived yet) so callers fall back to the default footer.
-func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string) string {
+func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string, turnStart time.Time) string {
 	if !e.replyFooterEnabled {
 		return ""
 	}
@@ -8093,52 +8276,121 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	if usage == nil || usage.ContextWindow <= 0 {
 		return ""
 	}
-	// Only emit the CCD-style footer when we have the cache-token signals
-	// that CCD's statusline consumes. Other agents (codex, gemini) fall
-	// through to the default footer.
-	if usage.CachedInputTokens == 0 && usage.CacheCreationInputTokens == 0 {
+	// The two-line CCD status style needs real per-turn token activity:
+	// either Anthropic prompt-cache tiers (cw/cr) or per-turn input/output
+	// counts (ACP/Hermes). An agent that only reports window occupancy
+	// (UsedTokens/ContextWindow) plus a UsageReport quota bucket — and no
+	// per-turn tokens at all — keeps the legacy single-line quota footer.
+	hasCacheTokens := usage.CachedInputTokens > 0 || usage.CacheCreationInputTokens > 0
+	hasPerTurnTokens := usage.InputTokens > 0 || usage.OutputTokens > 0
+	if !hasCacheTokens && !hasPerTurnTokens {
 		return ""
 	}
 
+	// Compute common fields up front (used by both template and default paths).
+	model := strings.TrimSpace(replyFooterModel(session, agent))
+	effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent))
+	workdir := replyFooterWorkDir(session, agent, workspaceDir)
+
+	// Elapsed duration since turn started.
+	var elapsed string
+	if !turnStart.IsZero() {
+		elapsed = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang())
+	}
+
+	// Context-window percentage.
+	used := usage.UsedTokens
+	if used <= 0 && !usage.CumulativeInputTokens {
+		// Only Anthropic-style disjoint buckets are safe to sum as a fallback:
+		// on the cumulative path they are running totals, so summing them would
+		// fabricate an occupancy far beyond the real context.
+		used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
+	}
+	pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	ctxPct := fmt.Sprintf("%d", pct)
+
+	// Token counts as formatted strings. When the input counter is flagged
+	// session-cumulative (ACP/Hermes), "in" must render the honest per-request
+	// figure — UsedTokens, the same value ctx% uses — and cw/cr (equally
+	// cumulative, and a subset of the prompt on OpenAI-style usage) are
+	// dropped entirely.
+	outStr := formatStatusTokenCount(usage.OutputTokens)
+	inStr := formatStatusTokenCount(usage.InputTokens)
+	cwStr := formatStatusTokenCount(usage.CacheCreationInputTokens)
+	crStr := formatStatusTokenCount(usage.CachedInputTokens)
+	inValid := usage.InputTokens > 0
+	if usage.CumulativeInputTokens {
+		inStr = formatStatusTokenCount(usage.UsedTokens)
+		inValid = usage.UsedTokens > 0
+		cwStr, crStr = "", ""
+	}
+
+	// Template path: render via user-supplied Go template.
+	if e.footerTemplate != "" {
+		data := footerTemplateData{
+			Model:   model,
+			Effort:  effort,
+			Out:     outStr,
+			In:      inStr,
+			CW:      cwStr,
+			CR:      crStr,
+			Ctx:     ctxPct,
+			Elapsed: elapsed,
+			Workdir: workdir,
+		}
+		if s := e.renderFooterTemplate(data); s != "" {
+			return s
+		}
+		// Template parse/render failure → fall through to built-in default.
+	}
+
+	// Built-in default format.
 	var line1 string
 	if e.showContextIndicator {
-		used := usage.UsedTokens
-		if used <= 0 {
-			used = usage.InputTokens + usage.CachedInputTokens + usage.CacheCreationInputTokens
-		}
-		pct := int(math.Round(float64(used) * 100 / float64(usage.ContextWindow)))
-		if pct < 0 {
-			pct = 0
-		}
-		if pct > 100 {
-			pct = 100
-		}
-
 		// Compose:
-		//   <model id> · [effort:X ·] out N · in N cw N cr N · ctx N%
+		//   <model id> · [effort:X ·] out N · in N cw N cr N · ctx N% · <elapsed>
 		// `·` separates major segments; tokens-in tier (in/cw/cr) groups under
 		// one segment because cw/cr are just cache-tiered variants of input.
 		// Raw model id is preserved (e.g. "claude-opus-4-7[1m]") for diagnostic
 		// clarity over a prettified display name.
 		var line1Parts []string
-		if model := strings.TrimSpace(replyFooterModel(session, agent)); model != "" {
+		if model != "" {
 			line1Parts = append(line1Parts, model)
 		}
-		if effort := strings.TrimSpace(replyFooterReasoningEffort(session, agent)); effort != "" {
+		if effort != "" {
 			line1Parts = append(line1Parts, "effort:"+effort)
 		}
-		line1Parts = append(line1Parts, fmt.Sprintf("out %s", formatStatusTokenCount(usage.OutputTokens)))
-		line1Parts = append(line1Parts, fmt.Sprintf("in %s cw %s cr %s",
-			formatStatusTokenCount(usage.InputTokens),
-			formatStatusTokenCount(usage.CacheCreationInputTokens),
-			formatStatusTokenCount(usage.CachedInputTokens)))
-		line1Parts = append(line1Parts, fmt.Sprintf("ctx %d%%", pct))
+		if usage.OutputTokens > 0 {
+			line1Parts = append(line1Parts, fmt.Sprintf("out %s", outStr))
+		}
+		switch {
+		case !usage.CumulativeInputTokens && hasCacheTokens:
+			// Anthropic path: keep the CCD-style "in X cw Y cr Z" grouping
+			// (zero tiers still shown) once any cache tier is present.
+			line1Parts = append(line1Parts, fmt.Sprintf("in %s cw %s cr %s", inStr, cwStr, crStr))
+		case inValid:
+			// Cache-less agents (ACP/Hermes, …): plain input count, no cw/cr.
+			// Cumulative-flagged input arrives here after substitution.
+			line1Parts = append(line1Parts, fmt.Sprintf("in %s", inStr))
+		}
+		if used > 0 {
+			line1Parts = append(line1Parts, fmt.Sprintf("ctx %s%%", ctxPct))
+		}
+		if elapsed != "" {
+			line1Parts = append(line1Parts, elapsed)
+		}
 		line1 = strings.Join(line1Parts, " · ")
 	}
 
 	var line2 string
 	if e.showWorkdirIndicator {
-		line2 = replyFooterWorkDir(session, agent, workspaceDir)
+		line2 = workdir
 	}
 
 	switch {
@@ -8151,6 +8403,46 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	default:
 		return ""
 	}
+}
+
+// footerTemplateData holds the placeholder values available to a custom
+// footer template. All fields are pre-formatted strings ready for display.
+type footerTemplateData struct {
+	Model   string // model id (e.g. "claude-opus-4-7[1m]")
+	Effort  string // reasoning effort (e.g. "xhigh"), empty if unset
+	Out     string // output token count (e.g. "1.2k")
+	In      string // input token count
+	CW      string // cache-creation input token count
+	CR      string // cached-input token count
+	Ctx     string // context-window percentage (e.g. "4%")
+	Elapsed string // elapsed wall-clock since turn start (e.g. "12s")
+	Workdir string // workspace directory path
+}
+
+// defaultFooterTemplate is the built-in Go template equivalent to the
+// hard-coded footer format. It is used as a reference and could be offered
+// as a starting point for users who want to customise.
+const defaultFooterTemplate = `{{if .Model}}{{.Model}}{{end}}{{if .Effort}} · effort:{{.Effort}}{{end}}{{if .Out}} · out {{.Out}}{{end}} · in {{.In}}{{if ne .CW "0"}} cw {{.CW}}{{end}}{{if ne .CR "0"}} cr {{.CR}}{{end}}{{if .Ctx}} · ctx {{.Ctx}}{{end}}{{if .Elapsed}} · {{.Elapsed}}{{end}}{{if .Workdir}}
+{{.Workdir}}{{end}}`
+
+// renderFooterTemplate parses (lazily) and executes e.footerTemplate with the
+// given data. Returns "" on any error (parse or execution), allowing callers
+// to fall back gracefully.
+func (e *Engine) renderFooterTemplate(data footerTemplateData) string {
+	if e.footerTemplateTmpl == nil {
+		t, err := template.New("footer").Parse(e.footerTemplate)
+		if err != nil {
+			slog.Warn("footer template parse error, falling back to default", "error", err)
+			return ""
+		}
+		e.footerTemplateTmpl = t
+	}
+	var buf strings.Builder
+	if err := e.footerTemplateTmpl.Execute(&buf, data); err != nil {
+		slog.Warn("footer template execute error, falling back to default", "error", err)
+		return ""
+	}
+	return strings.TrimSpace(buf.String())
 }
 
 // sendChunksWithStatusFooter splits body across maxPlatformMessageLen and sends
@@ -8179,6 +8471,115 @@ func sendChunksWithStatusFooter(ctx context.Context, p Platform, replyCtx any, b
 		}
 	}
 	return true
+}
+
+// sendFinalChunk delivers one chunk of a split final reply, attaching the
+// status footer to the last chunk (StatusFooterSender first, inline fallback).
+// Shared by the immediate path and the outbox replayer so chunk/footer
+// semantics stay identical.
+func sendFinalChunk(ctx context.Context, p Platform, replyCtx any, chunks []string, idx int, statusFooter string, sendFn func(Platform, any, string) error) error {
+	chunk := chunks[idx]
+	isLast := idx == len(chunks)-1
+	if isLast && statusFooter != "" {
+		if sfs, ok := p.(StatusFooterSender); ok {
+			if err := sfs.SendWithStatusFooter(ctx, replyCtx, chunk, statusFooter); err == nil {
+				return nil
+			} else {
+				slog.Warn("SendWithStatusFooter failed, falling back to inline footer", "error", err)
+			}
+		}
+		chunk = appendReplyFooter(chunk, statusFooter)
+	}
+	return sendFn(p, replyCtx, chunk)
+}
+
+// sendFinalWithOutbox sends a *final* reply with durable redelivery. For
+// platforms implementing ReplyContextCodec + SendErrorClassifier with the
+// outbox enabled, it durably records the reply and per-chunk progress so a
+// transient outage or process restart is followed by replay of only the
+// missing chunks. Other platforms / disabled outbox fall back to
+// sendChunksWithStatusFooter. Returns true when every chunk was sent. Only
+// final replies use this path; progress and thinking side-channel sends do not.
+func (e *Engine) sendFinalWithOutbox(sessionKey string, ctx context.Context, p Platform, replyCtx any, body, statusFooter string, sendFn func(Platform, any, string) error) bool {
+	codec, isCodec := p.(ReplyContextCodec)
+	classifier, isClass := p.(SendErrorClassifier)
+	if e.outbox == nil || !isCodec || !isClass {
+		return sendChunksWithStatusFooter(ctx, p, replyCtx, body, statusFooter, sendFn)
+	}
+	chunks := SplitMessageCodeFenceAware(body, maxPlatformMessageLen)
+	if len(chunks) == 0 {
+		return true
+	}
+	encoded, err := codec.EncodeReplyCtx(replyCtx)
+	if err != nil {
+		slog.Warn("outbox: encode reply context failed, using plain send", "platform", p.Name(), "error", err)
+		return sendChunksWithStatusFooter(ctx, p, replyCtx, body, statusFooter, sendFn)
+	}
+	id := e.outbox.Add(p.Name(), sessionKey, encoded, body, statusFooter)
+	if id == "" { // outbox disabled
+		return sendChunksWithStatusFooter(ctx, p, replyCtx, body, statusFooter, sendFn)
+	}
+	// Bind the outbox idempotency key so a stray double send collapses at the platform.
+	sendCtx := WithOutboxUUID(ctx, e.outbox.ItemUUID(id))
+	for i := 0; i < len(chunks); i++ {
+		if err := sendFinalChunk(sendCtx, p, replyCtx, chunks, i, statusFooter, sendFn); err == nil {
+			e.outbox.SetChunkProgress(id, i+1)
+			continue
+		} else if classifier.IsRetryableSendError(err) {
+			// Park for the replayer; progress up to chunk i is already durable.
+			slog.Warn("final reply delivery interrupted, queued for redelivery",
+				"id", id, "chunk", i+1, "of", len(chunks), "error", err)
+			e.outbox.Fail(id, err) // schedule first backoff instead of hot-retrying
+			return false
+		} else {
+			// Permanent error: never redeliver.
+			e.outbox.Drop(id, err)
+			return false
+		}
+	}
+	e.outbox.Complete(id)
+	return true
+}
+
+// replayOutboxItem is the outbox replayer callback. It resends only the chunks
+// not yet acknowledged; done=true means the reply is fully delivered (or must
+// be dropped because it can never be delivered).
+func (e *Engine) replayOutboxItem(ctx context.Context, it *OutboxItem) (bool, error) {
+	p := e.lookupReadyPlatform(it.Platform)
+	if p == nil {
+		return false, fmt.Errorf("platform %q not ready for redelivery", it.Platform)
+	}
+	codec, ok := p.(ReplyContextCodec)
+	if !ok {
+		slog.Error("outbox: platform no longer supports reply-context codec, dropping reply", "platform", it.Platform, "id", it.ID)
+		return true, nil
+	}
+	classifier, _ := p.(SendErrorClassifier)
+	replyCtx, err := codec.DecodeReplyCtx(it.ReplyCtx)
+	if err != nil {
+		slog.Error("outbox: undecodable reply context, dropping reply", "id", it.ID, "error", err)
+		return true, nil
+	}
+	chunks := SplitMessageCodeFenceAware(it.Body, maxPlatformMessageLen)
+	if it.SentChunks > len(chunks) {
+		it.SentChunks = 0 // defensive: split result changed, resend all
+	}
+	replayCtx := WithOutboxUUID(ctx, it.UUID) // same idempotency key as the immediate attempt
+	for i := it.SentChunks; i < len(chunks); i++ {
+		// On replay the body is already rendered, so use the plain rendered-send
+		// path rather than re-applying workspace reference rendering.
+		if err := sendFinalChunk(replayCtx, p, replyCtx, chunks, i, it.Footer, e.sendAlreadyRenderedWithError); err != nil {
+			if classifier != nil && !classifier.IsRetryableSendError(err) {
+				slog.Error("outbox: permanent error on redelivery, dropping reply", "id", it.ID, "error", err)
+				return true, nil
+			}
+			return false, err
+		}
+		it.SentChunks = i + 1
+		e.outbox.SetChunkProgress(it.ID, i+1)
+	}
+	slog.Info("outbox: final reply redelivered", "id", it.ID, "platform", it.Platform, "session", it.SessionKey, "chunks", len(chunks))
+	return true, nil
 }
 
 func appendReplyFooter(content, footer string) string {
@@ -9409,6 +9810,10 @@ func (e *Engine) modelCardBackButton() CardButton {
 	return DefaultBtn(e.i18n.T(MsgCardBack), "nav:/model")
 }
 
+func (e *Engine) modelsCardBackButton() CardButton {
+	return DefaultBtn(e.i18n.T(MsgCardBack), "nav:/models")
+}
+
 func (e *Engine) cardPrevButton(action string) CardButton {
 	return DefaultBtn(e.i18n.T(MsgCardPrev), action)
 }
@@ -10077,6 +10482,15 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		return
 	}
 
+	// Command-driven agents (e.g. ACP/Hermes) switch models with a native
+	// slash command forwarded over the live session rather than through the
+	// structured ModelSwitcher interface (which targets the next session and
+	// requires an AvailableModels listing the agent may not provide).
+	if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+		e.cmdForwardModelCommand(p, msg, passer.ModelCommand(), sessions, args)
+		return
+	}
+
 	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelNotSupported))
@@ -10171,6 +10585,343 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	sessions.Save()
 
 	e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgModelChanged, target))
+}
+
+// cmdModels renders the switchable-model list as an interactive card with a
+// dropdown: picking an entry switches to it directly. The listing always
+// reflects the agent this project's engine is bound to (resolved through the
+// normal command context), so no selector argument is needed. Platforms
+// without card support fall back to text.
+func (e *Engine) cmdModels(p Platform, msg *Message, args []string) {
+	agent, _, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	_ = args
+
+	if !supportsCards(p) {
+		e.cmdModelsText(p, msg, agent)
+		return
+	}
+	e.replyWithCard(p, msg.ReplyCtx, e.renderModelsCard(msg.SessionKey, agent))
+}
+
+// cmdModelsText is the text fallback for /models on platforms without cards.
+func (e *Engine) cmdModelsText(p Platform, msg *Message, agent Agent) {
+	groups, total := e.collectModelDetails(agent)
+	if total == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelsNotSupported))
+		return
+	}
+
+	var sb strings.Builder
+	for _, g := range groups {
+		sb.WriteString(fmt.Sprintf("**%s**\n", g.title))
+		for _, d := range g.details {
+			sb.WriteString("`" + d.SwitchCommand + "`")
+			if d.Current {
+				sb.WriteString(" ← 当前")
+			}
+			if d.Note != "" {
+				sb.WriteString("  " + d.Note)
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+	sb.WriteString(e.i18n.T(MsgModelsUsage))
+	e.reply(p, msg.ReplyCtx, sb.String())
+}
+
+// renderModelsCard builds the /models dropdown card and remembers the flattened
+// listing in interactive state so a selection resolves to the exact detail.
+func (e *Engine) renderModelsCard(sessionKey string, agent Agent) *Card {
+	groups, total := e.collectModelDetails(agent)
+	if total == 0 {
+		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelsNotSupported))
+	}
+
+	var opts []CardSelectOption
+	var flat []ModelDetail
+	initVal := ""
+	n := 0
+	var sb strings.Builder
+	for _, g := range groups {
+		sb.WriteString(fmt.Sprintf("**%s** (%d)\n", g.title, len(g.details)))
+	}
+	var currentLine string
+	for _, g := range groups {
+		for _, d := range g.details {
+			n++
+			flat = append(flat, d)
+			label := d.Name
+			if d.ProviderLabel != "" {
+				label = d.ProviderLabel + " · " + d.Name
+			} else if d.Provider != "" {
+				label = d.Provider + " · " + d.Name
+			}
+			val := fmt.Sprintf("act:/models switch %d", n)
+			opts = append(opts, CardSelectOption{Text: label, Value: val})
+			if d.Current {
+				initVal = val
+				currentLine = d.SwitchCommand
+			}
+		}
+	}
+
+	// Remember the listing for the selection callback.
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	if state == nil {
+		state = &interactiveState{}
+		e.interactiveStates[interactiveKey] = state
+	}
+	e.interactiveMu.Unlock()
+	state.mu.Lock()
+	state.modelsList = &modelsListState{items: flat}
+	state.mu.Unlock()
+
+	body := e.i18n.T(MsgModelDefault)
+	if currentLine != "" {
+		body = e.i18n.Tf(MsgModelCurrent, currentLine)
+	}
+	cb := NewCard().Title(e.i18n.T(MsgCardTitleModel), "indigo").
+		Markdown(body + "\n" + sb.String()).
+		Select(e.i18n.T(MsgModelSelectPlaceholder), opts, initVal).
+		Buttons(e.cardBackButton())
+	cb.Note(e.i18n.T(MsgModelsUsage))
+	return cb.Build()
+}
+
+// handleModelsCardAction switches to the model chosen in the /models dropdown.
+// "switch <n>" resolves against the listing remembered at render time; unknown
+// selections re-render the card.
+func (e *Engine) handleModelsCardAction(args, sessionKey string) *Card {
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	state := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+
+	fields := strings.Fields(args)
+	if len(fields) < 2 || !strings.EqualFold(fields[0], "switch") {
+		agent, _ := e.sessionContextForKey(sessionKey)
+		return e.renderModelsCard(sessionKey, agent)
+	}
+	idx, err := strconv.Atoi(fields[1])
+	if err != nil || state == nil {
+		agent, _ := e.sessionContextForKey(sessionKey)
+		return e.renderModelsCard(sessionKey, agent)
+	}
+	state.mu.Lock()
+	var items []ModelDetail
+	if state.modelsList != nil {
+		items = append([]ModelDetail(nil), state.modelsList.items...)
+	}
+	state.mu.Unlock()
+	if len(items) == 0 || idx < 1 || idx > len(items) {
+		agent, _ := e.sessionContextForKey(sessionKey)
+		return e.renderModelsCard(sessionKey, agent)
+	}
+	target := items[idx-1]
+
+	// ACP/command-driven agents (Hermes): forward the full switch command over
+	// the live session and report the running state; the agent's own reply
+	// carries the confirmation. Resolve the agent for this session/workspace
+	// first; using e.agent here breaks multi-workspace projects whose bound
+	// workspace agent differs from the engine's global/default agent.
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+		e.interactiveMu.Lock()
+		st := e.interactiveStates[interactiveKey]
+		if st == nil {
+			st = &interactiveState{}
+			e.interactiveStates[interactiveKey] = st
+		}
+		e.interactiveMu.Unlock()
+		st.mu.Lock()
+		alive := st.agentSession != nil && st.agentSession.Alive()
+		st.mu.Unlock()
+		if !alive {
+			// No live agent session (e.g. right after a restart): forwarding
+			// would nil-deref on state.agentSession. Tell the user to send a
+			// message first, same as the typed /model path (MsgModelNoSession).
+			return NewCard().
+				Title(e.i18n.T(MsgCardTitleModel), "red").
+				Markdown(e.i18n.T(MsgModelNoSession)).
+				Buttons(e.modelsCardBackButton()).
+				Build()
+		}
+		st.mu.Lock()
+		st.modelSwitch = &modelSwitchState{phase: "switching", target: target.SwitchCommand}
+		st.mu.Unlock()
+		go e.forwardModelsSwitchAsync(sessionKey, st, target.SwitchCommand, target.Name)
+		return e.renderModelSwitchingCard(target.SwitchCommand)
+	}
+
+	if _, ok := agent.(ModelSwitcher); !ok {
+		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
+	}
+	model := target.Name
+	resolved, serr := e.switchModelOnAgent(agent, model, agent == e.agent)
+	if serr == nil {
+		e.persistWorkspaceModelOverride(interactiveKey, sessionKey, agent, resolved)
+		sessions.Save()
+	}
+	e.cleanupInteractiveState(interactiveKey)
+	return e.renderModelsSwitchResultCard(resolved, serr)
+}
+
+// renderModelsSwitchResultCard reports the /models switch outcome; its back
+// button returns to the model list rather than the main help menu.
+func (e *Engine) renderModelsSwitchResultCard(target string, err error) *Card {
+	if err != nil {
+		return NewCard().
+			Title(e.i18n.T(MsgCardTitleModel), "red").
+			Markdown(e.i18n.Tf(MsgModelCardSwitchFailed, err)).
+			Buttons(e.modelsCardBackButton()).
+			Build()
+	}
+	return NewCard().
+		Title(e.i18n.T(MsgCardTitleModel), "green").
+		Markdown(e.i18n.Tf(MsgModelCardSwitched, target)).
+		Buttons(e.modelsCardBackButton()).
+		Build()
+}
+
+// forwardModelsSwitchAsync forwards a full "/model ..." switch command to the
+// live ACP session (Hermes) and refreshes the card with the agent's reply.
+func (e *Engine) forwardModelsSwitchAsync(sessionKey string, state *interactiveState, command, label string) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	alive := state.agentSession != nil && state.agentSession.Alive()
+	state.mu.Unlock()
+	if !alive {
+		// Session died between selection and forward: never touch a nil/dead
+		// agentSession (would panic). Just drop the pending switch state.
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	passer, ok := agent.(ModelCommand)
+	if !ok || passer.ModelCommand() == "" {
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	platformName := extractPlatformName(sessionKey)
+	var targetPlatform Platform
+	for _, p := range e.platforms {
+		if p.Name() == platformName {
+			targetPlatform = p
+			break
+		}
+	}
+	if targetPlatform == nil {
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	session := sessions.GetOrCreateActive(sessionKey)
+	lockGen, locked := session.TryLock()
+	if !locked {
+		e.pushModelSwitchResultCard(sessionKey, e.renderModelsSwitchResultCard("", fmt.Errorf("%s", e.i18n.T(MsgPreviousProcessing))))
+		e.cleanupInteractiveState(e.interactiveKeyForSessionKey(sessionKey), state)
+		return
+	}
+	iKey := e.interactiveKeyForSessionKey(sessionKey)
+	// Card callbacks carry no usable reply context (nil after a restart), so
+	// the switch result text would never reach the user. Reconstruct one.
+	state.mu.Lock()
+	replyCtx := state.replyCtx
+	state.mu.Unlock()
+	if rc, ok := targetPlatform.(ReplyContextReconstructor); ok {
+		if rctx, err := rc.ReconstructReplyCtx(sessionKey); err != nil {
+			slog.Warn("models switch: reconstruct reply ctx failed, using card ctx", "error", err)
+		} else {
+			replyCtx = rctx
+		}
+	}
+	_, rerr := e.runForwardedCommand(state, session, sessions, iKey, targetPlatform, replyCtx, command, false, "", lockGen)
+	if e.ctx.Err() != nil || state.isStopped() {
+		e.cleanupInteractiveState(iKey, state)
+		return
+	}
+	resolved := label
+	if rerr != nil {
+		resolved = ""
+	} else if as := func() AgentSession {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		return state.agentSession
+	}(); as != nil {
+		// Keep the reply footer accurate without waiting for a session
+		// restart; the agent only announces its model on session new/load.
+		if setter, ok := as.(interface{ SetModel(string) }); ok {
+			setter.SetModel(label)
+		}
+	}
+	e.pushModelSwitchResultCard(sessionKey, e.renderModelsSwitchResultCard(resolved, rerr))
+	e.cleanupInteractiveState(iKey, state)
+}
+
+// renderModelsCardSafe resolves the agent for a session key before rendering,
+// for nav: re-renders where no agent is passed explicitly.
+func (e *Engine) renderModelsCardSafe(sessionKey string) *Card {
+	agent, _ := e.sessionContextForKey(sessionKey)
+	return e.renderModelsCard(sessionKey, agent)
+}
+
+type modelGroup struct {
+	title   string
+	details []ModelDetail
+}
+
+// collectModelDetails pulls the model list from whichever optional interface the
+// agent implements: ModelLister (provider-aware, offline-safe) is preferred,
+// ModelSwitcher.AvailableModels is the fallback for agents without one.
+func (e *Engine) collectModelDetails(agent Agent) ([]modelGroup, int) {
+	ctx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
+	defer cancel()
+
+	var details []ModelDetail
+	if lister, ok := agent.(ModelLister); ok {
+		details = lister.ListModelsDetail(ctx)
+	} else if switcher, ok := agent.(ModelSwitcher); ok {
+		for _, m := range switcher.AvailableModels(ctx) {
+			details = append(details, ModelDetail{
+				Name:          m.Name,
+				Note:          m.Desc,
+				SwitchCommand: "/model " + m.Name,
+			})
+		}
+	}
+	if len(details) == 0 {
+		return nil, 0
+	}
+
+	// Group by provider, preserving first-seen order so the primary/current
+	// provider stays at the top of the reply.
+	var groups []modelGroup
+	index := map[string]int{}
+	for _, d := range details {
+		title := d.ProviderLabel
+		if title == "" {
+			title = d.Provider
+		}
+		if title == "" {
+			title = "默认"
+		}
+		i, seen := index[title]
+		if !seen {
+			i = len(groups)
+			index[title] = i
+			groups = append(groups, modelGroup{title: title})
+		}
+		groups[i].details = append(groups[i].details, d)
+	}
+	return groups, len(details)
 }
 
 // resolveModelAlias resolves a user-supplied string to a model name.
@@ -10646,55 +11397,24 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	state.mu.Unlock()
 
 	// If the agent session supports graceful turn cancellation (e.g. ACP),
-	// send a cancel notification and keep the session alive for the next
-	// user message, rather than killing the process and destroying state.
+	// send a cancel notification to stop the current turn, then fall through
+	// to normalCleanup to kill the process. This matches Claude Code behavior:
+	// /stop kills the process, next message spawns a fresh one and resumes
+	// the session from persisted history. Keeping the process alive after
+	// cancel leaves the agent in a broken state (json-rpc -32603).
 	if canceller, ok := agentSession.(AgentSessionCanceller); ok && agentSession != nil {
-		// Keep the state in the map so the next message reuses this session.
-		// Don't markStopped — the session is still usable.
-		// Don't delete from interactiveStates — keep it alive.
-		e.interactiveMu.Unlock()
-
-		if pending != nil {
-			pending.resolve()
-		}
-		if notifyQueued {
-			e.notifyDroppedQueuedMessages(state, fmt.Errorf("session cancelled"))
+		if cancelErr := canceller.CancelTurn(); cancelErr != nil {
+			slog.Debug("agent session CancelTurn failed during stop", "session_key", sessionKey, "error", cancelErr)
 		} else {
-			state.mu.Lock()
-			state.pendingMessages = nil
-			state.mu.Unlock()
+			slog.Info("agent session turn cancelled, killing process for clean restart", "session_key", sessionKey)
 		}
-
-		// Mark eventsNeedResync so the next turn drains stale events from
-		// the cancelled turn before processing fresh input.
-		state.mu.Lock()
-		state.eventsNeedResync = true
-		state.mu.Unlock()
-
-		cancelErr := canceller.CancelTurn()
-		if cancelErr != nil {
-			slog.Warn("agent session CancelTurn failed, falling back to Close",
-				"session_key", sessionKey, "error", cancelErr)
-			// Fall through to normal cleanup below.
-			goto normalCleanup
-		}
-
+		// Fall through to normalCleanup to kill the process and delete state.
+		// The next message will spawn a fresh process and resume the session.
 		if state.busySession != nil && state.busySession.ForceUnlock() {
 			slog.Info("session busy lock released after turn cancel", "session_key", sessionKey)
 		}
-
-		slog.Info("agent session turn cancelled, session kept alive",
-			"session_key", sessionKey)
-
-		e.hooks.Emit(HookEvent{
-			Event:      HookEventSessionEnded,
-			SessionKey: sessionKey,
-		})
-
-		return true
 	}
 
-normalCleanup:
 	state.markStopped()
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
@@ -10726,6 +11446,48 @@ normalCleanup:
 	})
 
 	return true
+}
+
+// cmdForwardModelCommand handles /model for agents that switch models with a
+// native slash command (ModelCommand, e.g. ACP/Hermes "/model"). It forwards
+// "<baseCmd> [args]" to the live session and relays the agent's text reply:
+// with no args the agent reports its current model, with args it switches the
+// current session in place (preserving history).
+func (e *Engine) cmdForwardModelCommand(p Platform, msg *Message, baseCmd string, sessions *SessionManager, args []string) {
+	command := strings.TrimSpace(baseCmd)
+	if len(args) > 0 {
+		command = command + " " + strings.Join(args, " ")
+	}
+
+	iKey := e.interactiveKeyForSessionKey(msg.SessionKey)
+	e.interactiveMu.Lock()
+	state, hasState := e.interactiveStates[iKey]
+	e.interactiveMu.Unlock()
+
+	if !hasState || state == nil {
+		// Fallback: suffix scan for multi-workspace key mismatch
+		if found := e.findInteractiveKeyForSession(msg.SessionKey); found != "" && found != iKey {
+			e.interactiveMu.Lock()
+			state, hasState = e.interactiveStates[found]
+			e.interactiveMu.Unlock()
+		}
+	}
+
+	if !hasState || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelNoSession))
+		return
+	}
+
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+	lockGen, locked := session.TryLock()
+	if !locked {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
+		return
+	}
+
+	e.send(p, msg.ReplyCtx, e.i18n.T(MsgModelSwitching))
+
+	go e.runForwardedCommand(state, session, sessions, iKey, p, msg.ReplyCtx, command, false, "", lockGen)
 }
 
 func (e *Engine) cmdCompress(p Platform, msg *Message) {
@@ -10772,15 +11534,36 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false, lockGen)
 }
 
-// runCompress sends the agent's compress command and handles results.
-// If autoTriggered is true, suppress user-visible "compressing" and completion messages.
+// runCompress resolves the agent's native compression command and forwards
+// it. It is a thin wrapper over runForwardedCommand; the session lock passed
+// in by the caller is always released here. When auto is true (automatic
+// compression), all user-visible messages are suppressed.
 func (e *Engine) runCompress(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, auto bool, lockGen uint64) {
-	// session.Unlock() is called inside drainQueuedMessagesAfterCompress
-	// while holding state.mu to close the race window. Deferred fallback
-	// ensures the lock is released on early-return paths.
-	compressUnlocked := false
+	compressor, ok := e.agent.(ContextCompressor)
+	if !ok || compressor.CompressCommand() == "" {
+		if !auto {
+			e.reply(p, replyCtx, e.i18n.T(MsgCompressNotSupported))
+		}
+		session.Unlock(lockGen)
+		return
+	}
+	e.runForwardedCommand(state, session, sessions, iKey, p, replyCtx,
+		compressor.CompressCommand(), auto, e.i18n.T(MsgCompressDone), lockGen)
+}
+
+// runForwardedCommand sends a native agent slash command (e.g. Hermes'
+// /compress or /model) to the live agent session and relays whatever text it
+// emits back to the user. It is shared by /compact (ContextCompressor) and
+// /model (ModelCommand) for agents whose capability is driven by a slash
+// command. The caller holds the session lock; it is released either by
+// drainQueuedMessagesAfterCompress while closing the race window, or by the
+// deferred fallback on an early-return path. When auto is true the command
+// runs silently. emptyText is shown only when the command produces no text;
+// pass "" to stay silent in that case.
+func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, command string, auto bool, emptyText string, lockGen uint64) (string, error) {
+	commandUnlocked := false
 	defer func() {
-		if !compressUnlocked {
+		if !commandUnlocked {
 			session.Unlock(lockGen)
 		}
 	}()
@@ -10795,32 +11578,25 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 
 	drainEvents(state.agentSession.Events())
 
-	compressor, ok := e.agent.(ContextCompressor)
-	if !ok || compressor.CompressCommand() == "" {
-		if !auto {
-			e.reply(p, replyCtx, e.i18n.T(MsgCompressNotSupported))
-		}
-		return
-	}
-
-	cmd := compressor.CompressCommand()
-	if err := state.agentSession.Send(cmd, "", nil, nil); err != nil {
+	if err := state.agentSession.Send(command, "", nil, nil); err != nil {
 		if !auto {
 			e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 		}
 		if !state.agentSession.Alive() {
 			e.cleanupInteractiveState(iKey)
 		}
-		return
+		return "", err
 	}
 
-	e.processCompressEvents(state, session, sessions, iKey, p, replyCtx, &compressUnlocked, auto, lockGen)
+	return e.processForwardedEvents(state, session, sessions, iKey, p, replyCtx, &commandUnlocked, auto, emptyText, lockGen)
 }
 
-// processCompressEvents drains agent events after a compress command.
-// Unlike processInteractiveEvents it does NOT record history and treats
-// an empty result as success rather than "(empty response)".
-func (e *Engine) processCompressEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, lockGen uint64) {
+// processForwardedEvents drains agent events after a forwarded slash command
+// (compression or runtime model switch). Unlike processInteractiveEvents it
+// does NOT record history and treats an empty result as success rather than
+// "(empty response)". emptyText is relayed only when no text comes back; an
+// empty emptyText means "stay silent".
+func (e *Engine) processForwardedEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, emptyText string, lockGen uint64) (string, error) {
 
 	var textParts []string
 	events := state.agentSession.Events()
@@ -10840,33 +11616,35 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 
 		select {
 		case <-stopCh:
-			return
+			return "", nil
 		case event, ok = <-events:
 			if !ok {
 				e.cleanupInteractiveState(sessionKey, state)
 				if !auto {
 					if len(textParts) > 0 {
 						e.send(p, replyCtx, strings.Join(textParts, ""))
-					} else {
-						e.reply(p, replyCtx, e.i18n.T(MsgCompressDone))
+					} else if emptyText != "" {
+						e.reply(p, replyCtx, emptyText)
 					}
 				}
-				e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited during compress"))
-				return
+				forwardErr := fmt.Errorf("agent process exited during forwarded command")
+				e.notifyDroppedQueuedMessages(state, forwardErr)
+				return strings.Join(textParts, ""), forwardErr
 			}
 		case <-idleCh:
 			if !auto {
 				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
 			}
+			forwardErr := fmt.Errorf("forwarded command timed out")
 			e.cleanupInteractiveState(sessionKey, state)
-			e.notifyDroppedQueuedMessages(state, fmt.Errorf("compress timed out"))
-			return
+			e.notifyDroppedQueuedMessages(state, forwardErr)
+			return strings.Join(textParts, ""), forwardErr
 		case <-e.ctx.Done():
-			return
+			return "", nil
 		}
 
 		if state.isStopped() {
-			return
+			return "", nil
 		}
 
 		if idleTimer != nil {
@@ -10907,14 +11685,14 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 			if !auto {
 				if result != "" {
 					e.send(p, replyCtx, result)
-				} else {
-					e.reply(p, replyCtx, e.i18n.T(MsgCompressDone))
+				} else if emptyText != "" {
+					e.reply(p, replyCtx, emptyText)
 				}
 			}
 
 			// After compress succeeds, process any queued messages instead of dropping them.
 			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
-			return
+			return result, nil
 		case EventError:
 			if !auto && event.Error != nil {
 				e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
@@ -10927,7 +11705,10 @@ func (e *Engine) processCompressEvents(state *interactiveState, session *Session
 				// Agent survived — try to process queued messages.
 				e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
 			}
-			return
+			if event.Error != nil {
+				return "", event.Error
+			}
+			return "", fmt.Errorf("agent error during forwarded command")
 		case EventPermissionRequest:
 			_ = state.agentSession.RespondPermission(event.RequestID, PermissionResult{
 				Behavior:     "allow",
@@ -12307,6 +13088,11 @@ func (e *Engine) sendAlreadyRenderedWithError(p Platform, replyCtx any, content 
 		}
 		return err
 	}
+	// A successful outbound send means connectivity is healthy — nudge the
+	// outbox to replay any other parked replies right away.
+	if e.outbox != nil {
+		e.outbox.Kick()
+	}
 	if elapsed := time.Since(start); elapsed >= slowPlatformSend {
 		slog.Warn("slow platform send", "platform", p.Name(), "elapsed", elapsed, "content_len", len(content))
 	}
@@ -12459,6 +13245,10 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.handleModelCardAction(args, sessionKey)
 	}
 
+	if prefix == "act" && cmd == "/models" {
+		return e.handleModelsCardAction(args, sessionKey)
+	}
+
 	if prefix == "act" {
 		e.executeCardAction(cmd, args, sessionKey)
 	}
@@ -12468,6 +13258,8 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.renderHelpGroupCard(args)
 	case "/model":
 		return e.renderModelCard(sessionKey)
+	case "/models":
+		return e.renderModelsCardSafe(sessionKey)
 	case "/reasoning":
 		return e.renderReasoningCard()
 	case "/mode":
@@ -15086,7 +15878,11 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey, lockGen)
+	e.turnWg.Add(1)
+	go func() {
+		defer e.turnWg.Done()
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey, lockGen)
+	}()
 }
 
 // executeShellCommand runs a shell command and sends the output to the user.
@@ -15315,7 +16111,11 @@ func (e *Engine) executeSkill(p Platform, msg *Message, skill *Skill, args []str
 	)
 
 	msg.Content = prompt
-	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey, lockGen)
+	e.turnWg.Add(1)
+	go func() {
+		defer e.turnWg.Done()
+		e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, workspaceDir, msg.SessionKey, lockGen)
+	}()
 }
 
 func (e *Engine) cmdSkills(p Platform, msg *Message) {

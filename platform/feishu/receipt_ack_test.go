@@ -70,6 +70,15 @@ func TestReceiptAcknowledgement_AcceptedMessagePersistsThroughTypingCleanup(t *t
 			var mu sync.Mutex
 			active := map[string]string{}
 			p := receiptTestPlatform(t, map[string]any{"ack_emoji": "Get", "reaction_emoji": processingEmoji}, func(w http.ResponseWriter, r *http.Request) {
+				// Branch text-ack (sendAckMessage) posts a reply during dispatch.
+				// It is not part of the receipt-reaction sequence: answer success
+				// without recording, so reaction accounting stays exact.
+				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reply") {
+					if _, err := fmt.Fprint(w, `{"code":0,"data":{"message_id":"om_ack"}}`); err != nil {
+						t.Errorf("write ack fixture response: %v", err)
+					}
+					return
+				}
 				req := receiptRequest{method: r.Method, path: r.URL.Path}
 				mu.Lock()
 				switch r.Method {
@@ -161,7 +170,17 @@ func TestReceiptAcknowledgement_DisabledAndSyntheticMessages(t *testing.T) {
 		{"synthetic", map[string]any{"ack_emoji": "Get"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := receiptTestPlatform(t, tc.opts, func(w http.ResponseWriter, r *http.Request) { t.Errorf("unexpected API call: %s", r.URL.Path) })
+			p := receiptTestPlatform(t, tc.opts, func(w http.ResponseWriter, r *http.Request) {
+				// Branch text-ack reply is orthogonal to the receipt feature:
+				// answer success so dispatch completes without noise.
+				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reply") {
+					if _, err := fmt.Fprint(w, `{"code":0,"data":{"message_id":"om_ack"}}`); err != nil {
+						t.Errorf("write ack fixture response: %v", err)
+					}
+					return
+				}
+				t.Errorf("unexpected API call: %s", r.URL.Path)
+			})
 			p.handler = func(_ core.Platform, m *core.Message) {}
 			msg := receiptMessage()
 			if tc.synthetic {
@@ -184,6 +203,14 @@ func TestReceiptAcknowledgement_SlowOrFailedAPIIsBestEffort(t *testing.T) {
 			unblock := func() { releaseOnce.Do(func() { close(release) }) }
 			defer unblock()
 			p := receiptTestPlatform(t, map[string]any{"ack_emoji": "Get"}, func(w http.ResponseWriter, r *http.Request) {
+				// Branch text-ack reply must not consume the one-shot started
+				// gate: answer success immediately, only the reaction arms it.
+				if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reply") {
+					if _, err := fmt.Fprint(w, `{"code":0,"data":{"message_id":"om_ack"}}`); err != nil {
+						t.Errorf("write ack fixture response: %v", err)
+					}
+					return
+				}
 				close(started)
 				<-release
 				if fail {
@@ -308,11 +335,19 @@ func TestReceiptAcknowledgement_TypingStopsBeforeReceiptCompletes(t *testing.T) 
 	defer unblock()
 	var requests atomic.Int32
 	p := receiptTestPlatform(t, map[string]any{"ack_emoji": "Get", "reaction_emoji": "Get"}, func(w http.ResponseWriter, r *http.Request) {
-		requests.Add(1)
 		if r.Method != http.MethodPost {
 			t.Errorf("receipt deleted: %s", r.Method)
 			return
 		}
+		// Branch text-ack reply must not consume the one-shot started
+		// gate (double close would panic and hang the test binary).
+		if strings.HasSuffix(r.URL.Path, "/reply") {
+			if _, err := fmt.Fprint(w, `{"code":0,"data":{"message_id":"om_ack"}}`); err != nil {
+				t.Errorf("write ack fixture response: %v", err)
+			}
+			return
+		}
+		requests.Add(1)
 		close(started)
 		<-release
 		if _, err := fmt.Fprint(w, `{"code":0,"data":{"reaction_id":"receipt"}}`); err != nil {
@@ -347,6 +382,11 @@ type receiptDeadlineTransport struct{ observed chan time.Duration }
 func (rt *receiptDeadlineTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if strings.Contains(r.URL.Path, "/auth/") {
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"code":0,"expire":7200,"tenant_access_token":"test-token"}`))}, nil
+	}
+	// Branch text-ack reply is orthogonal: answer success without touching
+	// the one-slot observed channel, so only the reaction deadline is read.
+	if strings.HasSuffix(r.URL.Path, "/reply") {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"code":0,"data":{"message_id":"om_ack"}}`))}, nil
 	}
 	deadline, ok := r.Context().Deadline()
 	if !ok {

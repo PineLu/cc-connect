@@ -495,3 +495,25 @@ func TestSession_maybeAbsorbCurrentModeUpdate(t *testing.T) {
 		t.Fatalf("callback should have been fired with currentModeId=plan, got %+v ok=%v", last, ok)
 	}
 }
+
+// TestAcpSessionSetModel guards the /models footer freshness hook:
+// a successful card switch overrides the cached model id (announced only on
+// session new/load), empty input is ignored.
+func TestAcpSessionSetModel(t *testing.T) {
+	s := &acpSession{}
+	if got := s.GetModel(); got != "" {
+		t.Fatalf("fresh session model = %q, want empty", got)
+	}
+	s.absorbModel(&acpModelBlock{CurrentModelID: "custom:muse-spark-1.3"})
+	if got := s.GetModel(); got != "custom:muse-spark-1.3" {
+		t.Fatalf("after absorb model = %q", got)
+	}
+	s.SetModel("glm-5.3-flash")
+	if got := s.GetModel(); got != "glm-5.3-flash" {
+		t.Fatalf("after SetModel = %q", got)
+	}
+	s.SetModel("   ")
+	if got := s.GetModel(); got != "glm-5.3-flash" {
+		t.Fatalf("empty SetModel changed model to %q", got)
+	}
+}

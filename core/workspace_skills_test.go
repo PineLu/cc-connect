@@ -116,6 +116,18 @@ func newWorkspaceSkillsEngine(t *testing.T, p Platform) (*Engine, string, string
 	}
 	writeWorkspaceSkill(t, global, "global-skill", "Global instructions")
 	writeWorkspaceSkill(t, global, "shared-skill", "Wrong global instructions")
+
+	// Match production workspace identity. On macOS, t.TempDir() may return a
+	// /var/... spelling while child processes/getcwd resolve the same directory
+	// as /private/var/.... Production routing canonicalizes workspace paths via
+	// normalizeWorkspacePath, so the shared fixture must return and bind the
+	// same canonical paths; otherwise override keys and execution assertions
+	// compare two spellings of the same directory.
+	base = normalizeWorkspacePath(base)
+	a = normalizeWorkspacePath(a)
+	b = normalizeWorkspacePath(b)
+	global = normalizeWorkspacePath(global)
+
 	name := "workspace-skills-" + t.Name()
 	RegisterAgent(name, func(opts map[string]any) (Agent, error) {
 		return &workspaceSkillAgent{name: name, workDir: opts["work_dir"].(string), global: global}, nil

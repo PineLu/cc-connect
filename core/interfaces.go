@@ -54,6 +54,26 @@ type ReplyContextReconstructor interface {
 	ReconstructReplyCtx(sessionKey string) (any, error)
 }
 
+// ReplyContextCodec is an optional interface for platforms whose reply context
+// can be round-trip serialized. It powers durable redelivery (the outbox):
+// when a final reply can't be delivered immediately, the engine persists the
+// encoded reply context together with the rendered reply and replays it after
+// connectivity returns or after a restart. Platforms that don't implement it
+// keep the legacy fire-and-forget send behaviour.
+type ReplyContextCodec interface {
+	EncodeReplyCtx(replyCtx any) ([]byte, error)
+	DecodeReplyCtx(encoded []byte) (any, error)
+}
+
+// SendErrorClassifier is an optional interface that classifies an outgoing
+// send failure as retryable (transient network / 5xx) or permanent (invalid
+// request, bot removed from the chat, missing permission, ...). Retryable
+// failures of a *final reply* are parked in the outbox for redelivery;
+// permanent failures and progress/side-channel sends are not retried.
+type SendErrorClassifier interface {
+	IsRetryableSendError(err error) bool
+}
+
 // RelayGroupVisibilityTarget is an optional interface for platforms that
 // want to customise the session key used when echoing relay request /
 // response messages into the group chat for visibility.  Platforms that
@@ -435,6 +455,44 @@ type ModelSwitcher interface {
 	AvailableModels(ctx context.Context) []ModelOption
 }
 
+// ModelLister is an optional interface for agents that can enumerate every
+// switchable model together with the provider each one belongs to. Unlike
+// ModelSwitcher.AvailableModels, which returns a flat list meant for the /model
+// picker, ListModelsDetail preserves the provider grouping a multi-provider
+// agent needs and is expected to work without contacting the network (so it
+// still answers while the currently selected model is unreachable).
+//
+// The engine uses it for the /models command. Agents that also implement
+// ModelLister are preferred over the ModelSwitcher fallback; agents that do not
+// still get a reasonable answer when they implement ModelSwitcher.
+type ModelLister interface {
+	ListModelsDetail(ctx context.Context) []ModelDetail
+}
+
+// ModelDetail is one switchable model together with the routing information
+// needed to build a copy-pasteable switch command.
+type ModelDetail struct {
+	// Name is the model identifier as the agent expects it.
+	Name string
+	// Provider is the agent's provider slug, empty when the agent has a single
+	// implicit provider.
+	Provider string
+	// ProviderLabel is a human-readable provider name for display; falls back
+	// to Provider when empty.
+	ProviderLabel string
+	// CustomProvider marks a user-defined endpoint, which must be addressed as
+	// "custom:<Provider>:<Name>" rather than "<Provider>:<Name>".
+	CustomProvider bool
+	// SwitchCommand is the command the user can copy to select this model,
+	// formatted for the agent's own switch syntax (e.g. "/model provider:name").
+	SwitchCommand string
+	// Note carries an optional caveat for this model (e.g. cache-only, switch
+	// unconfirmed).
+	Note string
+	// Current marks the model the agent currently has selected.
+	Current bool
+}
+
 // ReasoningEffortSwitcher is an optional interface for agents that support
 // runtime switching of reasoning effort.
 type ReasoningEffortSwitcher interface {
@@ -513,9 +571,17 @@ type ContextUsage struct {
 	// BaselineTokens is the portion of the context window always occupied by
 	// fixed runtime/system instructions and therefore excluded from user-visible
 	// "left" calculations when the agent provides it.
-	BaselineTokens           int
-	TotalTokens              int
-	InputTokens              int
+	BaselineTokens int
+	TotalTokens    int
+	InputTokens    int
+	// CumulativeInputTokens marks InputTokens as a SESSION-CUMULATIVE value
+	// (summed across every API sub-call in the turn/session) rather than the
+	// prompt size of the most recent request. Set by agents whose protocol only
+	// reports running totals — notably ACP/Hermes, whose PromptResponse.usage
+	// documents inputTokens as "Total input tokens across all turns". When true,
+	// the footer renders the "in" segment from UsedTokens (the honest
+	// "context size right now") instead of the inflated cumulative counter.
+	CumulativeInputTokens    bool
 	CachedInputTokens        int // cache-read tokens (prior context retrieved from cache)
 	CacheCreationInputTokens int // cache-write tokens (new content written to cache)
 	OutputTokens             int
@@ -529,6 +595,17 @@ type ContextUsage struct {
 // that will be forwarded to the agent process. Return "" if not supported.
 type ContextCompressor interface {
 	CompressCommand() string
+}
+
+// ModelCommand is an optional interface for agents whose native runtime
+// model switching is driven by a slash command forwarded over the live
+// session (e.g. an ACP agent such as Hermes that understands "/model <name>"
+// and reports "Model switched to: ..." as text). ModelCommand returns the
+// base command (e.g. "/model"); the engine appends any user-supplied args.
+// Return "" when the agent instead implements the structured ModelSwitcher
+// interface. Agents that implement neither keep the "not supported" reply.
+type ModelCommand interface {
+	ModelCommand() string
 }
 
 // AgentSessionCanceller is an optional interface for agent sessions that support

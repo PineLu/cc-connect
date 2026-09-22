@@ -107,6 +107,7 @@ type Config struct {
 	Relay              RelayConfig             `toml:"relay"`               // bot-to-bot relay behavior
 	Cron               CronConfig              `toml:"cron"`
 	Queue              QueueConfig             `toml:"queue"`
+	Outbox             OutboxConfig            `toml:"outbox"` // durable redelivery of failed final replies
 	Webhook            WebhookConfig           `toml:"webhook"`
 	Bridge             BridgeConfig            `toml:"bridge"`
 	Management         ManagementConfig        `toml:"management"`
@@ -146,6 +147,18 @@ type CronConfig struct {
 // QueueConfig controls the per-session message queue.
 type QueueConfig struct {
 	MaxDepth *int `toml:"max_depth"` // max queued messages per session; default 5
+}
+
+// OutboxConfig controls durable redelivery of final replies whose immediate
+// send failed on a retryable network/platform error (e.g. a few-minute outage
+// of the connection to the messaging API, or a restart mid-send). Failed final
+// replies are persisted under <data_dir>/outbox and resent with exponential
+// backoff once connectivity returns. Only final replies are redelivered;
+// progress/thinking side-channel messages are not.
+type OutboxConfig struct {
+	Enabled     *bool `toml:"enabled"`      // default true
+	MaxAgeMins  *int  `toml:"max_age_mins"` // drop unsent replies older than N minutes; default 30
+	MaxAttempts *int  `toml:"max_attempts"` // max send attempts per reply; default 12
 }
 
 // WebhookConfig controls the external HTTP webhook endpoint.
@@ -533,6 +546,10 @@ type ProjectConfig struct {
 	// ReplyFooter: nil/true = render the reply footer; false = disable it
 	// entirely (the per-line indicator flags above become no-ops).
 	ReplyFooter      *bool        `toml:"reply_footer,omitempty"`
+	// FooterTemplate is a Go text/template string for the CCD-style reply footer.
+	// Available placeholders: {{.Model}}, {{.Effort}}, {{.Out}},
+	// {{.In}}, {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}.
+	FooterTemplate *string `toml:"footer_template,omitempty"`
 	InjectSender     *bool        `toml:"inject_sender,omitempty"`     // prepend sender identity (platform + user ID) to each message sent to the agent
 	DisabledCommands []string     `toml:"disabled_commands,omitempty"` // commands to disable for this project (e.g. ["restart", "upgrade"])
 	AdminFrom        string       `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users
@@ -3426,6 +3443,7 @@ type ProjectSettingsUpdate struct {
 	ShowContextIndicator *bool
 	ShowWorkdirIndicator *bool
 	ReplyFooter          *bool
+	FooterTemplate       *string
 	InjectSender         *bool
 	PlatformAllowFrom    map[string]string
 }
@@ -3511,6 +3529,9 @@ func SaveProjectSettings(projectName string, update ProjectSettingsUpdate) error
 		if update.ReplyFooter != nil {
 			v := *update.ReplyFooter
 			proj.ReplyFooter = &v
+		}
+		if update.FooterTemplate != nil {
+			proj.FooterTemplate = update.FooterTemplate
 		}
 		if update.InjectSender != nil {
 			v := *update.InjectSender
@@ -3599,6 +3620,9 @@ func GetProjectConfigDetails(projectName string) map[string]any {
 		}
 		if p.ReplyFooter != nil {
 			result["reply_footer"] = *p.ReplyFooter
+		}
+		if p.FooterTemplate != nil {
+			result["footer_template"] = *p.FooterTemplate
 		}
 		if p.InjectSender != nil {
 			result["inject_sender"] = *p.InjectSender

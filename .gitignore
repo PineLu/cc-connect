@@ -3,6 +3,10 @@
 # ============================================================================
 /cc-connect
 cc-connect.bak-*
+cc-connect-arm64.bak-*
+cc-connect-arm64.prev
+.tmp_patch_*.py
+core/test_ws_*.json
 *.exe
 *.exe~
 *.dll
@@ -11,6 +15,8 @@ cc-connect.bak-*
 *.test
 *.out
 *.old
+*.bak
+*.bak-*
 
 # ============================================================================
 # Go workspace & tooling
@@ -150,6 +156,8 @@ Desktop.ini
 *.pfx
 secrets/
 credentials/
-
+.omc/*
+.omc
 .codex
 cc-connect-new
+cc-connect*

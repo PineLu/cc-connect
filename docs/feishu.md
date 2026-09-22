@@ -110,7 +110,9 @@ app_secret = "QhkMpxxxxxxxxxxxxxxxxxxxx"
 # domain = "https://open.feishu.cn" # 可选：覆盖运行时 API/WebSocket 域名
 # enable_feishu_card = true  # 可选：关闭后统一回退纯文本回复
 # thread_isolation = true    # 可选：按飞书 thread/root 隔离群聊会话
+# session_key_strategy = "hybrid" # 可选：群聊按 thread 隔离，私聊按用户隔离；首次 ack 会进入飞书话题
 # group_chat_history_share = false  # 可选：共享未 @ 机器人的群消息作为下一次触发的上下文；消息本身不会触发回复
+# ack_show_session_key = true   # 可选：ack「收到，正在处理中...」是否附带 [session: ..] 会话标识，默认 true；设为 false 可隐藏
 # progress_style = "legacy"  # 可选：legacy | compact | card
 # ack_emoji = "Get"           # 可选：消息被接受处理或入队时立即添加并保留的确认表情；默认禁用
 # reaction_emoji = "OnIt"      # 可选：agent 处理期间的临时表情，结束后移除
@@ -120,7 +122,9 @@ app_secret = "QhkMpxxxxxxxxxxxxxxxxxxxx"
 
 > 如果应用没有交互卡片权限，或后台未配置卡片回调，可将 `enable_feishu_card = false`，让所有命令统一走纯文本回复，避免卡片发送失败后用户看不到内容。
 > 如果开启 `thread_isolation = true`，群聊里每个根消息 / reply thread 会对应一个独立 agent session；私聊行为保持原样。
+> 如果设置 `session_key_strategy = "hybrid"`，群聊消息会优先使用飞书 thread/root 作为 session 边界；没有现成 thread 的群消息会以触发消息作为 thread 起点，ack 和后续回复都会 `reply_in_thread=true`，私聊仍按用户隔离。
 > `group_chat_history_share = true` 时，cc-connect 只在内存中保留当前进程观察到的、允许访问的群聊 text/post 消息，并在下一次明确 @ 机器人且真正进入 agent turn 时注入；未 @ 的消息不会触发回复。`/status` 等由 cc-connect 处理的命令不会消费这段待处理上下文，`/new` 会清空对应主频道或话题的上下文。
+> `ack_show_session_key = false` 时，ack（如「收到，正在处理中...」）不再附带 `[session: ..]` 会话标识，群里只看到纯提示；默认 `true` 显示，便于排查会话归属。该开关只影响展示，不影响会话隔离逻辑。
 > 在 multi-workspace 模式下，`thread_isolation = true` 也会让每个话题独立绑定 workspace；在话题内执行 `/workspace bind <name>` 不会影响同群的其他话题。已有的群级 binding 会保留为默认值，由尚未显式绑定的话题继承，因此回退到旧版本时仍可使用。
 > `progress_style = "compact"` 会把思考/工具进度合并到一条可更新消息里，减少刷屏；`legacy` 保持原有逐条发送；`card` 会使用结构化卡片（标题 + 进度块）持续更新同一条消息，观感比纯文本更清晰。
 > `domain` 只影响运行时 API / WebSocket 请求地址；CLI `setup/new/bind` 的引导域名仍然使用内置默认值。

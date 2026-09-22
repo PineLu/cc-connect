@@ -455,6 +455,12 @@ type stubStrictModelAgent struct {
 	calls  int
 }
 
+type stubCommandModelAgent struct {
+	stubModelModeAgent
+}
+
+func (a *stubCommandModelAgent) ModelCommand() string { return "/model" }
+
 type stubLiveModeSession struct {
 	stubAgentSession
 	modes []string
@@ -4693,6 +4699,40 @@ func TestCmdModel_DoesNotClaimSuccessWhenModelSaveFails(t *testing.T) {
 	}
 	if !strings.Contains(sent[0], "Failed to change model") {
 		t.Fatalf("reply = %q, want model change failure message", sent[0])
+	}
+}
+
+
+func TestHandleModelsCardAction_MultiWorkspaceUsesBoundAgentType(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	globalAgent := &stubCommandModelAgent{}
+	e := NewEngine("test", globalAgent, []Platform{p}, "", LangEnglish)
+
+	baseDir := t.TempDir()
+	bindingPath := filepath.Join(t.TempDir(), "bindings.json")
+	e.SetMultiWorkspace(baseDir, bindingPath)
+
+	wsDir := normalizeWorkspacePath(t.TempDir())
+	channelID := "C-models-card"
+	e.workspaceBindings.Bind("project:test", channelID, "chan", wsDir)
+
+	ws := e.workspacePool.GetOrCreate(wsDir)
+	wsAgent := &stubModelModeAgent{model: "old-model"}
+	ws.agent = wsAgent
+	ws.sessions = NewSessionManager("")
+
+	sessionKey := "feishu:" + channelID + ":u1"
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	e.interactiveStates[interactiveKey] = &interactiveState{
+		modelsList: &modelsListState{items: []ModelDetail{{Name: "new-model"}}},
+	}
+	e.interactiveMu.Unlock()
+
+	_ = e.handleModelsCardAction("switch 1", sessionKey)
+
+	if got := wsAgent.model; got != "new-model" {
+		t.Fatalf("workspace agent model = %q, want new-model; card action likely used global agent type", got)
 	}
 }
 
@@ -9841,6 +9881,15 @@ type stubCompressorAgent struct {
 
 func (a *stubCompressorAgent) CompressCommand() string { return a.cmd }
 
+// stubModelCommandAgent opts into native slash-command model switching
+// (core.ModelCommand), like the ACP adapter configured with model_command.
+type stubModelCommandAgent struct {
+	stubAgent
+	cmd string
+}
+
+func (a *stubModelCommandAgent) ModelCommand() string { return a.cmd }
+
 func TestCmdCompress_NoCompressor_RepliesNotSupported(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -10258,6 +10307,108 @@ func TestCmdCompress_Success_SendsCompressDone(t *testing.T) {
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}
+	}
+}
+
+// --- /model forwarding (ModelCommand, e.g. ACP/Hermes) ---
+
+func TestCmdModel_ModelCommand_NoSession_RepliesNoSession(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &stubModelCommandAgent{cmd: "/model"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:user1", Content: "/model x", ReplyCtx: "ctx"}
+	e.cmdModel(p, msg, []string{"x"})
+
+	sent := p.getSent()
+	if len(sent) == 0 {
+		t.Fatal("expected a reply")
+	}
+	if !strings.Contains(sent[0], e.i18n.T(MsgModelNoSession)) {
+		t.Fatalf("expected MsgModelNoSession, got %q", sent[0])
+	}
+}
+
+// TestCmdModel_ModelCommand_ForwardsAndRelays verifies that an agent which
+// switches models via a native slash command gets "/model <args>" sent to the
+// live session and the agent's text result is relayed back (no structured
+// ModelSwitcher involvement).
+func TestCmdModel_ModelCommand_ForwardsAndRelays(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("model-fwd")
+	agent := &stubModelCommandAgent{cmd: "/model"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+
+	msg := &Message{SessionKey: key, Content: "/model z-ai/glm-5.3-flash", ReplyCtx: "ctx"}
+	e.cmdModel(p, msg, []string{"z-ai/glm-5.3-flash"})
+
+	// Wait until the command reaches the agent session, then assert exact text.
+	deadline := time.After(3 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		sess.sendMu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for forwarded /model Send")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	sess.sendMu.Lock()
+	gotCmd := sess.sendCalls[0]
+	sess.sendMu.Unlock()
+	if gotCmd != "/model z-ai/glm-5.3-flash" {
+		t.Fatalf("forwarded command = %q, want /model z-ai/glm-5.3-flash", gotCmd)
+	}
+
+	// Agent reports the switch; engine must relay that text to the platform.
+	sess.events <- Event{Type: EventResult, Content: "Model switched to: z-ai/glm-5.3-flash", Done: true}
+	for {
+		relayed := false
+		for _, s := range p.getSent() {
+			if strings.Contains(s, "Model switched to: z-ai/glm-5.3-flash") {
+				relayed = true
+			}
+		}
+		if relayed {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for relayed model result, sent=%v", p.getSent())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// TestCmdModel_NoSwitcher_RepliesNotSupported guards the original path: an
+// agent that implements neither ModelCommand nor ModelSwitcher still gets the
+// "not supported" reply (forwarding must not swallow it).
+func TestCmdModel_NoSwitcher_RepliesNotSupported(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	msg := &Message{SessionKey: "test:user1", Content: "/model x", ReplyCtx: "ctx"}
+	e.cmdModel(p, msg, []string{"x"})
+
+	sent := p.getSent()
+	if len(sent) == 0 || !strings.Contains(sent[0], e.i18n.T(MsgModelNotSupported)) {
+		t.Fatalf("expected MsgModelNotSupported, got %v", sent)
 	}
 }
 
@@ -16327,5 +16478,174 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 	}
 	if strings.Contains(card.finalContent(), "NO_REPLY") {
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
+	}
+}
+
+// TestModelsCardAction_ModelCommand_NoSession_ReturnsNoSessionCard guards the
+// 2026-09-12 crash: selecting a model from the /models dropdown with no live
+// agent session (e.g. right after a daemon restart) nil-dereferenced
+// state.agentSession in forwardModelsSwitchAsync, panicking the process
+// (exit 2) and leaving the card stuck on "switching" forever.
+func TestModelsCardAction_ModelCommand_NoSession_ReturnsNoSessionCard(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	agent := &stubModelCommandAgent{cmd: "/model"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "test:user1"
+	iKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = &interactiveState{
+		// agentSession deliberately nil: no turn has run since (re)start.
+		modelsList: &modelsListState{items: []ModelDetail{{
+			Name:          "glm-5.3-flash",
+			Provider:      "custom:new-api-01",
+			SwitchCommand: "/model custom:new-api-01:glm-5.3-flash",
+		}}},
+	}
+	e.interactiveMu.Unlock()
+
+	var card *Card
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("handleCardNav panicked on nil agentSession: %v", r)
+			}
+		}()
+		card = e.handleCardNav("act:/models switch 1", sessionKey)
+	}()
+	if card == nil {
+		t.Fatal("expected a no-session card, got nil")
+	}
+	want := e.i18n.T(MsgModelNoSession)
+	found := false
+	for _, elem := range card.Elements {
+		if md, ok := elem.(CardMarkdown); ok && strings.Contains(md.Content, want) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected card to contain %q, elements=%v", want, card.Elements)
+	}
+}
+
+// stubRefreshPlatform records in-place card refreshes for /models tests.
+type stubRefreshPlatform struct {
+	stubPlatformEngine
+	refreshed []*Card
+}
+
+func (p *stubRefreshPlatform) RefreshCard(_ context.Context, _ string, card *Card) error {
+	p.mu.Lock()
+	p.refreshed = append(p.refreshed, card)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *stubRefreshPlatform) refreshedCards() []*Card {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*Card(nil), p.refreshed...)
+}
+
+func cardMarkdownText(card *Card) string {
+	if card == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, elem := range card.Elements {
+		if md, ok := elem.(CardMarkdown); ok {
+			sb.WriteString(md.Content)
+		}
+	}
+	return sb.String()
+}
+
+// TestModelsCardAction_ModelCommand_SwitchNotifiesAndRefreshes verifies the
+// full card-switch path with a live session: the dropdown selection returns a
+// "switching" card, forwards "/model ..." to the agent, relays the agent's
+// confirmation text, and refreshes the card to the green result. Before the
+// fix the result text used the card's (often nil) replyCtx and was lost, and
+// the card stayed on "switching" forever.
+func TestModelsCardAction_ModelCommand_SwitchNotifiesAndRefreshes(t *testing.T) {
+	p := &stubRefreshPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	sess := newQueuingSession("models-fwd-ok")
+	agent := &stubModelCommandAgent{cmd: "/model"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "test:user1"
+	iKey := e.interactiveKeyForSessionKey(sessionKey)
+	e.interactiveMu.Lock()
+	e.interactiveStates[iKey] = &interactiveState{
+		agentSession: sess,
+		platform:     p,
+		replyCtx:     "ctx",
+		modelsList: &modelsListState{items: []ModelDetail{{
+			Name:          "glm-5.3-flash",
+			Provider:      "custom:new-api-01",
+			SwitchCommand: "/model custom:new-api-01:glm-5.3-flash",
+		}}},
+	}
+	e.interactiveMu.Unlock()
+
+	var card *Card
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("handleCardNav panicked: %v", r)
+			}
+		}()
+		card = e.handleCardNav("act:/models switch 1", sessionKey)
+	}()
+	if card == nil {
+		t.Fatal("expected a switching card, got nil")
+	}
+	if got := cardMarkdownText(card); !strings.Contains(got, e.i18n.Tf(MsgModelCardSwitching, "/model custom:new-api-01:glm-5.3-flash")) {
+		t.Fatalf("expected switching card, got %q", got)
+	}
+
+	deadline := time.After(5 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		sess.sendMu.Unlock()
+		if n > 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for forwarded /model Send")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	sess.sendMu.Lock()
+	gotCmd := sess.sendCalls[0]
+	sess.sendMu.Unlock()
+	if gotCmd != "/model custom:new-api-01:glm-5.3-flash" {
+		t.Fatalf("forwarded command = %q", gotCmd)
+	}
+
+	sess.events <- Event{Type: EventResult, Content: "Model switched to: glm-5.3-flash", Done: true}
+	for {
+		relayed, refreshed := false, false
+		for _, s := range p.getSent() {
+			if strings.Contains(s, "Model switched to: glm-5.3-flash") {
+				relayed = true
+			}
+		}
+		for _, c := range p.refreshedCards() {
+			if strings.Contains(cardMarkdownText(c), "glm-5.3-flash") {
+				refreshed = true
+			}
+		}
+		if relayed && refreshed {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for notification (relayed=%v refreshed=%v sent=%v)", relayed, refreshed, p.getSent())
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 }

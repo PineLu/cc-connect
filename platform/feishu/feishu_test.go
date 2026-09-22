@@ -16,6 +16,43 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
+
+func TestApplyCardLinks_NestedActionsPreserveOrder(t *testing.T) {
+	parts := []string{"按钮A", "按钮B"}
+	node := map[string]any{
+		"actions": []any{
+			map[string]any{"action": map[string]any{"url": "https://a.example"}},
+			map[string]any{"action": map[string]any{"url": "https://b.example"}},
+		},
+	}
+
+	applyCardLinks(node, &parts, 0, len(parts))
+
+	if got, want := parts[0], "[按钮A](https://a.example)"; got != want {
+		t.Fatalf("parts[0] = %q, want %q", got, want)
+	}
+	if got, want := parts[1], "[按钮B](https://b.example)"; got != want {
+		t.Fatalf("parts[1] = %q, want %q", got, want)
+	}
+}
+
+func TestApplyCardLinks_NestedActionsSupportsMultiURL(t *testing.T) {
+	parts := []string{"打开"}
+	node := map[string]any{
+		"actions": []any{
+			map[string]any{"action": map[string]any{
+				"multi_url": map[string]any{"url": "https://multi.example"},
+			}},
+		},
+	}
+
+	applyCardLinks(node, &parts, 0, len(parts))
+
+	if got, want := parts[0], "[打开](https://multi.example)"; got != want {
+		t.Fatalf("parts[0] = %q, want %q", got, want)
+	}
+}
+
 func TestOnMessageRecalledDispatchesCoreRecallMessage(t *testing.T) {
 	got := make(chan *core.Message, 1)
 	p := &Platform{
@@ -156,6 +193,17 @@ func TestDispatchMessageIncludesQuotedImage(t *testing.T) {
 					if _, err := w.Write(imageData); err != nil {
 						t.Fatalf("write image: %v", err)
 					}
+				case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+					// Ack reply handler — return success with a message_id
+					w.Header().Set("Content-Type", "application/json")
+					replyMsgID := "om_ack_" + r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+					writeJSON(t, w, map[string]any{
+						"code": 0,
+						"msg":  "success",
+						"data": map[string]any{
+							"message_id": replyMsgID,
+						},
+					})
 				default:
 					t.Fatalf("unexpected path %s", r.URL.Path)
 				}
@@ -299,6 +347,9 @@ func TestDispatchMessageKeepsMentionOnlyQuotedText(t *testing.T) {
 		if !strings.Contains(msg.ExtraContent, "请总结这条消息") {
 			t.Fatalf("ExtraContent = %q, want quoted text", msg.ExtraContent)
 		}
+		if strings.Contains(msg.ExtraContent, "Reply chain") || strings.Contains(msg.ExtraContent, "om_grandparent") {
+			t.Fatalf("ExtraContent = %q, want direct parent only", msg.ExtraContent)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for mention-only quoted text message")
 	}
@@ -354,6 +405,14 @@ func TestOnMessageThreadIsolationBootstrapsExistingThreadContext(t *testing.T) {
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
 		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasSuffix(r.URL.Path, "/reply"):
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{
+					"message_id": "om_ack",
+				},
+			})
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -1423,7 +1482,7 @@ func TestResolveMentions_MentionMapPriority(t *testing.T) {
 	)
 	ctx := context.Background()
 	result := p.resolveMentionsInContent(ctx, "oc_test_group", "Hey @BotA check this")
-	if !strings.Contains(result, `user_id="ou_bot_openid"`) {
+	if !strings.Contains(result, `id=ou_bot_openid`) {
 		t.Errorf("expected mentionMap to override group member, got: %s", result)
 	}
 	if strings.Contains(result, "ou_human_openid") {
@@ -1439,10 +1498,10 @@ func TestResolveMentions_LongestMatch(t *testing.T) {
 	)
 	ctx := context.Background()
 	result := p.resolveMentionsInContent(ctx, "oc_test_group", "@Collector-B and @Collector please help")
-	if !strings.Contains(result, `user_id="ou_collectorb"`) {
+	if !strings.Contains(result, `id=ou_collectorb`) {
 		t.Error("Collector-B should resolve via mentionMap")
 	}
-	if !strings.Contains(result, `user_id="ou_human_collector"`) {
+	if !strings.Contains(result, `id=ou_human_collector`) {
 		t.Error("Collector should resolve via group members")
 	}
 }
@@ -1455,7 +1514,7 @@ func TestResolveMentions_MultipleOccurrences(t *testing.T) {
 	)
 	ctx := context.Background()
 	result := p.resolveMentionsInContent(ctx, "oc_test_group", "@BotA please help, @BotA is needed")
-	count := strings.Count(result, `user_id="ou_bot"`)
+	count := strings.Count(result, `id=ou_bot`)
 	if count != 2 {
 		t.Errorf("expected 2 substitutions, got %d. result: %s", count, result)
 	}
@@ -1472,11 +1531,11 @@ func TestBuildReplyContent_NoFalsePositiveOnEmail(t *testing.T) {
 }
 
 // TestBuildReplyContent_RealMentionForcesText confirms a resolved mention
-// (<at user_id="...">) still forces MsgTypeText even when markdown is present.
+// (<at id=...></at>) renders as card when markdown is present.
 func TestBuildReplyContent_RealMentionForcesText(t *testing.T) {
-	msgType, _ := buildReplyContent("**bold** <at user_id=\"ou_bot\">Collector-B</at> please review")
-	if msgType != larkim.MsgTypeText {
-		t.Errorf("resolved mention should force MsgTypeText; got %s", msgType)
+	msgType, _ := buildReplyContent("**bold** <at id=ou_bot></at> please review")
+	if msgType != larkim.MsgTypeInteractive {
+		t.Errorf("resolved mention in markdown should render as card; got %s", msgType)
 	}
 }
 
@@ -1485,13 +1544,13 @@ func TestBuildReplyContent_CardFormatMentionForcesText(t *testing.T) {
 		name    string
 		content string
 	}{
-		{"text_format", "**bold** <at user_id=\"ou_bot\">Collector-B</at> please review"},
+		{"text_format", "**bold** <at id=ou_bot></at> please review"},
 		{"card_format", "# report\n\n<at id=ou_bot></at> please review\n\n```\nok\n```"},
 	}
 	for _, tc := range cases {
 		msgType, _ := buildReplyContent(tc.content)
-		if msgType != larkim.MsgTypeText {
-			t.Errorf("%s: mention should force MsgTypeText; got %s", tc.name, msgType)
+		if msgType != larkim.MsgTypeInteractive {
+			t.Errorf("%s: mention in markdown should render as card; got %s", tc.name, msgType)
 		}
 	}
 }
@@ -1504,13 +1563,13 @@ func TestResolveMentions_MarkdownForcesTextFormat(t *testing.T) {
 	})
 	input := "# Report\n\n@Collector-B please review\n\n**done**"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at user_id="ou_bot_b">Collector-B</at>`) {
-		t.Fatalf("markdown content must still resolve to text format; got %q", result)
+	if !strings.Contains(result, `<at id=ou_bot_b></at>`) {
+		t.Fatalf("markdown content must resolve to card format; got %q", result)
 	}
-	// Verify the full pipeline forces MsgTypeText
+	// Verify the full pipeline renders as card
 	msgType, _ := buildReplyContent(result)
-	if msgType != larkim.MsgTypeText {
-		t.Fatalf("markdown + mention must force MsgTypeText so Feishu fires the mention event; got %s", msgType)
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("markdown + mention must render as card; got %s", msgType)
 	}
 }
 
@@ -1568,7 +1627,7 @@ func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
 	}{
 		{"email", "**bold** report sent to a@b.com", larkim.MsgTypeInteractive},
 		{"url", "see [docs](http://x@y.com/z)", larkim.MsgTypeInteractive},
-		{"mention", "hey @BotA review please", larkim.MsgTypeText},
+		{"mention", "hey @BotA review please", larkim.MsgTypeInteractive},
 	} {
 		if err := p.SendWithStatusFooter(ctx, rc, tc.content, "done"); err != nil {
 			t.Fatalf("%s: SendWithStatusFooter error = %v", tc.name, err)
@@ -2170,5 +2229,487 @@ func TestFlushImageBatchForSession_NoBatchIsSafe(t *testing.T) {
 	p.flushImageBatchForSession("") // empty session key is also a safe no-op
 	if n := len(p.imageBatch); n != 0 {
 		t.Fatalf("imageBatch size = %d, want 0", n)
+	}
+}
+
+// TestExtractInteractiveCardText_HrefMapLinks verifies that Feishu card v2
+// markdown elements with a separate "href" map (raw_card_content format)
+// have their link text rewritten as Markdown links [text](url).
+// Regression test for quoted interactive cards losing hyperlinks.
+func TestExtractInteractiveCardText_HrefMapLinks(t *testing.T) {
+	card := `{
+		"elements": [
+			{
+				"tag": "markdown",
+				"content": "详情查看: 应用异常详情\n临时关闭: 点击关闭",
+				"href": {
+					"应用异常详情": {"url": "https://example.com/detail"},
+					"点击关闭": {"url": "https://example.com/close", "pc_url": "https://pc.example.com/close"}
+				}
+			}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "[应用异常详情](https://example.com/detail)") {
+		t.Errorf("expected href map link to be rewritten, got:\n%s", got)
+	}
+	if !strings.Contains(got, "[点击关闭](https://example.com/close)") {
+		t.Errorf("expected second href link to be rewritten, got:\n%s", got)
+	}
+	if strings.Contains(got, "详情查看: 应用异常详情\n") && !strings.Contains(got, "详情查看: [应用异常详情]") {
+		t.Errorf("link text should be replaced in-place, got:\n%s", got)
+	}
+}
+
+// TestExtractInteractiveCardText_ButtonURL verifies that button/action
+// elements with a separate "url" field have their text wrapped as a
+// Markdown link.
+func TestExtractInteractiveCardText_ButtonURL(t *testing.T) {
+	card := `{
+		"elements": [
+			{
+				"tag": "button",
+				"text": {"tag": "plain_text", "content": "查看详情"},
+				"url": "https://example.com/btn"
+			}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "[查看详情](https://example.com/btn)") {
+		t.Errorf("expected button text to be wrapped with url, got:\n%s", got)
+	}
+}
+
+// TestExtractInteractiveCardText_MultiURL verifies that multi_url fields
+// (pc / ios / android links) are resolved using the generic "url" key.
+func TestExtractInteractiveCardText_MultiURL(t *testing.T) {
+	card := `{
+		"elements": [
+			{
+				"tag": "button",
+				"text": {"tag": "plain_text", "content": "多端链接"},
+				"multi_url": {"url": "https://example.com/generic", "pc_url": "https://pc.example.com", "ios_url": "https://ios.example.com"}
+			}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "[多端链接](https://example.com/generic)") {
+		t.Errorf("expected multi_url generic url to be used, got:\n%s", got)
+	}
+}
+
+// TestExtractInteractiveCardText_InlinedMarkdownLinkUntouched verifies that
+// cards where links are already inlined in the markdown content (event push
+// format) are not double-wrapped.
+func TestExtractInteractiveCardText_InlinedMarkdownLinkUntouched(t *testing.T) {
+	card := `{
+		"elements": [
+			{"tag": "markdown", "content": "查看: [Watcher链接](https://watcher.example.com/abc)"}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "[Watcher链接](https://watcher.example.com/abc)") {
+		t.Errorf("inlined markdown link should be preserved, got:\n%s", got)
+	}
+	// Must not be double-wrapped like [[Watcher链接](...)](...)
+	if strings.Contains(got, "[[Watcher链接]") {
+		t.Errorf("inlined link should not be double-wrapped, got:\n%s", got)
+	}
+}
+
+// TestExtractInteractiveCardText_PlainTextWithoutLinks verifies that
+// elements without any link field are extracted unchanged (no regression).
+func TestExtractInteractiveCardText_PlainTextWithoutLinks(t *testing.T) {
+	card := `{
+		"header": {"title": {"tag": "plain_text", "content": "报警通知"}},
+		"elements": [
+			{"tag": "div", "text": {"tag": "plain_text", "content": "报警级别: P1"}},
+			{"tag": "markdown", "content": "**报警名称**: test_metric"}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "报警通知") {
+		t.Errorf("header title should be extracted, got:\n%s", got)
+	}
+	if !strings.Contains(got, "报警级别: P1") {
+		t.Errorf("div text should be extracted, got:\n%s", got)
+	}
+	if !strings.Contains(got, "**报警名称**: test_metric") {
+		t.Errorf("markdown content should be extracted, got:\n%s", got)
+	}
+}
+
+// TestExtractInteractiveCardText_URLObject verifies markdown elements whose
+// link is stored as a url OBJECT ({"url": "..."}) rather than a plain string —
+// the actual raw_card_content shape produced by radar/alert cards. Regression
+// for the bug where x["url"].(string) type assertion silently failed and links
+// were dropped.
+func TestExtractInteractiveCardText_URLObject(t *testing.T) {
+	card := `{
+		"body": {
+			"property": {
+				"elements": [
+					{"tag": "markdown", "content": "查看详情："},
+					{
+						"property": {
+							"columns": [
+								{
+									"property": {
+										"elements": [
+											{
+												"property": {
+													"elements": [
+														{
+															"content": "Watcher链接",
+															"url": {"url": "https://watcher.example.com/dashboard"}
+														}
+													]
+												}
+											}
+										]
+									}
+								}
+							]
+						}
+					}
+				]
+			}
+		}
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "[Watcher链接](https://watcher.example.com/dashboard)") {
+		t.Errorf("expected url-object link to be rewritten even when deeply nested, got:\n%s", got)
+	}
+}
+
+// TestExtractInteractiveCardText_MultipleURLObjects verifies several sibling
+// url-object link elements in one alert card are all resolved.
+func TestExtractInteractiveCardText_MultipleURLObjects(t *testing.T) {
+	card := `{
+		"elements": [
+			{"content": "Watcher链接", "url": {"url": "https://a.example.com"}},
+			{"content": "跟进处理", "url": {"url": "https://b.example.com"}},
+			{"content": "屏蔽6小时", "url": {"url": "https://c.example.com"}}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	for _, want := range []string{
+		"[Watcher链接](https://a.example.com)",
+		"[跟进处理](https://b.example.com)",
+		"[屏蔽6小时](https://c.example.com)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, got)
+		}
+	}
+}
+
+// TestExtractInteractiveCardText_SiblingActionURL verifies the shape used by
+// real watcher alarm cards (2026-09-13 ta_has_order): the visible label and
+// the open_url action live in SIBLING nodes —
+// {"elements":[{"content":"报警链接"},{"type":"open_url","action":{"url":...}}]}.
+// Before the fix, the action node produced zero text segments, applyCardLinks
+// early-returned, and the URL was silently dropped.
+func TestExtractInteractiveCardText_SiblingActionURL(t *testing.T) {
+	card := `{
+		"elements": [
+			{"content": "2026-09-13 17:46:17，名称：ta_has_order 猫途鹰有单了"},
+			{"tag": "column_set", "property": {
+				"columns": [
+					{"tag": "column", "property": {
+						"elements": [
+							{"tag": "button", "property": {
+								"text": {"tag": "plain_text", "property": {"content": "报警链接"}},
+								"actions": [{"type": "open_url", "action": {"url": "https://opsai.cn/d7sULM"}}]
+							}},
+							{"tag": "button", "property": {
+								"text": {"tag": "plain_text", "property": {"content": "aio时间线"}},
+								"actions": [{"type": "open_url", "action": {"url": "https://aio.corp.qunar.com/action?event_id=xxx", "pcURL": "https://pc.example.com/yyy"}}]
+							}}
+						]
+					}}
+				]
+			}}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	for _, want := range []string{
+		"[报警链接](https://opsai.cn/d7sULM)",
+		"[aio时间线](https://aio.corp.qunar.com/action?event_id=xxx)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected %q in output, got:\n%s", want, got)
+		}
+	}
+}
+
+// TestExtractInteractiveCardText_OrphanURLFallback verifies that an action URL
+// with no linkable sibling text is appended bare instead of being dropped.
+func TestExtractInteractiveCardText_OrphanURLFallback(t *testing.T) {
+	card := `{
+		"elements": [
+			{"type": "open_url", "action": {"url": "https://example.com/lonely"}}
+		]
+	}`
+	got := extractInteractiveCardText(card)
+	if !strings.Contains(got, "https://example.com/lonely") {
+		t.Errorf("expected bare URL to be preserved, got:\n%s", got)
+	}
+}
+
+func TestFormatQuotedEcho(t *testing.T) {
+	t.Run("single quote", func(t *testing.T) {
+		in := "[Quoted message from 卢松林]:\n雷达P1报警 body\n\n"
+		got := formatQuotedEcho(in)
+		if !strings.Contains(got, "📎 引用内容（来自 卢松林）") {
+			t.Errorf("missing header/sender: %q", got)
+		}
+		if !strings.Contains(got, "雷达P1报警 body") {
+			t.Errorf("missing body: %q", got)
+		}
+		if strings.Contains(got, "[Quoted message from") {
+			t.Errorf("agent-facing prefix should be stripped: %q", got)
+		}
+	})
+	t.Run("reply chain", func(t *testing.T) {
+		got := formatQuotedEcho("--- Reply chain (2 messages) ---\nfoo")
+		if !strings.Contains(got, "📎 引用消息链") || !strings.Contains(got, "foo") {
+			t.Errorf("bad chain echo: %q", got)
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		if formatQuotedEcho("   ") != "" {
+			t.Error("blank input should yield empty")
+		}
+	})
+	t.Run("truncation", func(t *testing.T) {
+		long := "[Quoted message from x]:\n" + strings.Repeat("字", quotedEchoMaxRunes+50)
+		got := formatQuotedEcho(long)
+		if n := len([]rune(got)); n > quotedEchoMaxRunes+40 {
+			t.Errorf("not truncated, runes=%d", n)
+		}
+		if !strings.Contains(got, "已截断") {
+			t.Errorf("expected truncation marker, got %d runes", len([]rune(got)))
+		}
+	})
+}
+
+func TestNewPlatform_QuotedEchoAndCardMentionOpts(t *testing.T) {
+	p, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{
+		"app_id":                "cli_test",
+		"app_secret":            "secret",
+		"echo_quoted_in_thread": true,
+		"card_requires_mention": true,
+	})
+	if err != nil {
+		t.Fatalf("newPlatform error: %v", err)
+	}
+	fp := extractBasePlatform(p)
+	if !fp.echoQuotedInThread {
+		t.Error("echo_quoted_in_thread=true should be parsed")
+	}
+	if !fp.cardRequiresMention {
+		t.Error("card_requires_mention=true should be parsed")
+	}
+
+	// Defaults stay false when unset.
+	p2, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{
+		"app_id":     "cli_test",
+		"app_secret": "secret",
+	})
+	if err != nil {
+		t.Fatalf("newPlatform error: %v", err)
+	}
+	fp2 := extractBasePlatform(p2)
+	if fp2.echoQuotedInThread || fp2.cardRequiresMention {
+		t.Error("new options must default to false")
+	}
+}
+
+// TestOnMessage_InteractiveCardMentionGate verifies that interactive cards pass
+// without @mention by default, but are gated when card_requires_mention=true.
+func TestOnMessage_InteractiveCardMentionGate(t *testing.T) {
+	const botOpenID = "ou_bot"
+	const userOpenID = "ou_user"
+	const chatID = "oc_chat"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeJSON(t, w, map[string]any{"code": 0, "msg": "success",
+			"tenant_access_token": "t", "expire": 7200, "data": map[string]any{}})
+	}))
+	defer srv.Close()
+
+	card := `{"elements":[{"tag":"markdown","content":"P1 alert body"}]}`
+	buildCardEvent := func(mentions []*larkim.MentionEvent) *larkim.P2MessageReceiveV1 {
+		chatType, senderType := "group", "user"
+		return &larkim.P2MessageReceiveV1{
+			Event: &larkim.P2MessageReceiveV1Data{
+				Sender: &larkim.EventSender{
+					SenderId:   &larkim.UserId{OpenId: stringPtr(userOpenID)},
+					SenderType: &senderType,
+				},
+				Message: &larkim.EventMessage{
+					MessageId:   stringPtr("om_card_" + strconv.Itoa(int(time.Now().UnixNano()))),
+					ChatId:      stringPtr(chatID),
+					ChatType:    &chatType,
+					MessageType: stringPtr("interactive"),
+					Content:     stringPtr(card),
+					CreateTime:  stringPtr(strconv.FormatInt(time.Now().UnixMilli(), 10)),
+					Mentions:    mentions,
+				},
+			},
+		}
+	}
+	newP := func(cardRequiresMention bool) (*Platform, chan *core.Message) {
+		received := make(chan *core.Message, 4)
+		p := &Platform{
+			platformName:        "feishu",
+			domain:              srv.URL,
+			appID:               "cli_x",
+			appSecret:           "secret",
+			botOpenID:           botOpenID,
+			cardRequiresMention: cardRequiresMention,
+			dedup:               &core.MessageDedup{},
+			client: lark.NewClient("cli_x", "secret",
+				lark.WithOpenBaseUrl(srv.URL), lark.WithHttpClient(srv.Client())),
+			handler: func(_ core.Platform, msg *core.Message) { received <- msg },
+		}
+		return p, received
+	}
+
+	// Default: card without mention passes.
+	pDef, recvDef := newP(false)
+	if err := pDef.onMessage(context.Background(), buildCardEvent(nil)); err != nil {
+		t.Fatalf("onMessage default-card error: %v", err)
+	}
+	select {
+	case <-recvDef:
+	case <-time.After(time.Second):
+		t.Fatal("default: interactive card should dispatch without @mention")
+	}
+
+	// card_requires_mention=true: card without mention is dropped.
+	pGate, recvGate := newP(true)
+	if err := pGate.onMessage(context.Background(), buildCardEvent(nil)); err != nil {
+		t.Fatalf("onMessage gated-card error: %v", err)
+	}
+	select {
+	case m := <-recvGate:
+		t.Fatalf("gated card without mention must be dropped, got %q", m.MessageID)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// card_requires_mention=true: card WITH bot mention still passes.
+	botMention := []*larkim.MentionEvent{{
+		Key:  stringPtr("@_user_1"),
+		Id:   &larkim.UserId{OpenId: stringPtr(botOpenID)},
+		Name: stringPtr("bot"),
+	}}
+	if err := pGate.onMessage(context.Background(), buildCardEvent(botMention)); err != nil {
+		t.Fatalf("onMessage gated-mentioned-card error: %v", err)
+	}
+	select {
+	case <-recvGate:
+	case <-time.After(time.Second):
+		t.Fatal("gated card WITH @mention should still dispatch")
+	}
+}
+
+func TestAckSessionFooter(t *testing.T) {
+	const chatID = "oc_123"
+	realKey := "feishu:oc_123:thread:omt_real_topic"
+	// Temporary key for a brand-new topic: its thread segment IS the trigger
+	// message id (om_), because the omt_ topic id only exists after the ack is sent.
+	triggerMsg := "om_trigger_msg"
+	tempKey := "feishu:oc_123:thread:om_trigger_msg"
+
+	tests := []struct {
+		name       string
+		sessionKey string
+		triggerID  string
+		wantFooter bool
+	}{
+		{"fresh topic hides temporary key", tempKey, triggerMsg, false},
+		{"existing topic shows real key", realKey, triggerMsg, true},
+		{"empty session key hides footer", "", triggerMsg, false},
+		{"no trigger id falls back to showing key", tempKey, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ackSessionFooter(tt.sessionKey, tt.triggerID)
+			if tt.wantFooter {
+				want := "\n[session: " + tt.sessionKey + "]"
+				if got != want {
+					t.Fatalf("ackSessionFooter = %q, want %q", got, want)
+				}
+			} else if got != "" {
+				t.Fatalf("ackSessionFooter = %q, want empty (temporary key must not leak)", got)
+			}
+		})
+	}
+
+	// Regression guard for the reported confusion: a fresh-topic ack must NOT carry
+	// the temporary om_ key, otherwise the user sees two [session:] ids (om_ on the
+	// ack, omt_ on the reply) for a single topic.
+	if got := ackSessionFooter(tempKey, triggerMsg); got != "" {
+		t.Fatalf("fresh-topic ack footer must be empty, got %q", got)
+	}
+}
+
+func TestAckFooter_ShowSessionKeySwitch(t *testing.T) {
+	realKey := "feishu:oc_123:thread:omt_real_topic"
+	tempKey := "feishu:oc_123:thread:om_trigger_msg"
+	triggerMsg := "om_trigger_msg"
+
+	t.Run("enabled shows real key (default)", func(t *testing.T) {
+		p := &Platform{ackShowSessionKey: true}
+		want := "\n[session: " + realKey + "]"
+		if got := p.ackFooter(realKey, triggerMsg); got != want {
+			t.Fatalf("ackFooter = %q, want %q", got, want)
+		}
+		// The fresh-topic temporary-key suppression still applies when enabled.
+		if got := p.ackFooter(tempKey, triggerMsg); got != "" {
+			t.Fatalf("temporary key must stay hidden, got %q", got)
+		}
+	})
+
+	t.Run("disabled hides every key", func(t *testing.T) {
+		p := &Platform{ackShowSessionKey: false}
+		for _, key := range []string{realKey, tempKey, "feishu:ou_1:ou_1", ""} {
+			if got := p.ackFooter(key, triggerMsg); got != "" {
+				t.Fatalf("ackFooter(%q) = %q, want empty when switch is off", key, got)
+			}
+		}
+	})
+}
+
+func TestStripModelFillerLines(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no filler untouched", "hello\nworld", "hello\nworld"},
+		{"leading fillers removed", "\n\n◼\n\n◼\n\n修好了", "修好了"},
+		{"mid-text filler removed", "a\n◼\nb", "a\nb"},
+		{"multi-marker line removed", "a\n◼◼\nb", "a\nb"},
+		{"padded filler removed", "a\n  ◼  \nb", "a\nb"},
+		{"lookalike kept", "◼ text\n■ kept", "◼ text\n■ kept"},
+		{"only filler becomes blank guard", "◼\n◼", " "},
+		{"empty stays empty", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := stripModelFillerLines(c.in); got != c.want {
+				t.Fatalf("stripModelFillerLines(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	if _, body := buildReplyContent("\n\n◼\n\nplain reply"); body == "" {
+		t.Fatal("buildReplyContent must not return empty body")
+	} else if strings.Contains(body, "◼") {
+		t.Fatalf("buildReplyContent body still contains filler: %q", body)
 	}
 }

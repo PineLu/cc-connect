@@ -7,6 +7,8 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,6 +117,33 @@ func TestNew_ProgressStyleRejectsInvalidValue(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid progress_style") {
 		t.Fatalf("error = %q, want invalid progress_style", err.Error())
+	}
+}
+
+func TestNew_DefaultSessionKeyStrategyPreservesLegacyBehavior(t *testing.T) {
+	pAny, err := New(map[string]any{"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": false})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := pAny.(*Platform)
+	if p.sessionKeyStrategy != "" {
+		t.Fatalf("sessionKeyStrategy = %q, want empty legacy strategy", p.sessionKeyStrategy)
+	}
+}
+
+func TestNew_SupportsHybridSessionKeyStrategy(t *testing.T) {
+	pAny, err := New(map[string]any{
+		"app_id":               "cli_xxx",
+		"app_secret":           "secret",
+		"enable_feishu_card":   false,
+		"session_key_strategy": "hybrid",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	p := pAny.(*Platform)
+	if p.sessionKeyStrategy != "hybrid" {
+		t.Fatalf("sessionKeyStrategy = %q, want hybrid", p.sessionKeyStrategy)
 	}
 }
 
@@ -782,8 +811,153 @@ func TestLark_ThreadIsolationUsesRootSessionKey(t *testing.T) {
 	}
 }
 
+func TestFeishu_ThreadIsolationMentionedReplyIncludesQuotedParent(t *testing.T) {
+	const appID = "cli_quote_parent"
+	const appSecret = "secret-quote-parent"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/im/v1/messages/om_parent":
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"data": map[string]any{
+					"items": []map[string]any{
+						{
+							"msg_type": "text",
+							"sender": map[string]any{
+								"id":          "ou_parent",
+								"sender_type": "user",
+							},
+							"body": map[string]any{
+								"content": `{"text":"被引用的报警上下文"}`,
+							},
+						},
+					},
+				},
+			})
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{
+					"message_id": "om_ack_reply",
+				},
+			})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName:    "feishu",
+		domain:          srv.URL,
+		appID:           appID,
+		appSecret:       appSecret,
+		threadIsolation: true,
+		dedup:           &core.MessageDedup{},
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		replayClient: lark.NewClient(appID, appSecret,
+			lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+	}
+	p.botOpenID = "ou_bot"
+
+	msgCh := make(chan *core.Message, 1)
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		msgCh <- msg
+	}
+
+	messageID := "om_reply"
+	parentID := "om_parent"
+	rootID := "om_root"
+	chatID := "oc_test"
+	openID := "ou_test"
+	msgType := "text"
+	chatType := "group"
+	senderType := "user"
+	content := `{"text":"@bot 帮我看下这条"}`
+	createText := strconv.FormatInt(time.Now().UnixMilli(), 10)
+
+	if err := p.onMessage(context.Background(), &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId:   &larkim.UserId{OpenId: &openID},
+				SenderType: &senderType,
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   &messageID,
+				ParentId:    &parentID,
+				RootId:      &rootID,
+				ChatId:      &chatID,
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+				CreateTime:  &createText,
+				Mentions: []*larkim.MentionEvent{
+					{
+						Key: stringPtr("@bot"),
+						Id:  &larkim.UserId{OpenId: stringPtr("ou_bot")},
+					},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if !strings.Contains(msg.ExtraContent, "被引用的报警上下文") {
+			t.Fatalf("ExtraContent = %q, want quoted parent text", msg.ExtraContent)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for quoted reply message")
+	}
+}
+
 func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t *testing.T) {
-	p, err := newPlatform("lark", lark.LarkBaseUrl, map[string]any{
+	// Set up a mock server for ack replies
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success", "expire": 7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+			writeJSON(t, w, map[string]any{
+				"code": 0, "msg": "success",
+				"data": map[string]any{"message_id": "om_ack_reply"},
+			})
+		default:
+			// Ignore other paths (user/chat resolution etc.)
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		}
+	}))
+	defer srv.Close()
+
+	p, err := newPlatform("lark", srv.URL, map[string]any{
 		"app_id": "cli_xxx", "app_secret": "secret", "enable_feishu_card": true,
 		"group_reply_all": true, "thread_isolation": true,
 	})
@@ -851,6 +1025,174 @@ func TestLark_GroupReplyAllWithThreadIsolationUsesRootSessionKeyWithoutMention(t
 	}
 }
 
+func TestFeishu_HybridGroupStartCreatesThreadSessionBeforeDispatch(t *testing.T) {
+	const appID = "cli_hybrid_ack"
+	const appSecret = "secret-hybrid-ack"
+
+	var replyBodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case r.URL.Path == "/open-apis/im/v1/messages/om_start/reply":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode reply body: %v", err)
+			}
+			replyBodies = append(replyBodies, body)
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{"message_id": "om_ack", "thread_id": "omt_real_thread"},
+			})
+		case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code":                0,
+				"msg":                 "success",
+				"expire":              7200,
+				"tenant_access_token": "tenant-token",
+			})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/contact/v3/users/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
+			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	p := &Platform{
+		platformName:       "feishu",
+		domain:             srv.URL,
+		appID:              appID,
+		appSecret:          appSecret,
+		sessionKeyStrategy: "hybrid",
+		dedup:              &core.MessageDedup{},
+		client: lark.NewClient(appID, appSecret,
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+		replayClient: lark.NewClient(appID, appSecret,
+			lark.WithEnableTokenCache(false),
+			lark.WithOpenBaseUrl(srv.URL),
+			lark.WithHttpClient(srv.Client()),
+		),
+	}
+
+	msgCh := make(chan *core.Message, 1)
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		msgCh <- msg
+	}
+
+	chatID := "oc_alerts"
+	userID := "ou_user"
+	msgType := "text"
+	chatType := "group"
+	senderType := "user"
+	content := `{"text":"@bot 查一下报警"}`
+	createText := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	if err := p.onMessage(context.Background(), &larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{
+				SenderId:   &larkim.UserId{OpenId: &userID},
+				SenderType: &senderType,
+			},
+			Message: &larkim.EventMessage{
+				MessageId:   stringPtr("om_start"),
+				ChatId:      &chatID,
+				ChatType:    &chatType,
+				MessageType: &msgType,
+				Content:     &content,
+				CreateTime:  &createText,
+			},
+		},
+	}); err != nil {
+		t.Fatalf("onMessage() error = %v", err)
+	}
+
+	select {
+	case msg := <-msgCh:
+		if msg.SessionKey != "feishu:oc_alerts:thread:omt_real_thread" {
+			t.Fatalf("SessionKey = %q, want feishu:oc_alerts:thread:omt_real_thread", msg.SessionKey)
+		}
+		rc, ok := msg.ReplyCtx.(replyContext)
+		if !ok {
+			t.Fatalf("ReplyCtx type = %T, want replyContext", msg.ReplyCtx)
+		}
+		if !rc.replyInThread {
+			t.Fatal("replyContext.replyInThread = false, want true")
+		}
+		if rc.threadID != "omt_real_thread" {
+			t.Fatalf("replyContext.threadID = %q, want omt_real_thread", rc.threadID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for hybrid group message")
+	}
+
+	if len(replyBodies) != 1 {
+		t.Fatalf("reply calls = %d, want 1 ack reply", len(replyBodies))
+	}
+	if got, _ := replyBodies[0]["reply_in_thread"].(bool); !got {
+		t.Fatalf("reply_in_thread = %v, want true", replyBodies[0]["reply_in_thread"])
+	}
+	content, _ = replyBodies[0]["content"].(string)
+	// A fresh-topic ack must NOT carry the temporary om_ session key: the real omt_
+	// topic id exists only after this ack is sent, and a plain-text ack cannot be
+	// edited afterwards (Feishu PATCH only works on cards). The footer is hidden
+	// until the key already is the real omt_ id (follow-ups inside the topic).
+	if strings.Contains(content, "[session:") {
+		t.Fatalf("fresh-topic ack must hide the temporary session key, got %q", content)
+	}
+	if !strings.Contains(content, "收到报警，正在排查中...") {
+		t.Fatalf("ack content = %q, want ack text", content)
+	}
+	if _, ok := p.ackThrottle.Load("feishu:oc_alerts:thread:omt_real_thread"); !ok {
+		t.Fatal("ack throttle missing real thread session key")
+	}
+
+	rootOnlyMsg := &larkim.EventMessage{
+		MessageId: stringPtr("om_followup"),
+		RootId:    stringPtr("om_start"),
+		ParentId:  stringPtr("om_start"),
+		ChatType:  &chatType,
+	}
+	sessionKey := p.makeSessionKey(rootOnlyMsg, chatID, userID)
+	if sessionKey != "feishu:oc_alerts:thread:omt_real_thread" {
+		t.Fatalf("root-only follow-up sessionKey = %q, want feishu:oc_alerts:thread:omt_real_thread", sessionKey)
+	}
+}
+
+func TestFeishu_HybridThreadMessageUsesThreadIDSession(t *testing.T) {
+	p := &Platform{platformName: "feishu", sessionKeyStrategy: "hybrid"}
+	chatType := "group"
+	msg := &larkim.EventMessage{
+		ChatType: &chatType,
+		ThreadId: stringPtr("omt_thread"),
+		RootId:   stringPtr("om_root"),
+	}
+
+	sessionKey := p.makeSessionKey(msg, "oc_alerts", "ou_user")
+	if sessionKey != "feishu:oc_alerts:thread:omt_thread" {
+		t.Fatalf("sessionKey = %q, want feishu:oc_alerts:thread:omt_thread", sessionKey)
+	}
+
+	rc := p.makeReplyContext(msg, "om_child", "oc_alerts", sessionKey)
+	if !rc.replyInThread {
+		t.Fatal("replyContext.replyInThread = false, want true")
+	}
+	if rc.threadID != "omt_thread" {
+		t.Fatalf("replyContext.threadID = %q, want omt_thread", rc.threadID)
+	}
+}
+
 func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -876,11 +1218,17 @@ func TestBuildReplyMessageReqBody_SetsReplyInThreadFlag(t *testing.T) {
 			replyCtx:      replyContext{messageID: "om_reply"},
 			wantThreading: false,
 		},
+		{
+			name:          "explicit reply context routes into thread",
+			platform:      &Platform{},
+			replyCtx:      replyContext{messageID: "om_reply", sessionKey: "feishu:oc_chat:thread:om_root", replyInThread: true},
+			wantThreading: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			body := tt.platform.buildReplyMessageReqBody(tt.replyCtx, larkim.MsgTypeText, `{"text":"hello"}`)
+			body := tt.platform.buildReplyMessageReqBody(tt.replyCtx, larkim.MsgTypeText, `{"text":"hello"}`, "")
 			if body == nil {
 				t.Fatal("Body = nil, want populated reply body")
 			}
@@ -1708,7 +2056,27 @@ func TestAllowChat_FiltersGroupMessages(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			p, err := newPlatform("feishu", lark.FeishuBaseUrl, map[string]any{
+			// Mock server for ack replies when messages pass through
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.URL.Path == "/open-apis/auth/v3/tenant_access_token/internal":
+					writeJSON(t, w, map[string]any{
+						"code": 0, "msg": "success", "expire": 7200,
+						"tenant_access_token": "tenant-token",
+					})
+				case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/messages/") && strings.HasSuffix(r.URL.Path, "/reply"):
+					writeJSON(t, w, map[string]any{
+						"code": 0, "msg": "success",
+						"data": map[string]any{"message_id": "om_ack_reply"},
+					})
+				default:
+					writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+				}
+			}))
+			defer srv.Close()
+
+			p, err := newPlatform("feishu", srv.URL, map[string]any{
 				"app_id": "cli_xxx", "app_secret": "secret",
 				"enable_feishu_card": true,
 				"group_reply_all":    true,
@@ -1774,10 +2142,10 @@ func TestResolveMentions_ReplacesKnownMember(t *testing.T) {
 	})
 	input := "巡检完成，@张三 @李四 请查看"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at user_id="ou_zhangsan">张三</at>`) {
+	if !strings.Contains(result, `<at id=ou_zhangsan></at>`) {
 		t.Fatalf("expected 张三 to be resolved, got %q", result)
 	}
-	if !strings.Contains(result, `<at user_id="ou_lisi">李四</at>`) {
+	if !strings.Contains(result, `<at id=ou_lisi></at>`) {
 		t.Fatalf("expected 李四 to be resolved, got %q", result)
 	}
 }
@@ -1809,8 +2177,8 @@ func TestResolveMentions_LongestMatchFirst(t *testing.T) {
 }
 
 // TestResolveMentions_MarkdownContent verifies that @name inside markdown
-// content (which would trigger MsgTypeInteractive) is still resolved to the
-// MsgTypeText at syntax (<at user_id="...">name</at>).
+// content resolves to the card-compatible at syntax (<at id=...></at>)
+// which triggers real mention notifications.
 func TestResolveMentions_MarkdownContent(t *testing.T) {
 	p := &Platform{platformName: "feishu", resolveMentions: true}
 	p.chatMemberCache.Store("oc_chat", &chatMemberEntry{
@@ -1820,11 +2188,8 @@ func TestResolveMentions_MarkdownContent(t *testing.T) {
 	// Content with complex markdown
 	input := "# 巡检报告\n\n@张三 请查看\n\n```\nstatus: ok\n```"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at user_id="ou_zhangsan">张三</at>`) {
-		t.Fatalf("markdown content should resolve to text format <at user_id=...>, got %q", result)
-	}
-	if strings.Contains(result, "<at id=") {
-		t.Fatalf("card format <at id=...> must not be emitted (no mention event); got %q", result)
+	if !strings.Contains(result, `<at id=ou_zhangsan></at>`) {
+		t.Fatalf("markdown content should resolve to card format <at id=...>, got %q", result)
 	}
 }
 
@@ -1874,11 +2239,9 @@ func TestResolveMentions_SpecialCharsEscaped(t *testing.T) {
 	})
 	input := `@A<"B"> 你好`
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if strings.Contains(result, `<"B">`) {
-		t.Fatalf("special chars should be escaped, got %q", result)
-	}
-	if !strings.Contains(result, "A&lt;") {
-		t.Fatalf("expected HTML-escaped name, got %q", result)
+	// Card format uses <at id=open_id></at> — name is not included in the tag
+	if !strings.Contains(result, `<at id=ou_special></at>`) {
+		t.Fatalf("expected card format at tag, got %q", result)
 	}
 }
 
@@ -2353,5 +2716,85 @@ func TestCmdAction_WithAfterClick_SessionKeyRoutes(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected command to be dispatched with correct session key")
+	}
+}
+
+func TestInteractivePlatform_CardActionP2PAllowedViaAllowP2PFrom(t *testing.T) {
+	// Regression: a p2p (single-chat) card action must pass when the chat is not
+	// in allow_chat but the operator is in allow_p2p_from under group_only=true.
+	// Previously onCardAction used only allow_chat, so single-chat /help buttons
+	// (chat id not in the group allow_chat list) were silently dropped.
+	platformAny, err := New(map[string]any{
+		"app_id":             "cli_xxx",
+		"app_secret":         "secret",
+		"enable_feishu_card": true,
+		"group_only":         true,
+		"allow_p2p_from":     "ou_whitelisted_user",
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ip, ok := platformAny.(*interactivePlatform)
+	if !ok {
+		t.Fatalf("platform type = %T, want *interactivePlatform", platformAny)
+	}
+
+	actionCh := make(chan string, 1)
+	ip.cardNavHandler = func(action string, sessionKey string) *core.Card {
+		actionCh <- action
+		return core.NewCard().Markdown("ok").Build()
+	}
+
+	// p2p chat id (single-user chat) not in allow_chat, but operator whitelisted.
+	_, err = ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_whitelisted_user"},
+			Action:   &callback.CallBackAction{Value: map[string]any{"action": "nav:/help"}},
+			// A p2p chat with a user still has an OpenChatID like any chat.
+			Context: &callback.Context{OpenChatID: "oc_p2p_whitelisted", OpenMessageID: "om_msg1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() (whitelisted p2p) error = %v", err)
+	}
+	select {
+	case got := <-actionCh:
+		if got != "nav:/help" {
+			t.Fatalf("action = %q, want nav:/help", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected whitelisted p2p card action to reach nav handler")
+	}
+
+	// Non-whitelisted operator in a chat not in allow_chat must be dropped.
+	ip.cardNavHandler = nil // fail loudly if called again
+	_, err = ip.onCardAction(&callback.CardActionTriggerEvent{
+		Event: &callback.CardActionTriggerRequest{
+			Operator: &callback.Operator{OpenID: "ou_unlisted_user"},
+			Action:   &callback.CallBackAction{Value: map[string]any{"action": "nav:/help"}},
+			Context:  &callback.Context{OpenChatID: "oc_unlisted_chat", OpenMessageID: "om_msg2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("onCardAction() (unlisted) error = %v", err)
+	}
+	select {
+	case got := <-actionCh:
+		t.Fatalf("unlisted card action should have been dropped, got %q", got)
+	default:
+		// expected: no nav handler invocation
+	}
+}
+
+func TestBuildReplyBodyUUID(t *testing.T) {
+	p := &Platform{}
+	rc := replyContext{messageID: "om_x"}
+	none := p.buildReplyMessageReqBody(rc, larkim.MsgTypeText, `{"text":"a"}`, "")
+	if none.Uuid != nil {
+		t.Fatalf("empty uuid must leave Uuid nil, got %v", *none.Uuid)
+	}
+	with := p.buildReplyMessageReqBody(rc, larkim.MsgTypeText, `{"text":"b"}`, "idem-1")
+	if with.Uuid == nil || *with.Uuid != "idem-1" {
+		t.Fatalf("uuid not propagated into reply body: %+v", with.Uuid)
 	}
 }

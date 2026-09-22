@@ -397,6 +397,26 @@ func (a *Agent) AvailableModels(ctx context.Context) []core.ModelOption {
 	}
 }
 
+var _ core.ModelLister = (*Agent)(nil)
+
+// ListModelsDetail implements core.ModelLister for Claude Code. Claude Code has
+// a single implicit provider per project, so every entry is addressed by the
+// bare model name and there is no provider grouping to preserve.
+func (a *Agent) ListModelsDetail(ctx context.Context) []core.ModelDetail {
+	models := a.AvailableModels(ctx)
+	current := a.GetModel()
+	out := make([]core.ModelDetail, 0, len(models))
+	for _, m := range models {
+		out = append(out, core.ModelDetail{
+			Name:          m.Name,
+			SwitchCommand: "/model " + m.Name,
+			Note:          m.Desc,
+			Current:       m.Name == current,
+		})
+	}
+	return out
+}
+
 func (a *Agent) fetchModelsFromAPI(ctx context.Context) []core.ModelOption {
 	a.mu.Lock()
 	apiKey := ""

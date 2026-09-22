@@ -373,6 +373,15 @@ func TestDispatchMessageQuotedFileForeignUserDropped(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/open-apis/im/v1/chats/"):
 			w.Header().Set("Content-Type", "application/json")
 			writeJSON(t, w, map[string]any{"code": 0, "msg": "success"})
+		case strings.HasSuffix(r.URL.Path, "/reply"):
+			w.Header().Set("Content-Type", "application/json")
+			writeJSON(t, w, map[string]any{
+				"code": 0,
+				"msg":  "success",
+				"data": map[string]any{
+					"message_id": "om_ack",
+				},
+			})
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}

@@ -339,6 +339,8 @@ const (
 	MsgModelCardSwitched     MsgKey = "model_card_switched"
 	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
 	MsgModelNotSupported     MsgKey = "model_not_supported"
+	MsgModelsNotSupported   MsgKey = "models_not_supported"
+	MsgModelsUsage          MsgKey = "models_usage"
 	MsgReasoningCurrent      MsgKey = "reasoning_current"
 	MsgReasoningChanged      MsgKey = "reasoning_changed"
 	MsgReasoningNotSupported MsgKey = "reasoning_not_supported"
@@ -347,6 +349,11 @@ const (
 	MsgCompressing          MsgKey = "compressing"
 	MsgCompressNoSession    MsgKey = "compress_no_session"
 	MsgCompressDone         MsgKey = "compress_done"
+
+	// MsgModelSwitching / MsgModelNoSession are used when /model is forwarded
+	// to the agent as a native slash command (ModelCommand, e.g. ACP/Hermes).
+	MsgModelSwitching MsgKey = "model_switching"
+	MsgModelNoSession MsgKey = "model_no_session"
 
 	MsgMemoryNotSupported MsgKey = "memory_not_supported"
 	MsgMemoryShowProject  MsgKey = "memory_show_project"
@@ -413,31 +420,31 @@ const (
 	MsgCronIDLabel               MsgKey = "cron_id_label"
 	MsgCronFailedSuffix          MsgKey = "cron_failed_suffix"
 
-	MsgTimerNotAvailable  MsgKey = "timer_not_available"
-	MsgTimerUsage         MsgKey = "timer_usage"
-	MsgTimerAddUsage      MsgKey = "timer_add_usage"
-	MsgTimerAdded         MsgKey = "timer_added"
-	MsgTimerAddedExec     MsgKey = "timer_added_exec"
-	MsgTimerAddExecUsage  MsgKey = "timer_addexec_usage"
-	MsgTimerEmpty         MsgKey = "timer_empty"
-	MsgTimerListTitle     MsgKey = "timer_list_title"
-	MsgTimerListFooter    MsgKey = "timer_list_footer"
-	MsgTimerDelUsage      MsgKey = "timer_del_usage"
-	MsgTimerMuteUsage     MsgKey = "timer_mute_usage"
-	MsgTimerDeleted       MsgKey = "timer_deleted"
-	MsgTimerNotFound      MsgKey = "timer_not_found"
-	MsgTimerMuted         MsgKey = "timer_muted"
-	MsgTimerUnmuted       MsgKey = "timer_unmuted"
-	MsgTimerCardHint      MsgKey = "timer_card_hint"
-	MsgTimerBtnMute       MsgKey = "timer_btn_mute"
-	MsgTimerBtnUnmute     MsgKey = "timer_btn_unmute"
-	MsgTimerBtnDelete     MsgKey = "timer_btn_delete"
-	MsgTimerIDLabel       MsgKey = "timer_id_label"
-	MsgTimerScheduledLabel MsgKey = "timer_scheduled_label"
-	MsgTimerFailedSuffix  MsgKey = "timer_failed_suffix"
-	MsgCommandsTagAgent          MsgKey = "commands_tag_agent"
-	MsgCommandsTagShell          MsgKey = "commands_tag_shell"
-	MsgUpgradeTimeoutSuffix      MsgKey = "upgrade_timeout_suffix"
+	MsgTimerNotAvailable    MsgKey = "timer_not_available"
+	MsgTimerUsage           MsgKey = "timer_usage"
+	MsgTimerAddUsage        MsgKey = "timer_add_usage"
+	MsgTimerAdded           MsgKey = "timer_added"
+	MsgTimerAddedExec       MsgKey = "timer_added_exec"
+	MsgTimerAddExecUsage    MsgKey = "timer_addexec_usage"
+	MsgTimerEmpty           MsgKey = "timer_empty"
+	MsgTimerListTitle       MsgKey = "timer_list_title"
+	MsgTimerListFooter      MsgKey = "timer_list_footer"
+	MsgTimerDelUsage        MsgKey = "timer_del_usage"
+	MsgTimerMuteUsage       MsgKey = "timer_mute_usage"
+	MsgTimerDeleted         MsgKey = "timer_deleted"
+	MsgTimerNotFound        MsgKey = "timer_not_found"
+	MsgTimerMuted           MsgKey = "timer_muted"
+	MsgTimerUnmuted         MsgKey = "timer_unmuted"
+	MsgTimerCardHint        MsgKey = "timer_card_hint"
+	MsgTimerBtnMute         MsgKey = "timer_btn_mute"
+	MsgTimerBtnUnmute       MsgKey = "timer_btn_unmute"
+	MsgTimerBtnDelete       MsgKey = "timer_btn_delete"
+	MsgTimerIDLabel         MsgKey = "timer_id_label"
+	MsgTimerScheduledLabel  MsgKey = "timer_scheduled_label"
+	MsgTimerFailedSuffix    MsgKey = "timer_failed_suffix"
+	MsgCommandsTagAgent     MsgKey = "commands_tag_agent"
+	MsgCommandsTagShell     MsgKey = "commands_tag_shell"
+	MsgUpgradeTimeoutSuffix MsgKey = "upgrade_timeout_suffix"
 
 	MsgCronScheduleLabel MsgKey = "cron_schedule_label"
 	MsgCronNextRunLabel  MsgKey = "cron_next_run_label"
@@ -688,8 +695,8 @@ const (
 	// send / cron / timer / relay tool documentation in their native
 	// language. Translation coverage is en + zh for this PR; additional
 	// languages fall back to en automatically.
-	MsgAgentSendToolPrompt MsgKey = "agent_send_tool_prompt"
-	MsgAgentCronToolPrompt MsgKey = "agent_cron_tool_prompt"
+	MsgAgentSendToolPrompt  MsgKey = "agent_send_tool_prompt"
+	MsgAgentCronToolPrompt  MsgKey = "agent_cron_tool_prompt"
 	MsgAgentTimerToolPrompt MsgKey = "agent_timer_tool_prompt"
 	MsgAgentRelayToolPrompt MsgKey = "agent_relay_tool_prompt"
 )
@@ -2303,6 +2310,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangJapanese:           "このエージェントはモデルの切り替えをサポートしていません。",
 		LangSpanish:            "Este agente no soporta el cambio de modelo.",
 	},
+	MsgModelsNotSupported: {
+		LangEnglish:            "This agent does not report a model list.",
+		LangChinese:            "当前 Agent 不支持列出模型列表。",
+		LangTraditionalChinese: "當前 Agent 不支援列出模型列表。",
+		LangJapanese:           "このエージェントはモデル一覧を提供していません。",
+		LangSpanish:            "Este agente no informa una lista de modelos.",
+	},
+	MsgModelsUsage: {
+		LangEnglish:            "Copy a line and send it to switch models.",
+		LangChinese:            "复制其中一行发送即可切换模型。",
+		LangTraditionalChinese: "複製其中一行傳送即可切換模型。",
+		LangJapanese:           "いずれかの行をコピーして送信するとモデルを切り替えられます。",
+		LangSpanish:            "Copia una línea y envíala para cambiar de modelo.",
+	},
 	MsgReasoningCurrent: {
 		LangEnglish:            "Current reasoning effort: %s",
 		LangChinese:            "当前推理强度: %s",
@@ -2434,6 +2455,20 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "✅ 上下文壓縮完成。",
 		LangJapanese:           "✅ コンテキスト圧縮完了。",
 		LangSpanish:            "✅ Contexto comprimido.",
+	},
+	MsgModelSwitching: {
+		LangEnglish:            "🔄 Switching model...",
+		LangChinese:            "🔄 正在切换模型...",
+		LangTraditionalChinese: "🔄 正在切換模型...",
+		LangJapanese:           "🔄 モデルを切り替え中...",
+		LangSpanish:            "🔄 Cambiando modelo...",
+	},
+	MsgModelNoSession: {
+		LangEnglish:            "No active session to switch model on. Send a message first.",
+		LangChinese:            "没有活跃的会话可以切换模型。请先发送一条消息。",
+		LangTraditionalChinese: "沒有活躍的會話可以切換模型。請先發送一則訊息。",
+		LangJapanese:           "モデルを切り替えるアクティブなセッションがありません。まずメッセージを送信してください。",
+		LangSpanish:            "No hay ninguna sesión activa para cambiar el modelo. Envíe un mensaje primero.",
 	},
 
 	// Inline strings for engine.go commands

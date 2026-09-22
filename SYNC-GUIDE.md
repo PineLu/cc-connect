@@ -1,0 +1,429 @@
+# CC-Connect Fork 同步与开发指南
+
+> 本文档记录了如何从上游仓库同步更新到 fork 仓库，如何合并到本地开发分支，
+> 以及当前开发分支的功能说明和运行方式。
+
+---
+
+## 目录
+
+1. [仓库关系](#1-仓库关系)
+2. [同步上游仓库到 Fork](#2-同步上游仓库到-fork)
+3. [合并上游更新到维护分支](#3-合并上游更新到维护分支)
+4. [修复合并冲突](#4-修复合并冲突)
+5. [编译与运行](#5-编译与运行)
+6. [当前维护分支功能说明](#6-当前维护分支功能说明)
+7. [常用命令速查](#7-常用命令速查)
+
+---
+
+## 1. 仓库关系
+
+```
+上游仓库 (upstream)     你的 Fork (origin)          当前维护分支
+chenhg5/cc-connect  →  PineLu/cc-connect     →  sync-upstream-0913
+     ↑                      ↑                          ↑
+   官方代码              个人 Fork                 魔改 + 上游同步验证
+```
+
+**远程仓库配置：**
+
+```bash
+origin    git@github.com:PineLu/cc-connect.git        # 你的 fork
+upstream  git@github.com:chenhg5/cc-connect.git       # 上游官方
+```
+
+---
+
+## 2. 同步上游仓库到 Fork
+
+### 2.1 添加 upstream 远程仓库（首次）
+
+```bash
+cd ~/tujia_workspace/cc-connect
+git remote add upstream git@github.com:chenhg5/cc-connect.git
+```
+
+### 2.2 拉取上游最新代码
+
+```bash
+# 拉取上游所有分支和标签
+git fetch upstream
+
+# 切到 main 分支并合并上游
+git checkout main
+git merge upstream/main
+```
+
+### 2.3 推送到你的 Fork
+
+```bash
+git push origin main
+```
+
+> **注意：** 每次上游有更新时，重复以上步骤即可。
+
+---
+
+## 3. 合并上游更新到维护分支
+
+当前已验证并部署的同步分支为：
+
+```text
+sync-upstream-0913
+```
+
+后续同步建议不要直接在已部署分支上继续堆叠，而是每次创建新的日期分支，例如 `sync-upstream-0918`。
+
+### 3.1 更新 main
+
+```bash
+git fetch upstream
+git checkout main
+git merge upstream/main
+git push origin main
+```
+
+### 3.2 从当前维护分支创建新的同步分支
+
+```bash
+git checkout sync-upstream-0913
+git pull origin sync-upstream-0913
+
+# 示例：2026-09-18 同步
+git checkout -b sync-upstream-0918
+```
+
+> 如果后续已有更新的已验证同步分支，应从“最新已验证分支”创建，而不是固定从 `sync-upstream-0913` 创建。
+
+### 3.3 合并最新 main
+
+```bash
+git merge main
+```
+
+如果出现冲突，需要手动解决（见第 4 节）。
+
+### 3.4 完整验证
+
+```bash
+gofmt -w <本次修改的 Go 文件>
+go build ./...
+go vet ./...
+go test ./core/... -count=1
+go test ./platform/feishu/... -count=1
+```
+
+### 3.5 推送新的同步分支
+
+```bash
+git push -u origin sync-upstream-0918
+```
+
+确认编译、测试、飞书实测均通过后，再把该分支作为新的维护基线。
+
+---
+
+## 4. 修复合并冲突
+
+本次合并（v1.4.0 → v1.5.0）产生了一个冲突文件：
+
+### 4.1 冲突文件：`platform/feishu/feishu.go`
+
+**冲突 1 — 结构体字段（约第 190 行）：**
+
+```go
+<<<<<<< HEAD
+	// 你的分支新增：ack 节流 + thread ID 别名
+	ackThrottle    sync.Map
+	threadIDAliases sync.Map
+=======
+	// 上游新增：图片批量合并
+	imageBatchMu     sync.Mutex
+	imageBatch       map[string]*imageBatchEntry
+	imageBatchWindow time.Duration
+>>>>>>> upstream/main
+```
+
+**解决：** 两边都保留，合并为：
+
+```go
+	ackThrottle     sync.Map
+	threadIDAliases sync.Map
+	imageBatchMu     sync.Mutex
+	imageBatch       map[string]*imageBatchEntry
+	imageBatchWindow time.Duration
+```
+
+**冲突 2 — 函数定义（约第 1170 行）：**
+
+你的分支新增了 `shouldSendAck`、`sendAckMessage`、`sendAckAndGetThreadID` 等 ack 相关函数，
+上游新增了 `bufferImage`、`flushImageBatchByRef` 等图片批量合并函数。
+
+**解决：** 两组函数都保留。
+
+### 4.2 测试文件适配
+
+上游修改了 `dispatchMessage` 函数签名，新增了 `threadID` 参数：
+
+```go
+// 上游签名（12 个参数）
+func (p *Platform) dispatchMessage(ctx, msgType, content string, mentions,
+    messageID, sessionKey, userID, chatID string, rctx replyContext,
+    parentID, threadID string, createTimeMs int64)
+```
+
+需要在所有测试调用中补上 `""` 作为 `threadID` 参数。
+
+### 4.3 测试兼容修复
+
+合并后发现 5 个测试失败，原因是你的分支在 `dispatchCoreMessage` 中加入了 ack 自动回复逻辑，
+而上游的测试 mock 没有处理 reply API 调用：
+
+| 测试 | 问题 | 修复 |
+|------|------|------|
+| `TestDispatchMessageIncludesQuotedImage` | ack reply 触发未 mock 的 API | mock 增加 reply 路径 |
+| `TestFeishu_ThreadIsolation...` | dedup 字段未初始化 | 添加 `dedup: &core.MessageDedup{}` |
+| `TestFeishu_HybridGroupStart...` | dedup 字段未初始化 | 添加 `dedup: &core.MessageDedup{}` |
+| `TestLark_GroupReplyAll...` | ack 打到真实 API | 新增完整 mock server |
+| `TestAllowChat_FiltersGroupMessages` | 同上 | 新增完整 mock server |
+
+### 4.4 第二次合并（v1.5.0 → 2026-08-27，38 commits）
+
+**分支：** `sync-upstream-0827`（基于 `sync-upstream-0805`）
+
+**冲突文件：** `platform/feishu/feishu.go`（6 处冲突）
+
+| # | 冲突位置 | 我们的分支 | 上游 | 解决方式 |
+|---|---------|-----------|------|---------|
+| 1 | `replyContext`/`replyResult` 结构体 | `threadID`+`replyInThread`+`replyResult` | `bootstrapThread` | 合并两者，保留全部字段 |
+| 2 | quote 注入条件 | `threadID == ""` 简单判断 | `bootstrapThread` 精细控制 | 采用上游 |
+| 3 | `quotedParent` 结构体 | 基础字段 | +`senderID`/`files`/`parentID`/`quotedFileMeta` | 采用上游 |
+| 4 | `fetchQuotedMessage` 注释 | 只取直接父消息 | 多级 reply chain | 采用上游 |
+| 5 | `fetchQuotedMessage` 返回值 | 简单格式化 | chain 格式化+文件收集 | 采用上游 |
+| 6 | `formatQuotedParent` vs chain 函数 | 单消息格式化 | 多级 chain 函数集 | 采用上游 |
+
+**额外修复：**
+
+| 问题 | 修复 |
+|------|------|
+| `daemon/check_linger_other.go` 与 `launchd.go` 重复声明 `CheckLinger` | build tag 改为 `!linux && !darwin` |
+| `chainMessage` 类型和 `maxReplyChainDepth` 常量缺失 | 添加类型别名和常量 |
+| `fetchSingleMessage` 响应结构体缺少 `ParentID` | 添加字段 |
+| 3 个测试因 ack reply 未 mock 失败 | mock server 添加 `/reply` 路径 |
+| `TestDispatchMessageKeepsMentionOnlyQuotedText` 期望单级 parent | mock 改为 `parent_id: ""` |
+
+**上游新增功能：**
+- Google Chat 平台适配器
+- Kimi Code CLI 原生支持
+- Antigravity Agent 工具权限桥接
+- admin_from 权限控制（/commands addexec, /cron addexec）
+- 飞书引用文件按需下载（issue #1560）
+- 多级 reply chain quote 注入
+- sonnet[1m] 回退模型
+- i18n 本地化（cron/timer/send/relay）
+
+**对我们自定义功能的影响：** 无破坏性冲突。Thread 隔离、ACK、allow_p2p_from、threadIDAliases 均不受影响。Quote 注入从单级变为多级 reply chain（功能增强）。
+
+---
+
+## 5. 编译与运行
+
+### 5.1 编译
+
+```bash
+cd ~/tujia_workspace/cc-connect
+
+# 编译 arm64 版本（macOS Apple Silicon）
+GOOS=darwin GOARCH=arm64 go build -o cc-connect-arm64 ./cmd/cc-connect
+```
+
+### 5.2 运行方式
+
+本地通过 **macOS launchd** 服务管理：
+
+```bash
+# 服务配置文件
+~/Library/LaunchAgents/com.cc-connect.service.plist
+```
+
+**plist 关键配置：**
+
+```xml
+<key>ProgramArguments</key>
+<array>
+    <string>/Users/qitmac001720/tujia_workspace/cc-connect/cc-connect-arm64</string>
+</array>
+<key>WorkingDirectory</key>
+<string>/Users/qitmac001720/.cc-connect</string>
+<key>RunAtLoad</key>
+<true/>
+<key>KeepAlive</key>
+<dict>
+    <key>SuccessfulExit</key>
+    <true/>
+</dict>
+```
+
+- **RunAtLoad** = true → 登录后自动启动
+- **KeepAlive** → 进程退出后自动重启
+- **配置文件** → `~/.cc-connect/config.toml`
+- **日志** → `~/.cc-connect/logs/cc-connect.log`
+
+### 5.3 重启服务
+
+```bash
+# 编译后重启
+GOOS=darwin GOARCH=arm64 go build -o cc-connect-arm64 ./cmd/cc-connect
+launchctl stop com.cc-connect.service
+# launchd 会自动重新启动，无需手动 start
+```
+
+### 5.4 服务管理命令
+
+```bash
+# 查看状态
+launchctl list com.cc-connect.service
+
+# 停止
+launchctl stop com.cc-connect.service
+
+# 卸载（彻底停止）
+launchctl unload ~/Library/LaunchAgents/com.cc-connect.service.plist
+
+# 重新加载（修改 plist 后）
+launchctl load ~/Library/LaunchAgents/com.cc-connect.service.plist
+```
+
+---
+
+## 6. 当前维护分支功能说明
+
+**当前维护分支：** `sync-upstream-0913`
+
+**当前状态：** 已推送、已编译、已部署，飞书回执 reaction 已实测通过。
+
+**基线：** upstream/main（同步至 2026-09-13）+ 自定义魔改
+
+### 6.1 核心功能
+
+#### 🧵 Thread 会话隔离
+
+在飞书群聊中，使用 **reply in thread** 策略实现会话隔离：
+
+- 每个用户在群聊中的消息通过 thread 隔离，不同 thread 对应不同会话
+- 首条消息：发送 ack → 获取 real thread_id → 用 thread_id 作为 session key
+- 后续消息：直接使用 thread_id 作为 session key
+- 避免了之前用 msg_id 作为临时 thread ID 导致的多会话问题
+
+#### 💬 ACK 自动回复
+
+收到消息后自动发送确认回复，告知用户消息已收到：
+
+- 基于消息内容的智能 ack（报警 → "收到报警，正在排查中..."，订单 → "收到，正在查询中..."）
+- 30 秒节流，避免短时间内重复 ack
+- thread 策略下空消息也发 ack（用于创建 thread）
+- ack 消息附带 sessionKey，方便追踪
+
+#### 🏷️ Thread ID 别名
+
+维护 threadIDAliases 映射表，记录 Feishu 消息 ID 与真实 thread_id 的对应关系：
+
+- 首条消息的 msg_id → real thread_id
+- ack 消息的 message_id → real thread_id
+- 用于 session 路由，不用于 quote 展开
+
+#### 📎 Quote 上下文注入
+
+- thread 内一律跳过 quote（避免重复上下文）
+- 显式 @bot 回复时即使在 thread 内也获取 quote 上下文
+- 修复了 quote 注入检查使用实际 thread_id 而非 sessionKey 格式
+
+#### 👤 allow_p2p_from 配置
+
+支持 `group_only` 模式下白名单用户可以单聊：
+
+```toml
+[projects.platforms.options]
+allow_from = "group_only"
+allow_p2p_from = "user_id_1,user_id_2"
+```
+
+### 6.2 修改的文件
+
+| 文件 | 修改内容 |
+|------|----------|
+| `platform/feishu/feishu.go` | ack 逻辑、thread session 流程、threadIDAliases、allow_p2p_from |
+| `platform/feishu/feishu_test.go` | 适配 dispatchMessage 新签名 |
+| `platform/feishu/platform_test.go` | 新增 thread 隔离相关测试 |
+| `config.example.toml` | 新增 allow_p2p_from 配置说明 |
+| `docs/feishu.md` | 文档更新 |
+
+### 6.3 配置示例
+
+```toml
+[[projects]]
+  name = "workspace"
+
+  [projects.agent]
+    type = "claudecode"
+    [projects.agent.options]
+      allowed_tools = ["Read", "Grep", "Glob", "Bash", "Edit", "Write"]
+      mode = "auto"
+      work_dir = "/path/to/workspace"
+
+  [[projects.platforms]]
+    type = "feishu"
+    [projects.platforms.options]
+      allow_from = "*"
+      app_id = "cli_xxx"
+      app_secret = "xxx"
+      enable_feishu_card = true
+      session_key_strategy = "thread"    # 使用 thread 隔离
+      thread_isolation = true            # 启用 thread 会话隔离
+```
+
+---
+
+### 6.4 sync-upstream-0913 已验证内容
+
+- 合并上游飞书回执 reaction、Codex stdio、cron 睡眠恢复相关更新
+- 保留现有 Thread 隔离、ACK、allow_p2p_from、threadIDAliases 等自定义逻辑
+- `go build ./...`、`go vet ./...`、`go test ./core/...`、`go test ./platform/feishu/...` 已通过
+- macOS arm64 二进制已重新编译并通过 launchd 部署
+- 飞书 ACK/reaction 已在线验证
+
+> 历史同步分支 `sync-upstream-0805`、`sync-upstream-0827`、`sync-upstream-0905` 保留用于追溯，不再作为新的同步起点。
+
+---
+
+## 7. 常用命令速查
+
+```bash
+# ========== 同步上游 ==========
+git fetch upstream
+git checkout main && git merge upstream/main && git push origin main
+
+# ========== 创建新的同步分支（示例：2026-09-18） ==========
+git checkout sync-upstream-0913
+git pull origin sync-upstream-0913
+git checkout -b sync-upstream-0918
+git merge main
+
+# 解决冲突后：
+git add -A
+git commit -m "merge: upstream/main 2026-09-18"
+git push -u origin sync-upstream-0918
+
+# ========== 编译 ==========
+cd ~/tujia_workspace/cc-connect
+GOOS=darwin GOARCH=arm64 go build -o cc-connect-arm64 ./cmd/cc-connect
+
+# ========== 重启服务 ==========
+launchctl stop com.cc-connect.service
+
+# ========== 运行测试 ==========
+go test ./platform/feishu/... -count=1
+go build ./...
+go vet ./...
+```

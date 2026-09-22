@@ -429,6 +429,9 @@ func main() {
 		}
 		engine.SetShowWorkdirIndicator(showWorkdir)
 		engine.SetReplyFooterEnabled(showFooter)
+		if proj.FooterTemplate != nil {
+			engine.SetFooterTemplate(*proj.FooterTemplate)
+		}
 		engine.SetAttachmentSendEnabled(cfg.AttachmentSend != "off")
 		engine.SetFilterExternalSessions(proj.FilterExternalSessions != nil && *proj.FilterExternalSessions)
 		engine.SetBaseWorkDir(workDir)
@@ -701,6 +704,19 @@ func main() {
 		if cfg.Queue.MaxDepth != nil && *cfg.Queue.MaxDepth > 0 {
 			engine.SetMaxQueuedMessages(*cfg.Queue.MaxDepth)
 		}
+
+		// Wire durable outbox redelivery of failed final replies (enabled by default)
+		outboxCfg := core.DefaultOutboxConfig()
+		if cfg.Outbox.Enabled != nil {
+			outboxCfg.Enabled = *cfg.Outbox.Enabled
+		}
+		if cfg.Outbox.MaxAgeMins != nil && *cfg.Outbox.MaxAgeMins > 0 {
+			outboxCfg.MaxAge = time.Duration(*cfg.Outbox.MaxAgeMins) * time.Minute
+		}
+		if cfg.Outbox.MaxAttempts != nil && *cfg.Outbox.MaxAttempts > 0 {
+			outboxCfg.MaxAttempts = *cfg.Outbox.MaxAttempts
+		}
+		engine.SetOutboxConfig(outboxCfg)
 
 		// Wire auto-compress settings
 		if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
@@ -1182,6 +1198,7 @@ func main() {
 				ShowContextIndicator: u.ShowContextIndicator,
 				ShowWorkdirIndicator: u.ShowWorkdirIndicator,
 				ReplyFooter:          u.ReplyFooter,
+				FooterTemplate:       u.FooterTemplate,
 				InjectSender:         u.InjectSender,
 				PlatformAllowFrom:    u.PlatformAllowFrom,
 			})
@@ -1781,6 +1798,9 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 	}
 	engine.SetShowWorkdirIndicator(showWorkdir)
 	engine.SetReplyFooterEnabled(showFooter)
+	if proj.FooterTemplate != nil {
+		engine.SetFooterTemplate(*proj.FooterTemplate)
+	}
 
 	// Reload auto-compress settings
 	if proj.AutoCompress.Enabled != nil && *proj.AutoCompress.Enabled {
