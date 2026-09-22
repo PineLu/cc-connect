@@ -20,6 +20,8 @@ import (
 	"github.com/chenhg5/cc-connect/core"
 )
 
+var _ core.ContextUsageReporter = (*opencodeSession)(nil)
+
 // opencodeSession manages multi-turn conversations with the OpenCode CLI.
 // Each Send() launches a new `opencode run --format json` process
 // with --session for conversation continuity.
@@ -39,6 +41,10 @@ type opencodeSession struct {
 	alive             atomic.Bool
 	expectingContinue atomic.Bool // true when compaction_continue received, waiting for next step
 	resultSent        atomic.Bool // true when EventResult has been sent for this turn
+
+	// usageMu guards lastUsage, the most recent step_finish token snapshot.
+	usageMu   sync.RWMutex
+	lastUsage *core.ContextUsage
 }
 
 func newOpencodeSession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, agentName, resumeID string, extraEnv []string) (*opencodeSession, error) {
@@ -484,12 +490,94 @@ func (s *opencodeSession) handleStepFinish(raw map[string]any) {
 	reason := ""
 	if part != nil {
 		reason, _ = part["reason"].(string)
+		s.absorbStepTokens(part)
 	}
 	slog.Debug("opencodeSession: step finished", "reason", reason, "session_id", s.CurrentSessionID())
 
 	if reason == "stop" {
 		s.sendEventResult()
 	}
+}
+
+// absorbStepTokens folds step_finish.part.tokens into lastUsage.
+// OpenCode emits Anthropic-style disjoint buckets:
+//
+//	tokens = {total, input, output, reasoning, cache:{read,write}}
+//	used   = input + cache.read + cache.write; used+output == total
+//
+// Each step_finish is a snapshot of that API call (not cumulative), so
+// CumulativeInputTokens stays false and the last step reflects the live
+// context size. Results (including zero-token steps) update the snapshot.
+func (s *opencodeSession) absorbStepTokens(part map[string]any) {
+	tokens, ok := part["tokens"].(map[string]any)
+	if !ok || tokens == nil {
+		return
+	}
+
+	input := jsonInt(tokens["input"])
+	output := jsonInt(tokens["output"])
+	total := jsonInt(tokens["total"])
+	reasoning := jsonInt(tokens["reasoning"])
+
+	cacheRead, cacheWrite := 0, 0
+	if cache, ok := tokens["cache"].(map[string]any); ok && cache != nil {
+		cacheRead = jsonInt(cache["read"])
+		cacheWrite = jsonInt(cache["write"])
+	}
+
+	used := input + cacheRead + cacheWrite
+	if used <= 0 && total-output > 0 {
+		used = total - output
+	}
+
+	window := lookupOpencodeContextWindow(s.model)
+
+	s.usageMu.Lock()
+	if s.lastUsage == nil {
+		s.lastUsage = &core.ContextUsage{}
+	}
+	u := s.lastUsage
+	u.UsedTokens = used
+	u.TotalTokens = total
+	u.InputTokens = input
+	u.OutputTokens = output
+	u.ReasoningOutputTokens = reasoning
+	u.CachedInputTokens = cacheRead
+	u.CacheCreationInputTokens = cacheWrite
+	u.CumulativeInputTokens = false
+	if window > 0 {
+		u.ContextWindow = window
+	}
+	s.usageMu.Unlock()
+}
+
+// GetContextUsage implements core.ContextUsageReporter for the reply footer
+// and auto-compress heuristic. Returns nil before the first step_finish.
+func (s *opencodeSession) GetContextUsage() *core.ContextUsage {
+	s.usageMu.RLock()
+	defer s.usageMu.RUnlock()
+	if s.lastUsage == nil {
+		return nil
+	}
+	clone := *s.lastUsage
+	return &clone
+}
+
+// jsonInt coerces a JSON number (float64) or int-ish value to int; non-numeric yields 0.
+func jsonInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return 0
 }
 
 func (s *opencodeSession) sendEventResult() {
@@ -500,6 +588,14 @@ func (s *opencodeSession) sendEventResult() {
 	s.resultSent.Store(true)
 	sid := s.CurrentSessionID()
 	evt := core.Event{Type: core.EventResult, SessionID: sid, Done: true}
+	s.usageMu.RLock()
+	if u := s.lastUsage; u != nil {
+		evt.InputTokens = u.InputTokens
+		evt.OutputTokens = u.OutputTokens
+		evt.CacheCreationInputTokens = u.CacheCreationInputTokens
+		evt.CacheReadInputTokens = u.CachedInputTokens
+	}
+	s.usageMu.RUnlock()
 	select {
 	case s.events <- evt:
 	case <-s.ctx.Done():
