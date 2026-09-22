@@ -11479,14 +11479,15 @@ func (e *Engine) cmdForwardModelCommand(p Platform, msg *Message, baseCmd string
 	}
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
-	if !session.TryLock() {
+	lockGen, locked := session.TryLock()
+	if !locked {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPreviousProcessing))
 		return
 	}
 
 	e.send(p, msg.ReplyCtx, e.i18n.T(MsgModelSwitching))
 
-	go e.runForwardedCommand(state, session, sessions, iKey, p, msg.ReplyCtx, command, false, "")
+	go e.runForwardedCommand(state, session, sessions, iKey, p, msg.ReplyCtx, command, false, "", lockGen)
 }
 
 func (e *Engine) cmdCompress(p Platform, msg *Message) {
@@ -11543,11 +11544,11 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 		if !auto {
 			e.reply(p, replyCtx, e.i18n.T(MsgCompressNotSupported))
 		}
-		session.Unlock()
+		session.Unlock(lockGen)
 		return
 	}
 	e.runForwardedCommand(state, session, sessions, iKey, p, replyCtx,
-		compressor.CompressCommand(), auto, e.i18n.T(MsgCompressDone))
+		compressor.CompressCommand(), auto, e.i18n.T(MsgCompressDone), lockGen)
 }
 
 // runForwardedCommand sends a native agent slash command (e.g. Hermes'
