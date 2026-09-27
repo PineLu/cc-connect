@@ -1174,6 +1174,8 @@ app_secret = "your-feishu-app-secret"
 #                                 # 收到消息时添加的表情回复（默认 "🤔Thinking"）；设为 "none" 可禁用
 # done_emoji = "none"             # Emotion when agent finishes a reply (e.g. "🥳Done"); set to "none" to disable
 #                                 # Agent 完成回复后添加的表情回复（如 "🥳Done"）；设为 "none" 可禁用
+# card_final_preview_message = false # After an AI Card turn, send a separate Markdown summary
+#                                    # AI 卡片完成后额外发送一条普通 Markdown 摘要，用于刷新会话列表预览
 
 # WPS Xiezuo / WPS 协作 (uncomment to enable / 取消注释以启用)
 # 1. Create a WPS Open Platform app and enable event WebSocket delivery
@@ -1527,6 +1529,7 @@ app_secret = "your-feishu-app-secret"
 # mode = "websocket"
 # bot_id = "your-bot-id"
 # bot_secret = "your-bot-secret"
+# ws_url = "wss://your-wecom-host:port/im_openws?bizid=10001"  # optional / 可选：私有化部署 WebSocket 地址，留空默认公有云 wss://openws.work.weixin.qq.com
 # allow_from = "*"  # Allowed user IDs / 允许的用户 ID
 
 # Weixin personal (ilink bot) / 微信个人号（ilink 机器人网关）
@@ -1716,7 +1719,7 @@ app_secret = "your-feishu-app-secret"
 # model = "o3"
 #
 # Optional: specify Codex reasoning effort / 可选：指定 Codex 推理强度
-# reasoning_effort = "high"  # "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+# reasoning_effort = "high"  # "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
 #
 # Optional: project system prompt / 可选：项目系统提示
 # Codex has no native system-prompt flag, so cc-connect injects this as a
