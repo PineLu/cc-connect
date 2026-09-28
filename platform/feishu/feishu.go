@@ -4523,7 +4523,17 @@ func stripMentions(text string, mentions []*larkim.MentionEvent, botOpenID strin
 			continue
 		}
 		if botOpenID != "" && m.Id != nil && m.Id.OpenId != nil && *m.Id.OpenId == botOpenID {
+			before := text
 			text = strings.ReplaceAll(text, *m.Key, "")
+			// Feishu may already expand the bot placeholder in Message.Content to
+			// its display form (for example "@My Bot") while Mentions still
+			// reports Key="@_user_1". Fall back to removing one display-name
+			// occurrence only when the placeholder was not present, so ordinary
+			// literal references to @Bot are not stripped when the real placeholder
+			// was successfully removed.
+			if text == before && m.Name != nil && *m.Name != "" {
+				text = strings.Replace(text, "@"+*m.Name, "", 1)
+			}
 		} else if m.Name != nil && *m.Name != "" {
 			text = strings.ReplaceAll(text, *m.Key, "@"+*m.Name)
 		} else {

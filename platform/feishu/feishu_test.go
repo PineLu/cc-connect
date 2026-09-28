@@ -1100,6 +1100,24 @@ func TestStripMentions(t *testing.T) {
 			expected:  "/help",
 		},
 		{
+			name: "expanded bot display name removed when placeholder missing",
+			text: "@松林的Hermes\n Hi",
+			mentions: []*larkim.MentionEvent{
+				{Key: strPtr("@_user_1"), Id: &larkim.UserId{OpenId: strPtr("bot123")}, Name: strPtr("松林的Hermes")},
+			},
+			botOpenID: "bot123",
+			expected:  "Hi",
+		},
+		{
+			name: "placeholder removal does not strip separate literal bot reference",
+			text: "@_user_1 tell @Bot to wait",
+			mentions: []*larkim.MentionEvent{
+				{Key: strPtr("@_user_1"), Id: &larkim.UserId{OpenId: strPtr("bot123")}, Name: strPtr("Bot")},
+			},
+			botOpenID: "bot123",
+			expected:  "tell @Bot to wait",
+		},
+		{
 			name: "non-bot mention replaced with name",
 			text: "assign to @_user_2",
 			mentions: []*larkim.MentionEvent{
