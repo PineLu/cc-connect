@@ -382,23 +382,30 @@ func (s *appServerSession) threadRequestParams() map[string]any {
 	if model := s.GetModel(); model != "" {
 		params["model"] = model
 	}
-	if approval, sandbox := appServerModeSettings(s.mode); approval != "" {
-		params["approvalPolicy"] = approval
-		if sandbox != "" {
-			params["sandbox"] = sandbox
-		}
-	}
+	applyAppServerModeSettings(params, s.mode, true)
 	return params
 }
 
 func appServerModeSettings(mode string) (approval string, sandbox string) {
 	switch normalizeMode(mode) {
-	case "auto-edit", "full-auto":
+	case "auto-edit":
 		return "never", "workspace-write"
+	case "full-auto":
+		return "on-request", "workspace-write"
 	case "yolo":
 		return "never", "danger-full-access"
 	default:
 		return "on-request", "read-only"
+	}
+}
+
+func applyAppServerModeSettings(params map[string]any, mode string, includeSandbox bool) {
+	approval, sandbox := appServerModeSettings(mode)
+	if approval != "" {
+		params["approvalPolicy"] = approval
+	}
+	if includeSandbox && sandbox != "" {
+		params["sandbox"] = sandbox
 	}
 }
 
@@ -512,9 +519,7 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	if effort := s.GetReasoningEffort(); effort != "" {
 		params["effort"] = effort
 	}
-	if approval, _ := appServerModeSettings(s.mode); approval != "" {
-		params["approvalPolicy"] = approval
-	}
+	applyAppServerModeSettings(params, s.mode, false)
 
 	var resp turnStartResponse
 	if err := s.request("turn/start", params, &resp); err != nil {

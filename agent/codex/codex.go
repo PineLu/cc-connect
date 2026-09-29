@@ -33,6 +33,12 @@ func init() {
 //   - "auto-edit": --sandbox workspace-write + approval_policy=never (alias of full-auto)
 //   - "full-auto": --sandbox workspace-write + approval_policy=never
 //   - "yolo":      --dangerously-bypass-approvals-and-sandbox
+//
+// Modes on the app_server backend:
+//   - "suggest":   approvalPolicy=on-request + sandbox=read-only
+//   - "auto-edit": approvalPolicy=never      + sandbox=workspace-write
+//   - "full-auto": approvalPolicy=on-request + sandbox=workspace-write
+//   - "yolo":      approvalPolicy=never      + sandbox=danger-full-access
 type Agent struct {
 	workDir         string
 	model           string
@@ -819,23 +825,25 @@ func (a *Agent) activeProviderCodexConfig() (name string, apiKey string, wireAPI
 //     with approval_policy=never. Sandbox tier is what controls access. The
 //     "suggest" label refers to the *intent* (read-only safety) — the CLI does
 //     not pop interactive approval prompts on this backend.
-//   - app_server backend: "suggest" enables real interactive approval requests
-//     (execCommandApproval / applyPatchApproval / permissionsApproval).
+//   - app_server backend: "suggest" and "full-auto" use on-request approvals;
+//     auto-edit remains non-interactive with workspace-write, while yolo bypasses
+//     both approvals and sandbox restrictions.
 //
-// Note: auto-edit and full-auto produce the same flags on the exec backend
-// (codex CLI has no separate "ask for shell only" mode); auto-edit is kept as
-// an alias for backward compatibility with existing user configs.
+// Note: auto-edit and full-auto produce the same flags only on the exec backend
+// (codex CLI has no approval IPC there). app_server intentionally distinguishes
+// them: auto-edit is never + workspace-write; full-auto is on-request +
+// workspace-write.
 func (a *Agent) PermissionModes() []core.PermissionModeInfo {
 	return []core.PermissionModeInfo{
 		{Key: "suggest", Name: "Suggest", NameZh: "建议",
-			Desc:   "Read-only sandbox; on exec backend no prompts, on app_server backend asks for every tool call",
-			DescZh: "只读沙箱；exec 后端不弹审批，app_server 后端每次工具调用都会询问"},
+			Desc:   "Read-only sandbox; exec backend cannot prompt, app_server requests approval when needed",
+			DescZh: "只读沙箱；exec 后端无法交互审批，app_server 后端按需请求审批"},
 		{Key: "auto-edit", Name: "Auto Edit", NameZh: "自动编辑",
-			Desc:   "Workspace-write sandbox, no approval prompts (alias of Full Auto)",
-			DescZh: "工作区可写沙箱，不弹审批（等同于全自动）"},
+			Desc:   "Workspace-write sandbox with no approval prompts on either backend",
+			DescZh: "工作区可写沙箱；两种后端均不弹审批"},
 		{Key: "full-auto", Name: "Full Auto", NameZh: "全自动",
-			Desc:   "Workspace-write sandbox, no approval prompts",
-			DescZh: "工作区可写沙箱，不弹审批"},
+			Desc:   "Workspace-write sandbox; app_server requests approval on demand, exec backend cannot prompt",
+			DescZh: "工作区可写沙箱；app_server 后端按需请求审批，exec 后端无法交互审批"},
 		{Key: "yolo", Name: "YOLO", NameZh: "YOLO 模式",
 			Desc:   "Bypass all approvals and sandbox (DANGEROUS)",
 			DescZh: "跳过所有审批和沙箱（危险）"},

@@ -198,6 +198,42 @@ func TestBuildExecArgs_ModeMapping(t *testing.T) {
 	}
 }
 
+func TestAppServerModeSettings_ThreadAndTurnApprovalPolicies(t *testing.T) {
+	tests := []struct {
+		mode              string
+		wantApproval      string
+		wantThreadSandbox string
+	}{
+		{mode: "suggest", wantApproval: "on-request", wantThreadSandbox: "read-only"},
+		{mode: "auto-edit", wantApproval: "never", wantThreadSandbox: "workspace-write"},
+		{mode: "full-auto", wantApproval: "on-request", wantThreadSandbox: "workspace-write"},
+		{mode: "yolo", wantApproval: "never", wantThreadSandbox: "danger-full-access"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.mode, func(t *testing.T) {
+			s := &appServerSession{mode: tc.mode}
+
+			threadParams := s.threadRequestParams()
+			if got := threadParams["approvalPolicy"]; got != tc.wantApproval {
+				t.Fatalf("thread/start mode=%s approvalPolicy=%v, want %q", tc.mode, got, tc.wantApproval)
+			}
+			if got := threadParams["sandbox"]; got != tc.wantThreadSandbox {
+				t.Fatalf("thread/start mode=%s sandbox=%v, want %q", tc.mode, got, tc.wantThreadSandbox)
+			}
+
+			turnParams := map[string]any{}
+			applyAppServerModeSettings(turnParams, tc.mode, false)
+			if got := turnParams["approvalPolicy"]; got != tc.wantApproval {
+				t.Fatalf("turn/start mode=%s approvalPolicy=%v, want %q", tc.mode, got, tc.wantApproval)
+			}
+			if _, ok := turnParams["sandbox"]; ok {
+				t.Fatalf("turn/start mode=%s unexpectedly includes sandbox override: %v", tc.mode, turnParams)
+			}
+		})
+	}
+}
+
 // TestBuildExecArgs_ResumeUsesSandboxModeConfigOverride is the regression test
 // for the "codex exec resume" sandbox flag bug.
 //
