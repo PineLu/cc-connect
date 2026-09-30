@@ -4115,7 +4115,7 @@ func countMarkdownTables(s string) int {
 // buildPostMdJSON builds a Feishu post message using the md tag,
 // which renders markdown at normal chat font size.
 func buildPostMdJSON(content string) string {
-	content = sanitizeMarkdownURLs(content)
+	content = sanitizeMarkdownURLs(normalizeFeishuMarkdownCompatibility(content))
 	post := map[string]any{
 		"zh_cn": map[string]any{
 			"content": [][]map[string]any{
@@ -4129,10 +4129,122 @@ func buildPostMdJSON(content string) string {
 	return string(b)
 }
 
-// preprocessFeishuMarkdown ensures code fences have a newline before them,
-// which prevents rendering issues in Feishu card markdown.
-// Tables, headings, blockquotes, etc. are rendered natively by the card markdown element.
+var (
+	feishuMarkdownSimpleBoldPattern   = regexp.MustCompile(`\*\*([^*\n|]+)\*\*`)
+	feishuFontColorDoubleQuotePattern = regexp.MustCompile(`(?i)<font\s+color="(red|green)">`)
+	feishuAtOpenPattern               = regexp.MustCompile(`(?i)<at\b`)
+)
+
+// normalizeFeishuMarkdownCompatibility applies only platform-level rendering
+// compatibility fixes. Business formatting (for example auto-bolding labels such
+// as "结论" or "根因分析") belongs in the caller's template/builder layer.
+//
+// Fenced code, inline code, and existing Feishu <at ...></at> tags are copied
+// verbatim so examples and already-valid protocol markup are never rewritten.
+func normalizeFeishuMarkdownCompatibility(md string) string {
+	if md == "" {
+		return md
+	}
+
+	var out strings.Builder
+	out.Grow(len(md))
+	plainStart := 0
+
+	writePlain := func(end int) {
+		if end > plainStart {
+			out.WriteString(normalizeFeishuMarkdownPlainText(md[plainStart:end]))
+		}
+	}
+
+	for i := 0; i < len(md); {
+		if md[i] == '`' {
+			run := 1
+			for i+run < len(md) && md[i+run] == '`' {
+				run++
+			}
+			restStart := i + run
+			if end, ok := findFeishuMarkdownBacktickEnd(md, restStart, run); ok {
+				writePlain(i)
+				out.WriteString(md[i:end])
+				i = end
+				plainStart = end
+				continue
+			}
+			if run >= 3 {
+				writePlain(i)
+				out.WriteString(md[i:])
+				return out.String()
+			}
+			i += run
+			continue
+		}
+
+		if md[i] == '<' {
+			if loc := feishuAtTagPattern.FindStringIndex(md[i:]); loc != nil && loc[0] == 0 {
+				end := i + loc[1]
+				candidate := md[i:end]
+				if !feishuAtOpenPattern.MatchString(candidate[1:]) {
+					writePlain(i)
+					out.WriteString(candidate)
+					i = end
+					plainStart = end
+					continue
+				}
+			}
+		}
+
+		i++
+	}
+
+	writePlain(len(md))
+	return out.String()
+}
+
+func findFeishuMarkdownBacktickEnd(md string, start, openingRun int) (int, bool) {
+	for i := start; i < len(md); {
+		if openingRun < 3 && md[i] == '\n' {
+			return 0, false
+		}
+		if md[i] != '`' {
+			i++
+			continue
+		}
+		run := 1
+		for i+run < len(md) && md[i+run] == '`' {
+			run++
+		}
+		if (openingRun >= 3 && run >= openingRun) || (openingRun < 3 && run == openingRun) {
+			return i + run, true
+		}
+		i += run
+	}
+	return 0, false
+}
+
+func normalizeFeishuMarkdownPlainText(text string) string {
+	text = feishuFontColorDoubleQuotePattern.ReplaceAllStringFunc(text, func(tag string) string {
+		parts := feishuFontColorDoubleQuotePattern.FindStringSubmatch(tag)
+		if len(parts) != 2 {
+			return tag
+		}
+		return "<font color='" + strings.ToLower(parts[1]) + "'>"
+	})
+	return feishuMarkdownSimpleBoldPattern.ReplaceAllStringFunc(text, func(span string) string {
+		inner := span[2 : len(span)-2]
+		trimmed := strings.TrimSpace(inner)
+		if trimmed == "" || trimmed == inner {
+			return span
+		}
+		return "**" + trimmed + "**"
+	})
+}
+
+// preprocessFeishuMarkdown applies platform-level compatibility normalization
+// and ensures code fences have a newline before them, preventing rendering issues
+// in Feishu card markdown. Tables, headings, blockquotes, etc. are rendered
+// natively by the card markdown element.
 func preprocessFeishuMarkdown(md string) string {
+	md = normalizeFeishuMarkdownCompatibility(md)
 	// Ensure ``` has a newline before it (unless at start of text)
 	var b strings.Builder
 	b.Grow(len(md) + 32)

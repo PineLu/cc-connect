@@ -910,6 +910,104 @@ func TestPreprocessFeishuMarkdown_PreservesTablesAndHeadings(t *testing.T) {
 	}
 }
 
+func TestPreprocessFeishuMarkdown_NormalizesGenericCompatibilityOnly(t *testing.T) {
+	input := strings.Join([]string{
+		`** bold ** and **trailing ** and ** leading**`,
+		`<font color="red">hot</font> <font color="GREEN">ok</font>`,
+		`结论: keep business formatting unchanged`,
+		`<font color='red'>内容</font>`,
+	}, "\n")
+	out := preprocessFeishuMarkdown(input)
+	for _, want := range []string{
+		`**bold** and **trailing** and **leading**`,
+		`<font color='red'>hot</font> <font color='green'>ok</font>`,
+		`结论: keep business formatting unchanged`,
+		`<font color='red'>内容</font>`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in normalized markdown, got %q", want, out)
+		}
+	}
+	if strings.Contains(out, `**结论**`) || strings.Contains(out, `<font color='red'>**内容**</font>`) {
+		t.Fatalf("business formatting must not be injected by outbound normalization: %q", out)
+	}
+}
+
+func TestPreprocessFeishuMarkdown_ProtectedRegionsStayVerbatim(t *testing.T) {
+	input := strings.Join([]string{
+		"before ** fix me **",
+		"`** inline stays **`",
+		"```text",
+		"** fenced stays **",
+		`<font color="red">fenced tag stays</font>`,
+		"```",
+		`<at id=ou_bot>** mention stays **</at>`,
+		`<at user_id="ou_text">** text mention stays **</at>`,
+	}, "\n")
+	out := preprocessFeishuMarkdown(input)
+	for _, want := range []string{
+		"before **fix me**",
+		"`** inline stays **`",
+		"** fenced stays **",
+		`<font color="red">fenced tag stays</font>`,
+		`<at id=ou_bot>** mention stays **</at>`,
+		`<at user_id="ou_text">** text mention stays **</at>`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("protected region changed or expected normalization missing for %q: %q", want, out)
+		}
+	}
+}
+
+func TestPreprocessFeishuMarkdown_CodeFenceWithLongerClosingRun(t *testing.T) {
+	input := "before ** fix me **\n```text\n** fenced stays **\n````\nafter ** fix me too **"
+	out := preprocessFeishuMarkdown(input)
+	for _, want := range []string{
+		"before **fix me**",
+		"** fenced stays **",
+		"after **fix me too**",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q after compatible fence handling, got %q", want, out)
+		}
+	}
+}
+
+func TestPreprocessFeishuMarkdown_UnclosedFenceProtectsRemainder(t *testing.T) {
+	input := "before ** fix me **\n```text\n** fenced stays **\nafter ** stays protected **"
+	out := preprocessFeishuMarkdown(input)
+	if !strings.Contains(out, "before **fix me**") {
+		t.Fatalf("plain text before unclosed fence should normalize, got %q", out)
+	}
+	for _, want := range []string{"** fenced stays **", "after ** stays protected **"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("unclosed fence remainder must stay verbatim; missing %q in %q", want, out)
+		}
+	}
+}
+
+func TestPreprocessFeishuMarkdown_DoesNotRewriteNestedEmphasis(t *testing.T) {
+	input := `** outer *inner* **`
+	if out := preprocessFeishuMarkdown(input); out != input {
+		t.Fatalf("nested emphasis must stay unchanged, got %q", out)
+	}
+}
+
+func TestPreprocessFeishuMarkdown_MalformedAtDoesNotSwallowFollowingValidAt(t *testing.T) {
+	input := `before ** fix ** <at id=broken> middle ** fix too ** <at id=ou_ok>** valid mention stays **</at> after ** fix three **`
+	out := preprocessFeishuMarkdown(input)
+	for _, want := range []string{
+		`before **fix**`,
+		`middle **fix too**`,
+		`<at id=ou_ok>** valid mention stays **</at>`,
+		`after **fix three**`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("malformed at tag must not swallow following content; missing %q in %q", want, out)
+		}
+	}
+}
+
 func TestHasComplexMarkdown(t *testing.T) {
 	if !hasComplexMarkdown("text\n```go\ncode\n```") {
 		t.Error("should detect code blocks")
