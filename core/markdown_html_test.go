@@ -567,6 +567,117 @@ func TestSplitMessageCodeFenceAware_UnicodeLines(t *testing.T) {
 	}
 }
 
+func TestSplitMessageCodeFenceAware_RepeatsMarkdownTableHeader(t *testing.T) {
+	header := "| 活动 code | 活动名称 | 发放张数 |"
+	separator := "|---|---|---|"
+	var rows []string
+	for i := 0; i < 12; i++ {
+		rows = append(rows, fmt.Sprintf("| rp_%02d | 券-%02d | %d |", i, i, 1000+i))
+	}
+	text := "前置说明\n\n" + header + "\n" + separator + "\n" + strings.Join(rows, "\n") + "\n\n## 结论\n完成"
+	const maxLen = 120
+
+	chunks := SplitMessageCodeFenceAware(text, maxLen)
+	if len(chunks) < 2 {
+		t.Fatalf("expected table to span multiple chunks, got %d", len(chunks))
+	}
+	for i, chunk := range chunks {
+		if got := len([]rune(chunk)); got > maxLen {
+			t.Fatalf("chunk %d exceeds maxLen: %d > %d\n%s", i, got, maxLen, chunk)
+		}
+		if strings.Contains(chunk, "| rp_") {
+			if !strings.Contains(chunk, header) || !strings.Contains(chunk, separator) {
+				t.Fatalf("table chunk %d is missing repeated header/separator:\n%s", i, chunk)
+			}
+		}
+	}
+}
+
+func TestSplitMessageCodeFenceAware_TableSyntaxInsideCodeFenceIsNotRewritten(t *testing.T) {
+	header := "| header | value |"
+	text := "```text\n" + header + "\n|---|---|\n" + strings.Repeat("| row | value |\n", 12) + "```"
+	chunks := SplitMessageCodeFenceAware(text, 80)
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple code chunks, got %d", len(chunks))
+	}
+	if got := strings.Count(strings.Join(chunks, "\n"), header); got != 1 {
+		t.Fatalf("table-looking code must not gain repeated table headers; count=%d chunks=%q", got, chunks)
+	}
+}
+
+func TestSplitMessageCodeFenceAware_LegacyModeKeepsHistoricalTableSplit(t *testing.T) {
+	header := "| h | v |"
+	separator := "|---|---|"
+	text := header + "\n" + separator + "\n" + strings.Repeat("| row | value |\n", 10)
+	chunks := splitMessageCodeFenceAware(text, 70, false)
+	if len(chunks) < 2 {
+		t.Fatalf("expected legacy split to produce multiple chunks, got %d", len(chunks))
+	}
+	if strings.Contains(chunks[1], header) {
+		t.Fatalf("legacy replay mode must preserve pre-table-aware boundaries, got repeated header in %q", chunks[1])
+	}
+}
+
+func TestSplitMessageCodeFenceAware_OversizeTableRowDegradesSafely(t *testing.T) {
+	header := "| h | v |"
+	separator := "|---|---|"
+	longPayload := strings.Repeat("Ω", 120)
+	text := strings.Join([]string{
+		header,
+		separator,
+		"| before | ok |",
+		"| " + longPayload + " | huge |",
+		"| after | ok |",
+	}, "\n")
+	const maxLen = 70
+
+	chunks := SplitMessageCodeFenceAware(text, maxLen)
+	if len(chunks) < 3 {
+		t.Fatalf("expected oversize row to force multiple chunks, got %d: %q", len(chunks), chunks)
+	}
+	joined := strings.Join(chunks, "")
+	if strings.Count(joined, "before") != 1 || strings.Count(joined, "after") != 1 {
+		t.Fatalf("business rows must be preserved exactly once: %q", chunks)
+	}
+	if strings.Count(joined, "Ω") != len([]rune(longPayload)) {
+		t.Fatalf("oversize row payload was lost or duplicated: want %d payload runes, got %d", len([]rune(longPayload)), strings.Count(joined, "Ω"))
+	}
+	if strings.Count(joined, header) != 1 {
+		t.Fatalf("table must degrade after impossible row rather than repeat a misleading header: %q", chunks)
+	}
+	for i, chunk := range chunks {
+		if got := len([]rune(chunk)); got > maxLen {
+			t.Fatalf("chunk %d exceeds maxLen: %d > %d", i, got, maxLen)
+		}
+	}
+}
+
+func TestSplitMessageCodeFenceAware_OversizeTableHeaderDegradesToCode(t *testing.T) {
+	headerPayload := strings.Repeat("h", 90)
+	text := strings.Join([]string{
+		"| " + headerPayload + " | v |",
+		"|---|---|",
+		"| row1 | ok |",
+		"| row2 | ok |",
+	}, "\n")
+	const maxLen = 70
+
+	wrapped := wrapUnsplittableMarkdownTables(text, maxLen)
+	if !strings.HasPrefix(wrapped, "```text\n") || !strings.HasSuffix(wrapped, "\n```") {
+		t.Fatalf("oversize-header table should degrade to fenced text: %q", wrapped)
+	}
+	chunks := SplitMessageCodeFenceAware(text, maxLen)
+	joined := strings.Join(chunks, "")
+	if strings.Count(joined, "h") != len(headerPayload) || strings.Count(joined, "row1") != 1 || strings.Count(joined, "row2") != 1 {
+		t.Fatalf("degraded table content was lost or duplicated: %q", chunks)
+	}
+	for i, chunk := range chunks {
+		if got := len([]rune(chunk)); got > maxLen {
+			t.Fatalf("chunk %d exceeds maxLen: %d > %d", i, got, maxLen)
+		}
+	}
+}
+
 func TestMarkdownToSimpleHTML_BoldItalic(t *testing.T) {
 	out := MarkdownToSimpleHTML("this is ***bold italic*** text")
 	if !strings.Contains(out, "<b><i>bold italic</i></b>") {

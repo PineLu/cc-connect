@@ -259,6 +259,9 @@ func TestOutbox_ChunkProgressPersisted(t *testing.T) {
 	cfg := testOutboxCfg()
 	o := NewOutbox(dir, cfg)
 	id := o.Add("feishu", "k", []byte(`{}`), "b", "")
+	if err := o.SetSplitPlan(id, finalReplySplitVersion, 6000); err != nil {
+		t.Fatal(err)
+	}
 	o.SetChunkProgress(id, 2)
 
 	// Simulate restart: a fresh outbox over the same directory.
@@ -275,8 +278,43 @@ func TestOutbox_ChunkProgressPersisted(t *testing.T) {
 	if it.SentChunks != 2 {
 		t.Fatalf("SentChunks = %d, want 2", it.SentChunks)
 	}
+	if it.SplitVersion != finalReplySplitVersion || it.SplitMaxRunes != 6000 {
+		t.Fatalf("split plan = version %d max %d, want version %d max 6000", it.SplitVersion, it.SplitMaxRunes, finalReplySplitVersion)
+	}
 	if it.Platform != "feishu" || it.SessionKey != "k" || it.Body != "b" {
 		t.Fatalf("recovered item mismatch: %+v", it)
+	}
+}
+
+func TestOutbox_SetSplitPlanFailureRevertsInMemoryPlan(t *testing.T) {
+	dir := t.TempDir()
+	o := NewOutbox(dir, testOutboxCfg())
+	id := o.Add("feishu", "k", []byte(`{}`), "body", "")
+	if id == "" {
+		t.Fatal("expected initial outbox persist to succeed")
+	}
+
+	// Replace the persisted item file with a directory so AtomicWriteFile's
+	// rename and direct-write fallback both fail deterministically.
+	target := filepath.Join(dir, id+".json")
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := o.SetSplitPlan(id, finalReplySplitVersion, 6000); err == nil {
+		t.Fatal("SetSplitPlan should report persistence failure")
+	}
+	o.mu.Lock()
+	it := o.items[id]
+	o.mu.Unlock()
+	if it == nil {
+		t.Fatal("item should remain in memory after split-plan persistence failure")
+	}
+	if it.SplitVersion != 0 || it.SplitMaxRunes != 0 {
+		t.Fatalf("failed split-plan persist must revert in-memory plan; got version=%d max=%d", it.SplitVersion, it.SplitMaxRunes)
 	}
 }
 

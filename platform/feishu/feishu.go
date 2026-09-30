@@ -642,6 +642,12 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 
 func (p *Platform) Name() string { return p.platformName }
 
+// MaxFinalReplyRunes raises Feishu's final-reply split budget above core's
+// conservative cross-platform default. 6000 runes keeps typical card/text JSON
+// comfortably below Feishu's message-size guidance while avoiding needless
+// splits for medium-long Markdown replies.
+func (p *Platform) MaxFinalReplyRunes() int { return 6000 }
+
 func (p *Platform) ProgressStyle() string { return p.progressStyle }
 
 func (p *Platform) SupportsProgressCardPayload() bool { return true }

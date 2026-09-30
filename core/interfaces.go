@@ -74,6 +74,14 @@ type SendErrorClassifier interface {
 	IsRetryableSendError(err error) bool
 }
 
+// FinalReplyLengthProvider lets a platform raise or lower the rune budget used
+// when core splits completed assistant replies. It intentionally applies only
+// to final replies: progress/thinking/tool side-channel messages keep the
+// conservative cross-platform default unless their own path says otherwise.
+type FinalReplyLengthProvider interface {
+	MaxFinalReplyRunes() int
+}
+
 // RelayGroupVisibilityTarget is an optional interface for platforms that
 // want to customise the session key used when echoing relay request /
 // response messages into the group chat for visibility.  Platforms that

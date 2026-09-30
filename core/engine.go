@@ -29,6 +29,7 @@ import (
 )
 
 const maxPlatformMessageLen = 4000
+const finalReplySplitVersion = 1
 const telegramBotCommandLimit = 100
 const defaultMaxQueuedMessages = 5 // default cap for queued messages per session
 
@@ -6292,7 +6293,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					// Fallback: send the response as a normal message — but never
 					// for a silent reply, which has no deliverable content.
 					if !isSilent {
-						for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+						for _, chunk := range splitFinalReply(p, fullResponse) {
 							if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 								return
 							}
@@ -6725,7 +6726,7 @@ channelClosed:
 			if segmentStart < len(textParts) {
 				unsent := strings.Join(textParts[segmentStart:], "")
 				if unsent != "" {
-					for _, chunk := range SplitMessageCodeFenceAware(unsent, maxPlatformMessageLen) {
+					for _, chunk := range splitFinalReply(p, unsent) {
 						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 							return
 						}
@@ -6735,7 +6736,7 @@ channelClosed:
 		} else if sp.finish(fullResponse, "") {
 			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
-			for _, chunk := range SplitMessageCodeFenceAware(fullResponse, maxPlatformMessageLen) {
+			for _, chunk := range splitFinalReply(p, fullResponse) {
 				if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 					return
 				}
@@ -8456,15 +8457,54 @@ func (e *Engine) renderFooterTemplate(data footerTemplateData) string {
 	return strings.TrimSpace(buf.String())
 }
 
-// sendChunksWithStatusFooter splits body across maxPlatformMessageLen and sends
-// each chunk via the supplied sendFn. The final chunk carries the structured
-// statusFooter: platforms implementing StatusFooterSender render it as a
+// finalReplyMaxRunes returns the completed-reply rune budget for p. Platforms
+// can opt into a larger/smaller final-reply budget without changing the shared
+// side-channel/progress limit.
+func finalReplyMaxRunes(p Platform) int {
+	if provider, ok := p.(FinalReplyLengthProvider); ok {
+		if maxRunes := provider.MaxFinalReplyRunes(); maxRunes > 0 {
+			return maxRunes
+		}
+	}
+	return maxPlatformMessageLen
+}
+
+func splitFinalReplyWithPlan(p Platform, body, statusFooter string) ([]string, int) {
+	maxRunes := finalReplyMaxRunes(p)
+	chunks := SplitMessageCodeFenceAware(body, maxRunes)
+	if statusFooter == "" || len(chunks) == 0 {
+		return chunks, maxRunes
+	}
+	// StatusFooterSender may fall back to appendReplyFooter, so keep the final
+	// payload inside the platform budget even when structured footer rendering
+	// is unavailable. Most replies stay on the full-budget fast path.
+	last := chunks[len(chunks)-1]
+	if utf8.RuneCountInString(appendReplyFooter(last, statusFooter)) <= maxRunes {
+		return chunks, maxRunes
+	}
+	footerOverhead := utf8.RuneCountInString("\n\n*" + statusFooter + "*")
+	bodyMaxRunes := maxRunes - footerOverhead
+	if bodyMaxRunes < 1 {
+		bodyMaxRunes = 1
+	}
+	return SplitMessageCodeFenceAware(body, bodyMaxRunes), bodyMaxRunes
+}
+
+func splitFinalReply(p Platform, body string) []string {
+	chunks, _ := splitFinalReplyWithPlan(p, body, "")
+	return chunks
+}
+
+// sendChunksWithStatusFooter splits body across the platform's final-reply
+// rune budget and sends each chunk via the supplied sendFn.
+// The final chunk carries the structured statusFooter: platforms implementing
+// StatusFooterSender render it as a
 // small/dim block; otherwise the footer is appended inline via
 // appendReplyFooter. Returns true on success, false if any send failed (in
 // which case caller should bail). sendFn is the workspace-aware send closure
 // (so the helper picks up workspace transforms like path remapping).
 func sendChunksWithStatusFooter(ctx context.Context, p Platform, replyCtx any, body, statusFooter string, sendFn func(Platform, any, string) error) bool {
-	chunks := SplitMessageCodeFenceAware(body, maxPlatformMessageLen)
+	chunks, _ := splitFinalReplyWithPlan(p, body, statusFooter)
 	for i, chunk := range chunks {
 		isLast := i == len(chunks)-1
 		if isLast && statusFooter != "" {
@@ -8517,7 +8557,7 @@ func (e *Engine) sendFinalWithOutbox(sessionKey string, ctx context.Context, p P
 	if e.outbox == nil || !isCodec || !isClass {
 		return sendChunksWithStatusFooter(ctx, p, replyCtx, body, statusFooter, sendFn)
 	}
-	chunks := SplitMessageCodeFenceAware(body, maxPlatformMessageLen)
+	chunks, maxRunes := splitFinalReplyWithPlan(p, body, statusFooter)
 	if len(chunks) == 0 {
 		return true
 	}
@@ -8529,6 +8569,15 @@ func (e *Engine) sendFinalWithOutbox(sessionKey string, ctx context.Context, p P
 	id := e.outbox.Add(p.Name(), sessionKey, encoded, body, statusFooter)
 	if id == "" { // outbox disabled
 		return sendChunksWithStatusFooter(ctx, p, replyCtx, body, statusFooter, sendFn)
+	}
+	if err := e.outbox.SetSplitPlan(id, finalReplySplitVersion, maxRunes); err != nil {
+		// Do not send any chunk until the exact split plan is durable. Otherwise a
+		// restart could interpret SentChunks using the legacy 4000-rune boundaries
+		// and skip or duplicate content. The initial Add is already durable, so park
+		// the zero-version item for legacy-safe replay instead.
+		slog.Warn("outbox: persist final-reply split plan failed, deferring delivery", "id", id, "error", err)
+		e.outbox.Fail(id, err)
+		return false
 	}
 	// Bind the outbox idempotency key so a stray double send collapses at the platform.
 	sendCtx := WithOutboxUUID(ctx, e.outbox.ItemUUID(id))
@@ -8572,7 +8621,19 @@ func (e *Engine) replayOutboxItem(ctx context.Context, it *OutboxItem) (bool, er
 		slog.Error("outbox: undecodable reply context, dropping reply", "id", it.ID, "error", err)
 		return true, nil
 	}
-	chunks := SplitMessageCodeFenceAware(it.Body, maxPlatformMessageLen)
+	var chunks []string
+	if it.SplitVersion <= 0 {
+		// Legacy persisted items were split with the historical global 4000-rune
+		// code-fence-aware algorithm. Preserve those boundaries so SentChunks
+		// still refers to the same prefix after an upgrade.
+		chunks = splitMessageCodeFenceAware(it.Body, maxPlatformMessageLen, false)
+	} else {
+		maxRunes := it.SplitMaxRunes
+		if maxRunes <= 0 {
+			maxRunes = finalReplyMaxRunes(p)
+		}
+		chunks = splitMessageCodeFenceAware(it.Body, maxRunes, true)
+	}
 	if it.SentChunks > len(chunks) {
 		it.SentChunks = 0 // defensive: split result changed, resend all
 	}

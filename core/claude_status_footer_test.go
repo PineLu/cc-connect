@@ -462,6 +462,13 @@ type stubFooterSendingPlatform struct {
 	failFooter  bool     // when true, SendWithStatusFooter returns an error
 }
 
+type stubFinalReplyLimitPlatform struct {
+	stubPlatformEngine
+	maxRunes int
+}
+
+func (p *stubFinalReplyLimitPlatform) MaxFinalReplyRunes() int { return p.maxRunes }
+
 func (p *stubFooterSendingPlatform) SendWithStatusFooter(_ context.Context, _ any, content, footer string) error {
 	p.footerCalls = append(p.footerCalls, content+"|FOOTER|"+footer)
 	if p.failFooter {
@@ -528,6 +535,57 @@ func TestSendChunksWithStatusFooter_NoFooter(t *testing.T) {
 	}
 	if got := p.getSent(); len(got) != 1 || got[0] != "hello body" {
 		t.Errorf("plain Send sequence = %#v, want one chunk verbatim", got)
+	}
+}
+
+func TestSendChunksWithStatusFooter_UsesPlatformFinalReplyLimit(t *testing.T) {
+	p := &stubFinalReplyLimitPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		maxRunes:           6000,
+	}
+	body := strings.Repeat("中", 5500)
+	send := func(pl Platform, rctx any, content string) error {
+		return pl.Send(context.Background(), rctx, content)
+	}
+
+	if ok := sendChunksWithStatusFooter(context.Background(), p, "ctx", body, "", send); !ok {
+		t.Fatal("expected final reply send to succeed")
+	}
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != body {
+		t.Fatalf("5500-rune body should stay in one chunk at platform limit 6000; sends=%d", len(sent))
+	}
+}
+
+func TestFinalReplyMaxRunes_DefaultAndInvalidOverride(t *testing.T) {
+	if got := finalReplyMaxRunes(&stubPlatformEngine{n: "test"}); got != maxPlatformMessageLen {
+		t.Fatalf("default final reply limit = %d, want %d", got, maxPlatformMessageLen)
+	}
+	p := &stubFinalReplyLimitPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}, maxRunes: 0}
+	if got := finalReplyMaxRunes(p); got != maxPlatformMessageLen {
+		t.Fatalf("non-positive override must fall back to default; got %d", got)
+	}
+}
+
+func TestSplitFinalReplyWithPlan_ReservesInlineFooterOnlyWhenNeeded(t *testing.T) {
+	p := &stubFinalReplyLimitPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}, maxRunes: 100}
+	footer := "model · ctx"
+
+	shortChunks, shortLimit := splitFinalReplyWithPlan(p, strings.Repeat("x", 50), footer)
+	if shortLimit != 100 || len(shortChunks) != 1 {
+		t.Fatalf("short body should keep full platform budget; limit=%d chunks=%d", shortLimit, len(shortChunks))
+	}
+
+	chunks, splitLimit := splitFinalReplyWithPlan(p, strings.Repeat("x", 95), footer)
+	if splitLimit >= 100 {
+		t.Fatalf("near-limit body should reserve footer overhead; splitLimit=%d", splitLimit)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("near-limit body should be re-split once footer is reserved; chunks=%d", len(chunks))
+	}
+	last := appendReplyFooter(chunks[len(chunks)-1], footer)
+	if got := len([]rune(last)); got > 100 {
+		t.Fatalf("last chunk + inline footer exceeds platform budget: %d > 100", got)
 	}
 }
 

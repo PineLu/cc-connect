@@ -1706,6 +1706,13 @@ func TestBuildReplyContent_TextMentionInsideCodeFenceDoesNotForceText(t *testing
 	}
 }
 
+func TestPlatform_MaxFinalReplyRunes(t *testing.T) {
+	p := &Platform{platformName: "feishu"}
+	if got := p.MaxFinalReplyRunes(); got != 6000 {
+		t.Fatalf("MaxFinalReplyRunes() = %d, want 6000", got)
+	}
+}
+
 func TestResolveMentions_MarkdownForcesTextFormat(t *testing.T) {
 	p := &Platform{platformName: "feishu", resolveMentions: true}
 	p.chatMemberCache.Store("oc_chat", &chatMemberEntry{

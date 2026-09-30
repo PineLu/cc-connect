@@ -439,14 +439,26 @@ func tableCellVisualWidth(cell string) int {
 // boundary-aware italic regex.
 var reTableCellItalic = regexp.MustCompile(`\*([^*]+)\*`)
 
-// SplitMessageCodeFenceAware splits text into chunks no larger than maxLen runes,
-// preferring line boundaries. When a chunk boundary falls inside a code block,
-// the fence is closed at the end of the chunk and re-opened at the start of the
-// next chunk. If a single line exceeds maxLen, it is split within the line at
-// rune boundaries.
+// SplitMessageCodeFenceAware splits text into chunks no larger than maxLen
+// runes while preserving Markdown structures that would otherwise become
+// invalid at a chunk boundary. Fenced code blocks are closed/re-opened, and
+// Markdown tables repeat their header + separator when rows continue in a new
+// chunk. If a single non-table line exceeds maxLen, it is split at rune
+// boundaries.
 func SplitMessageCodeFenceAware(text string, maxLen int) []string {
-	if utf8.RuneCountInString(text) <= maxLen {
+	return splitMessageCodeFenceAware(text, maxLen, true)
+}
+
+// splitMessageCodeFenceAware keeps a legacy switch for persisted outbox items
+// created before table-aware splitting existed. Those items may already have a
+// SentChunks prefix recorded against the old boundaries, so replay must be able
+// to reproduce the historical code-fence-only split exactly.
+func splitMessageCodeFenceAware(text string, maxLen int, preserveTables bool) []string {
+	if maxLen <= 0 || utf8.RuneCountInString(text) <= maxLen {
 		return []string{text}
+	}
+	if preserveTables {
+		text = wrapUnsplittableMarkdownTables(text, maxLen)
 	}
 
 	// closingFence is appended when flushing a chunk that is inside a code block.
@@ -461,6 +473,9 @@ func SplitMessageCodeFenceAware(text string, maxLen int) []string {
 	// This +1 accounting lets the fit check use a single expression.
 	currentLen := 0
 	openFence := "" // opening ``` line when inside a code block, else ""
+	tableStart := -1
+	tableHeader := ""
+	tableSeparator := ""
 
 	// effectiveLimit returns the number of "currentLen units" available before
 	// the chunk (plus closingFence if needed) would exceed maxLen.
@@ -490,7 +505,64 @@ func SplitMessageCodeFenceAware(text string, maxLen int) []string {
 		}
 	}
 
-	for _, line := range lines {
+	clearTable := func() {
+		tableStart = -1
+		tableHeader = ""
+		tableSeparator = ""
+	}
+
+	seedTable := func(limit int) bool {
+		if tableHeader == "" || tableSeparator == "" {
+			return false
+		}
+		needed := utf8.RuneCountInString(tableHeader) + utf8.RuneCountInString(tableSeparator) + 2
+		if needed > limit {
+			return false
+		}
+		current = append(current, tableHeader, tableSeparator)
+		currentLen = needed
+		return true
+	}
+
+	for i, line := range lines {
+		// Detect tables only outside fenced code. A table starts with a row whose
+		// following row is a Markdown separator. If the header+separator pair
+		// cannot fit in a fresh chunk, fall back to the legacy line splitter for
+		// that pathological table rather than looping or exceeding maxLen.
+		if preserveTables && openFence == "" {
+			// A single table row that cannot fit together with the repeated header
+			// cannot be continued as a valid Markdown table. Flush the valid prefix
+			// and degrade the remainder of this table to the legacy line splitter;
+			// otherwise a rune-split row would leave later chunks looking like table
+			// bodies without a header/separator.
+			if tableStart >= 0 && i > tableStart+1 && splitMarkdownTableRow(line) {
+				prefixLen := utf8.RuneCountInString(tableHeader) + utf8.RuneCountInString(tableSeparator) + 2
+				if prefixLen+utf8.RuneCountInString(line)+1 > effectiveLimit() {
+					flush()
+					clearTable()
+				}
+			}
+			if tableStart >= 0 && i > tableStart && !splitMarkdownTableRow(line) {
+				clearTable()
+			}
+			if tableStart < 0 && i+1 < len(lines) && splitMarkdownTableRow(line) && splitMarkdownTableSeparator(lines[i+1]) {
+				pairLen := utf8.RuneCountInString(line) + utf8.RuneCountInString(lines[i+1]) + 2
+				minimumTableLen := pairLen
+				if i+2 < len(lines) && splitMarkdownTableRow(lines[i+2]) {
+					minimumTableLen += utf8.RuneCountInString(lines[i+2]) + 1
+				}
+				if minimumTableLen <= effectiveLimit() {
+					tableStart = i
+					tableHeader = line
+					tableSeparator = lines[i+1]
+					// Never leave a table header stranded at the end of a chunk.
+					if len(current) > 0 && currentLen+pairLen > effectiveLimit() {
+						flush()
+					}
+				}
+			}
+		}
+
 		lineRunes := []rune(line)
 		limit := effectiveLimit()
 
@@ -500,8 +572,12 @@ func SplitMessageCodeFenceAware(text string, maxLen int) []string {
 			currentLen += len(lineRunes) + 1
 		} else {
 			// Line doesn't fit; flush and try again with a fresh chunk.
+			reseedTable := preserveTables && openFence == "" && tableStart >= 0 && i > tableStart+1 && splitMarkdownTableRow(line)
 			flush()
 			limit = effectiveLimit()
+			if reseedTable {
+				seedTable(limit)
+			}
 
 			if currentLen+len(lineRunes)+1 <= limit {
 				// Fits after flush.
@@ -558,4 +634,75 @@ func SplitMessageCodeFenceAware(text string, maxLen int) []string {
 	}
 
 	return chunks
+}
+
+func splitMarkdownTableRow(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return len(trimmed) >= 2 && strings.HasPrefix(trimmed, "|") && strings.HasSuffix(trimmed, "|")
+}
+
+func splitMarkdownTableSeparator(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !splitMarkdownTableRow(trimmed) {
+		return false
+	}
+	hasDash := false
+	for _, r := range trimmed {
+		switch r {
+		case '|', '-', ':', ' ':
+			if r == '-' {
+				hasDash = true
+			}
+		default:
+			return false
+		}
+	}
+	return hasDash
+}
+
+// wrapUnsplittableMarkdownTables degrades a table to a fenced text block when
+// its header/separator plus any single data row cannot fit inside maxLen. Such
+// a table has no valid repeated-header split: rune-splitting the impossible row
+// would produce malformed table fragments. Fencing preserves the table text
+// while letting the code-fence splitter keep each emitted chunk valid.
+func wrapUnsplittableMarkdownTables(text string, maxLen int) string {
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines)+4)
+	inCodeBlock := false
+
+	for i := 0; i < len(lines); {
+		trimmed := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(trimmed, "```") {
+			inCodeBlock = !inCodeBlock
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+		if inCodeBlock || i+1 >= len(lines) || !splitMarkdownTableRow(lines[i]) || !splitMarkdownTableSeparator(lines[i+1]) {
+			out = append(out, lines[i])
+			i++
+			continue
+		}
+
+		end := i + 2
+		for end < len(lines) && splitMarkdownTableRow(lines[end]) {
+			end++
+		}
+		prefixLen := utf8.RuneCountInString(lines[i]) + utf8.RuneCountInString(lines[i+1]) + 2
+		unsplittable := prefixLen > maxLen
+		for row := i + 2; row < end && !unsplittable; row++ {
+			if prefixLen+utf8.RuneCountInString(lines[row])+1 > maxLen {
+				unsplittable = true
+			}
+		}
+		if unsplittable {
+			out = append(out, "```text")
+			out = append(out, lines[i:end]...)
+			out = append(out, "```")
+		} else {
+			out = append(out, lines[i:end]...)
+		}
+		i = end
+	}
+	return strings.Join(out, "\n")
 }

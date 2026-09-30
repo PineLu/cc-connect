@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -70,11 +71,17 @@ type OutboxItem struct {
 	ReplyCtx []byte `json:"reply_ctx"`
 	// Body / Footer are the already-rendered final reply; the model is never
 	// re-invoked on replay.
-	Body       string    `json:"body"`
-	Footer     string    `json:"footer"`
-	SentChunks int       `json:"sent_chunks"` // number of leading chunks already acked
-	Attempts   int       `json:"attempts"`
-	CreatedAt  time.Time `json:"created_at"`
+	Body       string `json:"body"`
+	Footer     string `json:"footer"`
+	SentChunks int    `json:"sent_chunks"` // number of leading chunks already acked
+	// SplitVersion / SplitMaxRunes pin the chunk plan used by the immediate
+	// sender so a later binary upgrade cannot reinterpret SentChunks against a
+	// different splitter or platform limit. Zero-valued legacy items replay with
+	// the historical 4000-rune, code-fence-only splitter.
+	SplitVersion  int       `json:"split_version,omitempty"`
+	SplitMaxRunes int       `json:"split_max_runes,omitempty"`
+	Attempts      int       `json:"attempts"`
+	CreatedAt     time.Time `json:"created_at"`
 	// UUID is the platform idempotency key shared by immediate send and every replay.
 	UUID string `json:"uuid"`
 	// immediateHeld: in-process immediate send still running -> sweep must not race it.
@@ -206,17 +213,19 @@ func (o *Outbox) expiredLocked(it *OutboxItem, now time.Time) bool {
 }
 
 // persistLocked writes an item atomically. Caller holds o.mu.
-func (o *Outbox) persistLocked(it *OutboxItem) {
+func (o *Outbox) persistLocked(it *OutboxItem) error {
 	b, err := json.Marshal(it)
 	if err != nil {
-		return
+		return err
 	}
 	if o.stopped {
-		return
+		return errors.New("outbox is stopped")
 	}
 	if err := AtomicWriteFile(it.file(o.dir), b, 0o600); err != nil {
 		slog.Warn("outbox: persist item failed", "id", it.ID, "error", err)
+		return err
 	}
+	return nil
 }
 
 // removeLocked deletes an item from memory and disk. Caller holds o.mu.
@@ -313,6 +322,29 @@ func (o *Outbox) SetChunkProgress(id string, sent int) {
 		it.SentChunks = sent
 		o.persistLocked(it)
 	}
+}
+
+// SetSplitPlan persists the splitter semantics used by the immediate final
+// reply send. It must be recorded before the first chunk is attempted so a
+// process restart can safely resume from SentChunks without changing boundaries.
+func (o *Outbox) SetSplitPlan(id string, version, maxRunes int) error {
+	if !o.Enabled() || id == "" {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if it, ok := o.items[id]; ok {
+		oldVersion, oldMaxRunes := it.SplitVersion, it.SplitMaxRunes
+		it.SplitVersion = version
+		it.SplitMaxRunes = maxRunes
+		if err := o.persistLocked(it); err != nil {
+			it.SplitVersion = oldVersion
+			it.SplitMaxRunes = oldMaxRunes
+			return err
+		}
+		return nil
+	}
+	return errors.New("outbox item not found")
 }
 
 // Complete removes a fully delivered item.

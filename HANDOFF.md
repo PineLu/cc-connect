@@ -1,6 +1,18 @@
 # HANDOFF — cc-connect
 
-更新时间：2026-09-13。仓库：origin=kleinlsl/cc-connect（fork，已迁往 PineLu/cc-connect，push 有重定向提醒但可用），upstream=chenhg5/cc-connect（主仓库）。
+更新时间：2026-09-30。仓库：origin=kleinlsl/cc-connect（fork，已迁往 PineLu/cc-connect，push 有重定向提醒但可用），upstream=chenhg5/cc-connect（主仓库）。
+
+## 2026-09-30 本地魔改：飞书长 Markdown 最终回复安全分片
+- **现象 / 根因已用真实消息复现**：17:26 的一条最终回复共 `5475 rune`，历史全平台阈值 `4000` 会按换行切成 `3931 + 1543`；切点正好落在 Markdown 表格 body 中间，第二条没有 header / separator，飞书因此把剩余 `| ... |` 行当普通文本显示。根因是旧 `SplitMessageCodeFenceAware` 只保护 fenced code，不理解 Markdown table。
+- **平台级最终回复预算**：`core.FinalReplyLengthProvider` 允许平台覆盖 completed/final reply 的 rune budget；飞书实现 `MaxFinalReplyRunes() = 6000`。其他平台继续走全局 `4000`，thinking/tool/progress 等 side-channel 限制也不随之放大。
+- **Markdown-aware splitter**：跨 chunk 的表格按完整行切分，续块自动重复 `header + separator`；fenced code 原有关闭/重开语义保留。若表头或任一单行长到无法在预算内维持合法表格，则整张表降级为 fenced text，再由 code-fence splitter 安全拆分，优先保证内容完整和 Markdown 有效。
+- **footer 长度预算**：final body 通常仍按平台完整预算切；只有“最后一块 + inline footer”会超预算时才扣除 footer 开销重新切分，避免名义上 6000 但最终 payload 超预算。
+- **outbox 升级兼容**：`OutboxItem` 持久化 `SplitVersion` / `SplitMaxRunes`，首次发送前必须先把 split plan 落盘；重放沿用原 chunk 边界。旧的 zero-version outbox item 明确按历史 `4000 + code-fence-only` 算法重放，避免升级后 `SentChunks` 指向不同边界造成漏发/重复。
+- **与实时预览的关系**：`stream_preview=true` 时正文通常在同一条飞书消息中持续 `UpdateMessage` 并原地 finalize，因此未必触发 final splitter；`progress_style=card|legacy` 控制的是 thinking/tool 进度展示，是另一套机制。splitter 主要覆盖 preview 不可用/降级/fallback 以及普通 final-send 路径。
+- **真实 E2E（2026-09-30 19:09）**：临时设置 `progress_style="legacy"` 且 `[stream_preview] enabled=false` 强制命中 final-send；Agent 实际生成 `7953 rune / 100` 行表格，部署代码拆为 `5952 + 2028` 两块，两块均从 `| idx | payload |` + `|---|---|` 开始，用户在飞书确认实际看到两条正常表格消息。测试后已恢复生产配置 `progress_style="card"`、`stream_preview=true`。
+- **部署 / 回滚**：本轮实测二进制 SHA256=`44080591d4855e240504e31147a76eb644242f80bdd141ee2b44401edaa81677`；部署前备份 `cc-connect-arm64.bak-20260930_183450-feishu-table-split`。正常重启仍使用 `launchctl unload` → `sleep 2` → `launchctl load`。
+- **验证**：定向 splitter/footer/outbox/Feishu 测试通过；开发阶段完整门禁 `go test ./... -count=1`、`go build ./...`、`go vet ./...`、`git diff --check` 均通过，独立 Codex 多轮只读 review 最终无阻断/中等级问题。提交前复跑时全量测试仅在未改动的 `agent/claudecode TestForceKillCmd_KillsGrandchild` 偶发一次 `operation not permitted`；该用例随后 `-count=5` 全过、整个 `agent/claudecode` 包复跑也通过，build/vet/diff-check 继续通过，按既有 Unix 进程测试抖动记录。
+- **维护原则**：后续同步上游时不要只保留“6000”而丢掉 table-aware split 与 outbox split-plan 兼容；三者共同构成这次修复。业务 Markdown 样式仍属于 Skill/Builder，cc-connect 这里只负责协议兼容和传输可靠性。
 
 ## 当前目标
 1. **【已提交·未验证未部署】`/models` 内置命令**（提交 `d96e5972`，10 文件 +969/−14）：
