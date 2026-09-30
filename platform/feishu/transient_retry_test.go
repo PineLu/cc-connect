@@ -293,7 +293,7 @@ func TestCreateMessageRetriesOnTransientNetworkError(t *testing.T) {
 	}
 }
 
-func TestReplyDoesNotRetryOnNonTransientAPIError(t *testing.T) {
+func TestReplyDoesNotSynchronouslyRetryRateLimit(t *testing.T) {
 	const appID = "cli_no_transient_retry"
 	const appSecret = "secret"
 
@@ -311,7 +311,8 @@ func TestReplyDoesNotRetryOnNonTransientAPIError(t *testing.T) {
 			})
 		case strings.HasSuffix(r.URL.Path, "/reply"):
 			replyCalls.Add(1)
-			// Return a non-transient API error (rate limit)
+			// Rate limits should return immediately from the synchronous retry
+			// loop and be handed to the durable outbox classifier instead.
 			writeJSON(t, w, map[string]any{
 				"code": 230001,
 				"msg":  "send too fast, please retry later",
@@ -345,9 +346,13 @@ func TestReplyDoesNotRetryOnNonTransientAPIError(t *testing.T) {
 	if !strings.Contains(err.Error(), "send too fast") {
 		t.Fatalf("Reply() error = %v, want rate limited error", err)
 	}
-	// Should only make 1 attempt (no retry on API-level errors)
+	// The platform call itself should only make one attempt; core outbox owns
+	// the longer-lived retry policy for rate limits/server overload.
 	if got := replyCalls.Load(); got != 1 {
-		t.Fatalf("replyCalls = %d, want 1 (no retry)", got)
+		t.Fatalf("replyCalls = %d, want 1 synchronous attempt", got)
+	}
+	if !p.IsRetryableSendError(err) {
+		t.Fatalf("rate-limit error must be retryable by durable outbox: %v", err)
 	}
 }
 

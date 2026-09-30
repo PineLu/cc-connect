@@ -8545,6 +8545,7 @@ func (e *Engine) sendFinalWithOutbox(sessionKey string, ctx context.Context, p P
 		} else {
 			// Permanent error: never redeliver.
 			e.outbox.Drop(id, err)
+			e.notifyPermanentFinalReplyFailure(p, replyCtx, err)
 			return false
 		}
 	}
@@ -8582,6 +8583,7 @@ func (e *Engine) replayOutboxItem(ctx context.Context, it *OutboxItem) (bool, er
 		if err := sendFinalChunk(replayCtx, p, replyCtx, chunks, i, it.Footer, e.sendAlreadyRenderedWithError); err != nil {
 			if classifier != nil && !classifier.IsRetryableSendError(err) {
 				slog.Error("outbox: permanent error on redelivery, dropping reply", "id", it.ID, "error", err)
+				e.notifyPermanentFinalReplyFailure(p, replyCtx, err)
 				return true, nil
 			}
 			return false, err
@@ -8591,6 +8593,18 @@ func (e *Engine) replayOutboxItem(ctx context.Context, it *OutboxItem) (bool, er
 	}
 	slog.Info("outbox: final reply redelivered", "id", it.ID, "platform", it.Platform, "session", it.SessionKey, "chunks", len(chunks))
 	return true, nil
+}
+
+// notifyPermanentFinalReplyFailure makes a permanently rejected final reply
+// visible to the user without re-queueing the failed payload. The notice is a
+// single best-effort send: if it is rejected too, we only log the failure and
+// never recurse back into the outbox path.
+func (e *Engine) notifyPermanentFinalReplyFailure(p Platform, replyCtx any, cause error) {
+	notice := e.i18n.T(MsgFinalReplyDeliveryFailed)
+	if err := e.sendWithError(p, replyCtx, notice); err != nil {
+		slog.Warn("outbox: failed to notify user after permanent final reply failure",
+			"platform", p.Name(), "cause", cause, "notify_error", err)
+	}
 }
 
 func appendReplyFooter(content, footer string) string {

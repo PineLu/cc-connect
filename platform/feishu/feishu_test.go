@@ -1500,7 +1500,7 @@ func TestResolveMentions_MentionMapPriority(t *testing.T) {
 	)
 	ctx := context.Background()
 	result := p.resolveMentionsInContent(ctx, "oc_test_group", "Hey @BotA check this")
-	if !strings.Contains(result, `id=ou_bot_openid`) {
+	if !strings.Contains(result, `user_id="ou_bot_openid"`) {
 		t.Errorf("expected mentionMap to override group member, got: %s", result)
 	}
 	if strings.Contains(result, "ou_human_openid") {
@@ -1516,10 +1516,10 @@ func TestResolveMentions_LongestMatch(t *testing.T) {
 	)
 	ctx := context.Background()
 	result := p.resolveMentionsInContent(ctx, "oc_test_group", "@Collector-B and @Collector please help")
-	if !strings.Contains(result, `id=ou_collectorb`) {
+	if !strings.Contains(result, `user_id="ou_collectorb"`) {
 		t.Error("Collector-B should resolve via mentionMap")
 	}
-	if !strings.Contains(result, `id=ou_human_collector`) {
+	if !strings.Contains(result, `user_id="ou_human_collector"`) {
 		t.Error("Collector should resolve via group members")
 	}
 }
@@ -1532,9 +1532,35 @@ func TestResolveMentions_MultipleOccurrences(t *testing.T) {
 	)
 	ctx := context.Background()
 	result := p.resolveMentionsInContent(ctx, "oc_test_group", "@BotA please help, @BotA is needed")
-	count := strings.Count(result, `id=ou_bot`)
+	count := strings.Count(result, `user_id="ou_bot"`)
 	if count != 2 {
 		t.Errorf("expected 2 substitutions, got %d. result: %s", count, result)
+	}
+}
+
+func TestResolveMentions_PreservesFencedCodeAndExistingAtTags(t *testing.T) {
+	p := newTestPlatform(
+		map[string]string{"BotA": "ou_bot"},
+		true,
+		map[string]string{},
+	)
+	input := "outside @BotA\n\n```text\n@BotA\n<at user_id=\"ou_code\">@BotA</at>\n```\n\n<at user_id=\"ou_existing\">@BotA</at>\n<at id=ou_card></at>"
+	got := p.resolveMentionsInContent(context.Background(), "oc_test_group", input)
+
+	if !strings.Contains(got, `outside <at user_id="ou_bot">BotA</at>`) {
+		t.Fatalf("ordinary text mention should resolve, got %q", got)
+	}
+	if !strings.Contains(got, "```text\n@BotA\n<at user_id=\"ou_code\">@BotA</at>\n```") {
+		t.Fatalf("fenced code must remain byte-for-byte unchanged, got %q", got)
+	}
+	if !strings.Contains(got, `<at user_id="ou_existing">@BotA</at>`) {
+		t.Fatalf("existing text mention tag must remain unchanged, got %q", got)
+	}
+	if !strings.Contains(got, `<at id=ou_card></at>`) {
+		t.Fatalf("existing card mention tag must remain unchanged, got %q", got)
+	}
+	if count := strings.Count(got, `user_id="ou_bot"`); count != 1 {
+		t.Fatalf("only the ordinary-text mention should be generated; count=%d got=%q", count, got)
 	}
 }
 
@@ -1548,28 +1574,37 @@ func TestBuildReplyContent_NoFalsePositiveOnEmail(t *testing.T) {
 	}
 }
 
-// TestBuildReplyContent_RealMentionForcesText confirms a resolved mention
-// (<at id=...></at>) renders as card when markdown is present.
+// TestBuildReplyContent_RealMentionForcesText confirms a resolved MsgTypeText
+// mention forces text even when markdown is present, so Feishu fires the
+// mention event.
 func TestBuildReplyContent_RealMentionForcesText(t *testing.T) {
-	msgType, _ := buildReplyContent("**bold** <at id=ou_bot></at> please review")
-	if msgType != larkim.MsgTypeInteractive {
-		t.Errorf("resolved mention in markdown should render as card; got %s", msgType)
+	msgType, _ := buildReplyContent(`**bold** <at user_id="ou_bot">Collector-B</at> please review`)
+	if msgType != larkim.MsgTypeText {
+		t.Errorf("resolved text mention should force MsgTypeText; got %s", msgType)
 	}
 }
 
-func TestBuildReplyContent_CardFormatMentionForcesText(t *testing.T) {
+func TestBuildReplyContent_CardFormatMentionStaysInteractive(t *testing.T) {
 	cases := []struct {
 		name    string
 		content string
 	}{
-		{"text_format", "**bold** <at id=ou_bot></at> please review"},
-		{"card_format", "# report\n\n<at id=ou_bot></at> please review\n\n```\nok\n```"},
+		{"inline", "**bold** <at id=ou_bot></at> please review"},
+		{"complex_markdown", "# report\n\n<at id=ou_bot></at> please review\n\n```\nok\n```"},
 	}
 	for _, tc := range cases {
 		msgType, _ := buildReplyContent(tc.content)
 		if msgType != larkim.MsgTypeInteractive {
-			t.Errorf("%s: mention in markdown should render as card; got %s", tc.name, msgType)
+			t.Errorf("%s: card-format mention should stay interactive; got %s", tc.name, msgType)
 		}
+	}
+}
+
+func TestBuildReplyContent_TextMentionInsideCodeFenceDoesNotForceText(t *testing.T) {
+	content := "# Example\n\n```text\n<at user_id=\"ou_bot\">Collector-B</at>\n```"
+	msgType, _ := buildReplyContent(content)
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("mention syntax shown inside a code fence must remain card markdown; got %s", msgType)
 	}
 }
 
@@ -1581,13 +1616,13 @@ func TestResolveMentions_MarkdownForcesTextFormat(t *testing.T) {
 	})
 	input := "# Report\n\n@Collector-B please review\n\n**done**"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at id=ou_bot_b></at>`) {
-		t.Fatalf("markdown content must resolve to card format; got %q", result)
+	if !strings.Contains(result, `<at user_id="ou_bot_b">Collector-B</at>`) {
+		t.Fatalf("markdown content must resolve to MsgTypeText mention format; got %q", result)
 	}
-	// Verify the full pipeline renders as card
+	// Verify the full pipeline keeps the message in MsgTypeText.
 	msgType, _ := buildReplyContent(result)
-	if msgType != larkim.MsgTypeInteractive {
-		t.Fatalf("markdown + mention must render as card; got %s", msgType)
+	if msgType != larkim.MsgTypeText {
+		t.Fatalf("markdown + mention must force MsgTypeText so Feishu fires the mention event; got %s", msgType)
 	}
 }
 
@@ -1645,7 +1680,7 @@ func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
 	}{
 		{"email", "**bold** report sent to a@b.com", larkim.MsgTypeInteractive},
 		{"url", "see [docs](http://x@y.com/z)", larkim.MsgTypeInteractive},
-		{"mention", "hey @BotA review please", larkim.MsgTypeInteractive},
+		{"mention", "hey @BotA review please", larkim.MsgTypeText},
 	} {
 		if err := p.SendWithStatusFooter(ctx, rc, tc.content, "done"); err != nil {
 			t.Fatalf("%s: SendWithStatusFooter error = %v", tc.name, err)

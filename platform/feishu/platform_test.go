@@ -2142,10 +2142,10 @@ func TestResolveMentions_ReplacesKnownMember(t *testing.T) {
 	})
 	input := "巡检完成，@张三 @李四 请查看"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at id=ou_zhangsan></at>`) {
+	if !strings.Contains(result, `<at user_id="ou_zhangsan">张三</at>`) {
 		t.Fatalf("expected 张三 to be resolved, got %q", result)
 	}
-	if !strings.Contains(result, `<at id=ou_lisi></at>`) {
+	if !strings.Contains(result, `<at user_id="ou_lisi">李四</at>`) {
 		t.Fatalf("expected 李四 to be resolved, got %q", result)
 	}
 }
@@ -2177,8 +2177,8 @@ func TestResolveMentions_LongestMatchFirst(t *testing.T) {
 }
 
 // TestResolveMentions_MarkdownContent verifies that @name inside markdown
-// content resolves to the card-compatible at syntax (<at id=...></at>)
-// which triggers real mention notifications.
+// content resolves to the MsgTypeText mention syntax so Feishu emits a real
+// mention notification.
 func TestResolveMentions_MarkdownContent(t *testing.T) {
 	p := &Platform{platformName: "feishu", resolveMentions: true}
 	p.chatMemberCache.Store("oc_chat", &chatMemberEntry{
@@ -2188,8 +2188,8 @@ func TestResolveMentions_MarkdownContent(t *testing.T) {
 	// Content with complex markdown
 	input := "# 巡检报告\n\n@张三 请查看\n\n```\nstatus: ok\n```"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	if !strings.Contains(result, `<at id=ou_zhangsan></at>`) {
-		t.Fatalf("markdown content should resolve to card format <at id=...>, got %q", result)
+	if !strings.Contains(result, `<at user_id="ou_zhangsan">张三</at>`) {
+		t.Fatalf("markdown content should resolve to text mention format, got %q", result)
 	}
 }
 
@@ -2239,9 +2239,8 @@ func TestResolveMentions_SpecialCharsEscaped(t *testing.T) {
 	})
 	input := `@A<"B"> 你好`
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
-	// Card format uses <at id=open_id></at> — name is not included in the tag
-	if !strings.Contains(result, `<at id=ou_special></at>`) {
-		t.Fatalf("expected card format at tag, got %q", result)
+	if !strings.Contains(result, `<at user_id="ou_special">A&lt;&#34;B&#34;&gt;</at>`) {
+		t.Fatalf("expected escaped text mention tag, got %q", result)
 	}
 }
 

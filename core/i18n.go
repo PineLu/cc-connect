@@ -216,6 +216,7 @@ const (
 	MsgToolAllowFailed           MsgKey = "tool_allow_failed"
 	MsgToolAllowedNew            MsgKey = "tool_allowed_new"
 	MsgError                     MsgKey = "error"
+	MsgFinalReplyDeliveryFailed  MsgKey = "final_reply_delivery_failed"
 	MsgSessionNotFound           MsgKey = "session_not_found"
 	MsgFailedToStartAgentSession MsgKey = "failed_to_start_agent_session"
 	MsgFailedToDeleteSession     MsgKey = "failed_to_delete_session"
@@ -866,6 +867,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "❌ 錯誤: %v",
 		LangJapanese:           "❌ エラー: %v",
 		LangSpanish:            "❌ Error: %v",
+	},
+	MsgFinalReplyDeliveryFailed: {
+		LangEnglish:            "⚠️ The final reply could not be delivered because the messaging platform rejected it. Please retry; if it still fails, check the bot or chat permissions.",
+		LangChinese:            "⚠️ 最终回复发送失败：消息平台拒绝了该消息。请重试；若仍失败，请检查机器人或会话权限。",
+		LangTraditionalChinese: "⚠️ 最終回覆傳送失敗：訊息平台拒絕了該訊息。請重試；若仍失敗，請檢查機器人或會話權限。",
+		LangJapanese:           "⚠️ 最終応答を送信できませんでした。メッセージプラットフォームに拒否されました。再試行し、解消しない場合はボットまたはチャットの権限を確認してください。",
+		LangSpanish:            "⚠️ No se pudo entregar la respuesta final porque la plataforma de mensajería la rechazó. Inténtalo de nuevo; si persiste, revisa los permisos del bot o del chat.",
 	},
 	MsgBackgroundAutoDenied: {
 		LangEnglish:            "⚠️ Background task requested permission for `%s` but was auto-denied (no active user turn). Send a message or use `/yolo` to approve future requests.",

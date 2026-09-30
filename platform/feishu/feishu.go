@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -165,11 +166,30 @@ func (p *Platform) DecodeReplyCtx(b []byte) (any, error) {
 	}, nil
 }
 
-// IsRetryableSendError implements core.SendErrorClassifier. Only transient
-// network/transport failures warrant durable redelivery; permanent API errors
-// (e.g. bot removed from chat, invalid params, missing permission) do not.
+type feishuSendAPIError struct {
+	platformTag string
+	operation   string
+	statusCode  int
+	code        int
+	msg         string
+}
+
+func (e *feishuSendAPIError) Error() string {
+	if e.statusCode != 0 && (e.statusCode < http.StatusOK || e.statusCode >= http.StatusMultipleChoices) {
+		return fmt.Sprintf("%s: %s failed code=%d msg=%s status=%d", e.platformTag, e.operation, e.code, e.msg, e.statusCode)
+	}
+	return fmt.Sprintf("%s: %s failed code=%d msg=%s", e.platformTag, e.operation, e.code, e.msg)
+}
+
+// IsRetryableSendError implements core.SendErrorClassifier. Short-lived
+// network failures are retryable, as are API responses that explicitly signal
+// server overload/rate limiting. Permanent business errors (bot removed from
+// chat, invalid params, missing permission, etc.) are not redelivered.
 func (p *Platform) IsRetryableSendError(err error) bool {
-	return isTransientError(err)
+	if isTransientError(err) {
+		return true
+	}
+	return isRetryableFeishuSendError(err)
 }
 
 type Platform struct {
@@ -2756,9 +2776,8 @@ func (p *Platform) getChatMembers(ctx context.Context, chatID string) map[string
 
 // resolveMentionsInContent replaces @name with Feishu at tags in raw content
 // (before JSON serialization). Reverse-matches against the chat member list,
-// longest name first. Emits the card-compatible at syntax (<at id=open_id></at>)
-// which works in both card markdown and MsgTypeText, and triggers real mention
-// notifications in both cases.
+// longest name first. Use the MsgTypeText mention syntax so Feishu emits a
+// real mention event for the target (including bot-to-bot mentions).
 func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content string) string {
 	if !p.resolveMentions || chatID == "" || !strings.Contains(content, "@") {
 		return content
@@ -2794,7 +2813,10 @@ func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content
 	}
 	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
 
-	result := content
+	// Do not rewrite @name examples inside fenced code or any existing Feishu
+	// <at ...></at> tag. Only ordinary message text participates in resolution.
+	result, codeBlocks := protectFencedCodeBlocks(content)
+	result, atTags := protectFeishuAtTags(result)
 	for _, name := range names {
 		pattern := "@" + name
 		if !strings.Contains(result, pattern) {
@@ -2804,12 +2826,14 @@ func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content
 		if openID == "" {
 			continue // ambiguous member, skip
 		}
-		// Use card-compatible at syntax which triggers real mention
-		// notifications in both card markdown and MsgTypeText messages.
-		atTag := fmt.Sprintf(`<at id=%s></at>`, openID)
+		// Feishu only reliably emits mention events for the MsgTypeText form.
+		// Escape the display name because it is embedded inside the tag body.
+		escapedName := html.EscapeString(name)
+		atTag := fmt.Sprintf(`<at user_id="%s">%s</at>`, openID, escapedName)
 		result = strings.ReplaceAll(result, pattern, atTag)
 	}
-	return result
+	result = restoreFeishuAtTags(result, atTags)
+	return restoreFencedCodeBlocks(result, codeBlocks)
 }
 
 // quotedParent holds extracted data from the directly quoted parent message.
@@ -3756,9 +3780,10 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 }
 
 // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
-// the body content followed by a small/dim status-footer block. Always uses
-// the interactive card path so the footer can render with text_size:
-// "notation". Falls back to plain Send when the footer is empty.
+// the body content followed by a small/dim status-footer block. Normally this
+// uses an interactive card so the footer can render with text_size "notation".
+// A MsgTypeText mention must stay text so Feishu emits the real mention event;
+// in that case the footer is appended inline instead.
 func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, footer string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
@@ -3768,6 +3793,9 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
 	if strings.TrimSpace(footer) == "" {
 		return p.Send(ctx, rctx, content)
+	}
+	if hasFeishuTextMention(content) {
+		return p.Send(ctx, rctx, content+"\n\n"+footer)
 	}
 	// Don't append footer to content here — buildCardJSONWithStatusFooter
 	// renders it as a separate "notation"-sized element below an <hr>.
@@ -4020,7 +4048,7 @@ func stripModelFillerLines(s string) string {
 
 func buildReplyContent(content string) (msgType string, body string) {
 	content = stripModelFillerLines(content)
-	if !containsMarkdown(content) {
+	if hasFeishuTextMention(content) || !containsMarkdown(content) {
 		b, _ := json.Marshal(map[string]string{"text": content})
 		return larkim.MsgTypeText, string(b)
 	}
@@ -4032,6 +4060,19 @@ func buildReplyContent(content string) (msgType string, body string) {
 		return larkim.MsgTypePost, buildPostMdJSON(content)
 	}
 	return larkim.MsgTypeInteractive, buildCardJSON(sanitizeMarkdownURLs(preprocessFeishuMarkdown(content)))
+}
+
+var feishuTextMentionPattern = regexp.MustCompile(`(?i)<at\s+user_id\s*=\s*"[^"]+"\s*>`)
+
+// hasFeishuTextMention reports whether content contains a Feishu MsgTypeText
+// mention tag outside fenced code blocks. Card-style <at id=...></at> tags are
+// intentionally excluded so callers can still render them in interactive cards.
+func hasFeishuTextMention(content string) bool {
+	if !strings.Contains(strings.ToLower(content), "user_id") {
+		return false
+	}
+	withoutCode, _ := protectFencedCodeBlocks(content)
+	return feishuTextMentionPattern.MatchString(withoutCode)
 }
 
 // hasComplexMarkdown detects code blocks or tables that require card rendering.
@@ -4760,8 +4801,18 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 			if err != nil {
 				return fmt.Errorf("%s: reply api call: %w", p.tag(), err)
 			}
-			if !resp.Success() {
-				return fmt.Errorf("%s: reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+			statusCode := 0
+			if resp.ApiResp != nil {
+				statusCode = resp.ApiResp.StatusCode
+			}
+			if !resp.Success() || (statusCode != 0 && (statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices)) {
+				return &feishuSendAPIError{
+					platformTag: p.tag(),
+					operation:   "reply",
+					statusCode:  statusCode,
+					code:        resp.Code,
+					msg:         resp.Msg,
+				}
 			}
 			if resp.Data != nil && resp.Data.MessageId != nil && *resp.Data.MessageId != "" {
 				result.messageID = *resp.Data.MessageId
@@ -4793,8 +4844,18 @@ func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, 
 			if err != nil {
 				return fmt.Errorf("%s: %s api call: %w", p.tag(), op, err)
 			}
-			if !resp.Success() {
-				return fmt.Errorf("%s: %s failed code=%d msg=%s", p.tag(), op, resp.Code, resp.Msg)
+			statusCode := 0
+			if resp.ApiResp != nil {
+				statusCode = resp.ApiResp.StatusCode
+			}
+			if !resp.Success() || (statusCode != 0 && (statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices)) {
+				return &feishuSendAPIError{
+					platformTag: p.tag(),
+					operation:   op,
+					statusCode:  statusCode,
+					code:        resp.Code,
+					msg:         resp.Msg,
+				}
 			}
 			return nil
 		})
@@ -4872,7 +4933,9 @@ var (
 )
 
 // isTransientError returns true if the error is a transient network error
-// that warrants a retry (connection reset, timeout, EOF, etc.).
+// that warrants a short synchronous retry (connection reset, timeout, EOF,
+// temporary DNS failure, etc.). API rate limits/server errors are intentionally
+// handled by the durable outbox instead of blocking this retry loop.
 func isTransientError(err error) bool {
 	if err == nil {
 		return false
@@ -4881,9 +4944,15 @@ func isTransientError(err error) bool {
 	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
 		return true
 	}
-	// net.Error covers timeouts and temporary errors from the stdlib.
+	// net.Error covers timeouts from the stdlib.
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	// DNS SERVFAIL/temporary resolver errors are retryable. NXDOMAIN/no-such-host
+	// is intentionally excluded because it normally indicates a bad hostname.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsTemporary && !dnsErr.IsNotFound {
 		return true
 	}
 	// EOF usually means the server closed the connection mid-response.
@@ -4906,6 +4975,32 @@ func isTransientError(err error) bool {
 		}
 	}
 	return false
+}
+
+var feishuRetryableHTTPStatusPattern = regexp.MustCompile(`(?i)(?:statuscode|status code|http status|status)[ :=]+(429|5\d{2})\b`)
+
+func isRetryableFeishuSendError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var apiErr *feishuSendAPIError
+	if errors.As(err, &apiErr) {
+		if apiErr.statusCode == http.StatusTooManyRequests || apiErr.statusCode >= http.StatusInternalServerError {
+			return true
+		}
+		msg := strings.ToLower(apiErr.msg)
+		for _, marker := range []string{"rate limit", "send too fast", "too many requests", "retry later"} {
+			if strings.Contains(msg, marker) {
+				return true
+			}
+		}
+	}
+
+	// Some SDK failures (for example a non-JSON 5xx response) are returned
+	// before we can wrap them as feishuSendAPIError. Preserve their HTTP status
+	// from the SDK's textual ApiResp representation as a conservative fallback.
+	return feishuRetryableHTTPStatusPattern.MatchString(err.Error())
 }
 
 // withTransientRetry wraps an operation with exponential-backoff retry on
@@ -7569,6 +7664,26 @@ func stripInvalidFeishuCardImages(text string) string {
 		}
 		return ""
 	})
+}
+
+var feishuAtTagPattern = regexp.MustCompile(`(?is)<at\b[^>]*>.*?</at>`)
+
+func protectFeishuAtTags(text string) (string, []string) {
+	var tags []string
+	protected := feishuAtTagPattern.ReplaceAllStringFunc(text, func(tag string) string {
+		placeholder := fmt.Sprintf("\x00CC_FEISHU_AT_TAG_%d\x00", len(tags))
+		tags = append(tags, tag)
+		return placeholder
+	})
+	return protected, tags
+}
+
+func restoreFeishuAtTags(text string, tags []string) string {
+	for i, tag := range tags {
+		placeholder := fmt.Sprintf("\x00CC_FEISHU_AT_TAG_%d\x00", i)
+		text = strings.ReplaceAll(text, placeholder, tag)
+	}
+	return text
 }
 
 func protectFencedCodeBlocks(text string) (string, []string) {

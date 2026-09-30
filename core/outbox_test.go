@@ -21,6 +21,137 @@ func testOutboxCfg() OutboxConfig {
 	}
 }
 
+type permanentOutboxPlatform struct {
+	stubPlatformEngine
+	attempts      []string
+	permanentBody string
+	failAll       bool
+}
+
+func (p *permanentOutboxPlatform) Send(ctx context.Context, r any, content string) error {
+	p.mu.Lock()
+	p.attempts = append(p.attempts, content)
+	fail := p.failAll || content == p.permanentBody
+	p.mu.Unlock()
+	if fail {
+		return errors.New("platform rejected message payload")
+	}
+	return p.stubPlatformEngine.Send(ctx, r, content)
+}
+
+func (p *permanentOutboxPlatform) EncodeReplyCtx(r any) ([]byte, error) {
+	s, ok := r.(string)
+	if !ok {
+		return nil, errors.New("reply context is not a string")
+	}
+	return []byte(s), nil
+}
+
+func (p *permanentOutboxPlatform) DecodeReplyCtx(b []byte) (any, error) {
+	return string(b), nil
+}
+
+func (p *permanentOutboxPlatform) IsRetryableSendError(error) bool { return false }
+
+func (p *permanentOutboxPlatform) getAttempts() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, len(p.attempts))
+	copy(out, p.attempts)
+	return out
+}
+
+func newPermanentOutboxTestEngine(t *testing.T, p *permanentOutboxPlatform) *Engine {
+	t.Helper()
+	return &Engine{
+		ctx:           context.Background(),
+		i18n:          NewI18n(LangEnglish),
+		outbox:        NewOutbox(t.TempDir(), testOutboxCfg()),
+		platformReady: map[Platform]bool{p: true},
+	}
+}
+
+func TestSendFinalWithOutbox_PermanentFailureNotifiesAndDrops(t *testing.T) {
+	const original = "original final payload"
+	p := &permanentOutboxPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		permanentBody:      original,
+	}
+	e := newPermanentOutboxTestEngine(t, p)
+
+	sendFn := func(platform Platform, replyCtx any, content string) error {
+		return platform.Send(context.Background(), replyCtx, content)
+	}
+	if ok := e.sendFinalWithOutbox("test:u1", context.Background(), p, "ctx-u1", original, "", sendFn); ok {
+		t.Fatal("permanent send failure must report final delivery failure")
+	}
+	if got := e.outbox.PendingCount(); got != 0 {
+		t.Fatalf("permanent failure must be dropped from outbox, pending=%d", got)
+	}
+	attempts := p.getAttempts()
+	if len(attempts) != 2 {
+		t.Fatalf("send attempts=%d, want original + one failure notice: %v", len(attempts), attempts)
+	}
+	if attempts[0] != original {
+		t.Fatalf("first attempt=%q, want original payload", attempts[0])
+	}
+	if attempts[1] != e.i18n.T(MsgFinalReplyDeliveryFailed) {
+		t.Fatalf("second attempt=%q, want localized failure notice", attempts[1])
+	}
+	if attempts[1] == original {
+		t.Fatal("failure notice must not resend the rejected payload")
+	}
+}
+
+func TestSendFinalWithOutbox_PermanentFailureNoticeDoesNotRecurse(t *testing.T) {
+	p := &permanentOutboxPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		failAll:            true,
+	}
+	e := newPermanentOutboxTestEngine(t, p)
+
+	sendFn := func(platform Platform, replyCtx any, content string) error {
+		return platform.Send(context.Background(), replyCtx, content)
+	}
+	if ok := e.sendFinalWithOutbox("test:u1", context.Background(), p, "ctx-u1", "original", "", sendFn); ok {
+		t.Fatal("permanent send failure must report final delivery failure")
+	}
+	if got := len(p.getAttempts()); got != 2 {
+		t.Fatalf("failure notice must be attempted exactly once without recursion; attempts=%d", got)
+	}
+	if got := e.outbox.PendingCount(); got != 0 {
+		t.Fatalf("permanent failure must not remain queued, pending=%d", got)
+	}
+}
+
+func TestReplayOutboxItem_PermanentFailureNotifiesOnce(t *testing.T) {
+	const original = "replayed final payload"
+	p := &permanentOutboxPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "test"},
+		permanentBody:      original,
+	}
+	e := newPermanentOutboxTestEngine(t, p)
+	it := &OutboxItem{
+		ID:         "outbox-item",
+		UUID:       "outbox-uuid",
+		Platform:   p.Name(),
+		SessionKey: "test:u1",
+		ReplyCtx:   []byte("ctx-u1"),
+		Body:       original,
+	}
+
+	done, err := e.replayOutboxItem(context.Background(), it)
+	if err != nil || !done {
+		t.Fatalf("replayOutboxItem() = done=%v err=%v, want true,nil for permanent failure", done, err)
+	}
+	attempts := p.getAttempts()
+	if len(attempts) != 2 {
+		t.Fatalf("replay attempts=%d, want rejected payload + one failure notice: %v", len(attempts), attempts)
+	}
+	if attempts[0] != original || attempts[1] != e.i18n.T(MsgFinalReplyDeliveryFailed) {
+		t.Fatalf("unexpected replay attempt sequence: %v", attempts)
+	}
+}
 
 func TestOutbox_AddReturnsEmptyWhenInitialPersistFails(t *testing.T) {
 	parent := t.TempDir()

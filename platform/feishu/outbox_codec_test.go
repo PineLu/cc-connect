@@ -3,6 +3,7 @@ package feishu
 import (
 	"errors"
 	"fmt"
+	"net"
 	"testing"
 )
 
@@ -57,7 +58,13 @@ func TestPlatform_IsRetryableSendError(t *testing.T) {
 		{"connection refused", fmt.Errorf("dial tcp 220.181.175.91:443: connect: connection refused"), true},
 		{"io timeout", errors.New("i/o timeout"), true},
 		{"connection reset", errors.New("read: connection reset by peer"), true},
-		{"no such host is permanent", errors.New("dial tcp: lookup x.invalid: no such host"), false},
+		{"temporary dns", &net.DNSError{Err: "temporary resolver failure", Name: "open.feishu.cn", IsTemporary: true}, true},
+		{"no such host remains permanent", errors.New("dial tcp: lookup x.invalid: no such host"), false},
+		{"business rate limit", &feishuSendAPIError{platformTag: "feishu", operation: "reply", statusCode: 200, code: 230001, msg: "send too fast, please retry later"}, true},
+		{"http 429", &feishuSendAPIError{platformTag: "feishu", operation: "reply", statusCode: 429, code: 0, msg: "too many requests"}, true},
+		{"http 503", &feishuSendAPIError{platformTag: "feishu", operation: "reply", statusCode: 503, code: 0, msg: "service unavailable"}, true},
+		{"sdk non-json 500", errors.New("response content-type not json, response: StatusCode: 500, Body: unavailable"), true},
+		{"http 400 business reject", &feishuSendAPIError{platformTag: "feishu", operation: "reply", statusCode: 400, code: 230002, msg: "bot not in chat"}, false},
 		{"plain business error is permanent", errors.New("230002 bot not in chat"), false},
 	}
 	for _, c := range cases {
