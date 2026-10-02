@@ -277,6 +277,92 @@ func TestHandleAssistantCapturesPerSubCallUsage(t *testing.T) {
 	}
 }
 
+func TestHandleAssistantUsesRequested1MWindowForOpaqueProviderModel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cs := &claudeSession{
+		events:         make(chan core.Event, 8),
+		ctx:            ctx,
+		requestedModel: "sonnet[1m]",
+	}
+	cs.sessionID.Store("opaque-provider-session")
+	cs.alive.Store(true)
+	cs.activeModel.Store("space-bunny-free")
+
+	cs.handleAssistant(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"content": []any{},
+			"usage": map[string]any{
+				"input_tokens": float64(155_028),
+			},
+		},
+	})
+
+	usage := cs.GetContextUsage()
+	if usage == nil {
+		t.Fatal("GetContextUsage returned nil")
+	}
+	if usage.ContextWindow != 1_000_000 {
+		t.Fatalf("ContextWindow = %d, want 1_000_000 from requested sonnet[1m]", usage.ContextWindow)
+	}
+	if usage.UsedTokens != 155_028 {
+		t.Fatalf("UsedTokens = %d, want 155028", usage.UsedTokens)
+	}
+	pct := float64(usage.UsedTokens) * 100 / float64(usage.ContextWindow)
+	if pct < 15 || pct > 16 {
+		t.Fatalf("ctx %% = %.2f, want about 15.5%%", pct)
+	}
+}
+
+func TestEffectiveContextWindowPriority(t *testing.T) {
+	t.Run("explicit max_context_tokens wins", func(t *testing.T) {
+		cs := &claudeSession{requestedModel: "sonnet[1m]", maxContextTokens: 500_000}
+		if got := cs.effectiveContextWindow("space-bunny-free"); got != 500_000 {
+			t.Fatalf("effectiveContextWindow = %d, want 500000", got)
+		}
+	})
+
+	t.Run("requested 1m beats opaque provider model", func(t *testing.T) {
+		cs := &claudeSession{requestedModel: "sonnet[1m]"}
+		if got := cs.effectiveContextWindow("space-bunny-free"); got != 1_000_000 {
+			t.Fatalf("effectiveContextWindow = %d, want 1000000", got)
+		}
+	})
+
+	t.Run("normal requested model preserves reported fallback", func(t *testing.T) {
+		cs := &claudeSession{requestedModel: "sonnet"}
+		if got := cs.effectiveContextWindow("space-bunny-free"); got != 200_000 {
+			t.Fatalf("opaque reported model window = %d, want 200000", got)
+		}
+		if got := cs.effectiveContextWindow("claude-opus-4-7[1m]"); got != 1_000_000 {
+			t.Fatalf("reported [1m] window = %d, want 1000000", got)
+		}
+	})
+}
+
+func TestRecoverUsageFromTranscriptUsesRequested1MWindow(t *testing.T) {
+	path := writeFixture(t, []string{
+		`{"type":"assistant","message":{"model":"space-bunny-free","usage":{"input_tokens":155028,"output_tokens":1}}}`,
+	})
+	cs := &claudeSession{
+		requestedModel:     "sonnet[1m]",
+		transcriptOverride: path,
+	}
+
+	usage := cs.recoverUsageFromTranscript()
+	if usage == nil {
+		t.Fatal("recoverUsageFromTranscript returned nil")
+	}
+	if usage.UsedTokens != 155_028 {
+		t.Fatalf("UsedTokens = %d, want 155028", usage.UsedTokens)
+	}
+	if usage.ContextWindow != 1_000_000 {
+		t.Fatalf("ContextWindow = %d, want 1000000 for requested sonnet[1m]", usage.ContextWindow)
+	}
+}
+
 func TestParseClaudeUsageAcceptsNonFloat64Types(t *testing.T) {
 	// Claude Code CLI stream-json normally encodes numbers as float64, but
 	// builds that prefer precision safety (or future Anthropic format changes)
@@ -1377,6 +1463,61 @@ func TestHandleResultUsesTranscriptTailWhenAssistantEmpty(t *testing.T) {
 	// output_tokens is additive and still comes from the result event.
 	if u.OutputTokens != 212 {
 		t.Errorf("OutputTokens = %d, want 212", u.OutputTokens)
+	}
+}
+
+func TestHandleResultTranscriptFallbackUsesRequested1MWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	path := writeFixture(t, []string{
+		`{"type":"assistant","message":{"model":"space-bunny-free","usage":{"input_tokens":155028,"output_tokens":1}}}`,
+	})
+
+	cs := &claudeSession{
+		events:             make(chan core.Event, 8),
+		ctx:                ctx,
+		workDir:            t.TempDir(),
+		requestedModel:     "sonnet[1m]",
+		transcriptOverride: path,
+	}
+	cs.sessionID.Store("opaque-fallback-session")
+	cs.alive.Store(true)
+	cs.activeModel.Store("space-bunny-free")
+
+	// Provider sends an empty live usage block, forcing result-time transcript
+	// fallback. The transcript's opaque model id would normally imply 200k;
+	// requested sonnet[1m] must keep the session at 1M.
+	cs.handleAssistant(map[string]any{
+		"type": "assistant",
+		"message": map[string]any{
+			"model":   "space-bunny-free",
+			"content": []any{},
+			"usage":   map[string]any{"input_tokens": float64(0), "output_tokens": float64(0)},
+		},
+	})
+	cs.handleResult(map[string]any{
+		"type":       "result",
+		"result":     "done",
+		"session_id": "opaque-fallback-session",
+		"usage": map[string]any{
+			"input_tokens":  float64(999_999),
+			"output_tokens": float64(12),
+		},
+	})
+
+	u := cs.GetContextUsage()
+	if u == nil {
+		t.Fatal("expected transcript fallback usage, got nil")
+	}
+	if u.UsedTokens != 155_028 {
+		t.Fatalf("UsedTokens = %d, want 155028 from transcript", u.UsedTokens)
+	}
+	if u.ContextWindow != 1_000_000 {
+		t.Fatalf("ContextWindow = %d, want 1000000 from requested sonnet[1m]", u.ContextWindow)
+	}
+	if src := cs.GetUsageSource(); src != "transcript" {
+		t.Fatalf("usage source = %q, want transcript", src)
 	}
 }
 

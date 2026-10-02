@@ -38,10 +38,16 @@ type claudeSession struct {
 	acceptEditsOnly atomic.Bool
 	dontAsk         atomic.Bool
 	workDir         string
-	ctx             context.Context
-	cancel          context.CancelFunc
-	done            chan struct{}
-	alive           atomic.Bool
+	// requestedModel is the model id cc-connect passed to Claude Code for this
+	// process. Third-party providers may return an opaque backend model id that
+	// does not preserve capability suffixes such as [1m], so context-window
+	// accounting must retain the original request separately from activeModel.
+	requestedModel   string
+	maxContextTokens int
+	ctx              context.Context
+	cancel           context.CancelFunc
+	done             chan struct{}
+	alive            atomic.Bool
 
 	// activeModel stores the model id reported by the CLI's init event (e.g.
 	// "claude-opus-4-7[1m]"). It may be empty if the init event hasn't
@@ -506,6 +512,8 @@ func newClaudeSession(ctx context.Context, workDir, cliBin string, cliExtraArgs 
 		stdin:               stdin,
 		events:              make(chan core.Event, 64),
 		workDir:             workDir,
+		requestedModel:      model,
+		maxContextTokens:    maxContextTokens,
 		ctx:                 sessionCtx,
 		cancel:              cancel,
 		done:                make(chan struct{}),
@@ -878,6 +886,7 @@ func tailUsageFromTranscript(path string, windowBytes int64) (usage *core.Contex
 func (cs *claudeSession) recoverUsageFromTranscript() *core.ContextUsage {
 	u, _ := tailUsageFromTranscript(cs.transcriptPath(), transcriptRecoveryWindow)
 	if u != nil {
+		cs.applyEffectiveContextWindow(u)
 		slog.Info("claudeSession: recovered context usage from transcript",
 			"used", u.UsedTokens, "input", u.InputTokens,
 			"cache_read", u.CachedInputTokens, "cache_creation", u.CacheCreationInputTokens,
@@ -972,8 +981,7 @@ func (cs *claudeSession) handleAssistant(raw map[string]any) {
 		input, _, cc, cr := parseClaudeUsage(usageRaw)
 		used := input + cc + cr
 		if used > 0 {
-			model := cs.GetModel()
-			window := claudeContextWindow(model)
+			window := cs.effectiveContextWindow(cs.GetModel())
 			cs.usageMu.Lock()
 			prevOutput := 0
 			if cs.lastUsage != nil {
@@ -1164,6 +1172,7 @@ func (cs *claudeSession) handleResult(raw map[string]any) {
 
 	if !haveExact {
 		if u, _ := tailUsageFromTranscript(cs.transcriptPath(), transcriptRecoveryWindow); u != nil {
+			cs.applyEffectiveContextWindow(u)
 			cs.usageMu.Lock()
 			// A recovered snapshot is a placeholder and a result snapshot is an
 			// aggregate — the transcript's per-call figure supersedes both.
@@ -1505,6 +1514,37 @@ func (cs *claudeSession) GetContextUsage() *core.ContextUsage {
 	}
 	clone := *cs.lastUsage
 	return &clone
+}
+
+// effectiveContextWindow resolves the context limit for this session.
+// Explicit max_context_tokens is authoritative. Otherwise a [1m] suffix on
+// the model requested by cc-connect is authoritative over provider-reported
+// opaque model ids; the reported model remains the fallback for normal cases.
+func (cs *claudeSession) effectiveContextWindow(reportedModel string) int {
+	if cs.maxContextTokens > 0 {
+		return cs.maxContextTokens
+	}
+	if claudeContextWindow(cs.requestedModel) == 1_000_000 {
+		return 1_000_000
+	}
+	return claudeContextWindow(reportedModel)
+}
+
+func (cs *claudeSession) applyEffectiveContextWindow(usage *core.ContextUsage) {
+	if usage == nil {
+		return
+	}
+	if cs.maxContextTokens > 0 {
+		usage.ContextWindow = cs.maxContextTokens
+		return
+	}
+	if claudeContextWindow(cs.requestedModel) == 1_000_000 {
+		usage.ContextWindow = 1_000_000
+		return
+	}
+	if usage.ContextWindow <= 0 {
+		usage.ContextWindow = 200_000
+	}
 }
 
 func (cs *claudeSession) Alive() bool {
