@@ -469,6 +469,18 @@ type stubFinalReplyLimitPlatform struct {
 
 func (p *stubFinalReplyLimitPlatform) MaxFinalReplyRunes() int { return p.maxRunes }
 
+type stubFinalReplyTableSplitPlatform struct {
+	stubFinalReplyLimitPlatform
+	splitCalls int
+	maxTables  int
+}
+
+func (p *stubFinalReplyTableSplitPlatform) SplitMarkdownByTables(md string, maxTables int) []string {
+	p.splitCalls++
+	p.maxTables = maxTables
+	return strings.Split(md, "\n--CARD-SPLIT--\n")
+}
+
 func (p *stubFooterSendingPlatform) SendWithStatusFooter(_ context.Context, _ any, content, footer string) error {
 	p.footerCalls = append(p.footerCalls, content+"|FOOTER|"+footer)
 	if p.failFooter {
@@ -586,6 +598,33 @@ func TestSplitFinalReplyWithPlan_ReservesInlineFooterOnlyWhenNeeded(t *testing.T
 	last := appendReplyFooter(chunks[len(chunks)-1], footer)
 	if got := len([]rune(last)); got > 100 {
 		t.Fatalf("last chunk + inline footer exceeds platform budget: %d > 100", got)
+	}
+}
+
+func TestSplitFinalReplyWithPlan_AppliesPlatformTableChunking(t *testing.T) {
+	p := &stubFinalReplyTableSplitPlatform{
+		stubFinalReplyLimitPlatform: stubFinalReplyLimitPlatform{
+			stubPlatformEngine: stubPlatformEngine{n: "test"},
+			maxRunes:           6000,
+		},
+	}
+	body := "**part one**\n--CARD-SPLIT--\n**part two**"
+
+	chunks, splitLimit := splitFinalReplyWithPlan(p, body, "")
+	if splitLimit != 6000 {
+		t.Fatalf("split limit = %d, want 6000", splitLimit)
+	}
+	if p.splitCalls != 1 || p.maxTables != 5 {
+		t.Fatalf("platform table splitter calls=%d maxTables=%d, want 1/5", p.splitCalls, p.maxTables)
+	}
+	if len(chunks) != 2 || chunks[0] != "**part one**" || chunks[1] != "**part two**" {
+		t.Fatalf("platform table chunks = %#v", chunks)
+	}
+}
+
+func TestFinalReplySplitVersion_BumpedForPlatformTableChunking(t *testing.T) {
+	if finalReplySplitVersion != 2 {
+		t.Fatalf("finalReplySplitVersion = %d, want 2", finalReplySplitVersion)
 	}
 }
 

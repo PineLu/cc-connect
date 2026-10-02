@@ -2819,9 +2819,10 @@ func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content
 	}
 	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
 
-	// Do not rewrite @name examples inside fenced code or any existing Feishu
-	// <at ...></at> tag. Only ordinary message text participates in resolution.
-	result, codeBlocks := protectFencedCodeBlocks(content)
+	// Do not rewrite @name examples inside fenced/inline code or any existing
+	// Feishu <at ...></at> tag. Only ordinary message text participates in
+	// resolution.
+	result, codeRegions := protectMarkdownCodeRegions(content)
 	result, atTags := protectFeishuAtTags(result)
 	for _, name := range names {
 		pattern := "@" + name
@@ -2839,7 +2840,7 @@ func (p *Platform) resolveMentionsInContent(ctx context.Context, chatID, content
 		result = strings.ReplaceAll(result, pattern, atTag)
 	}
 	result = restoreFeishuAtTags(result, atTags)
-	return restoreFencedCodeBlocks(result, codeBlocks)
+	return restoreMarkdownCodeRegions(result, codeRegions)
 }
 
 // quotedParent holds extracted data from the directly quoted parent message.
@@ -3788,8 +3789,8 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
 // the body content followed by a small/dim status-footer block. Normally this
 // uses an interactive card so the footer can render with text_size "notation".
-// A MsgTypeText mention must stay text so Feishu emits the real mention event;
-// in that case the footer is appended inline instead.
+// Plain-text mentions stay MsgTypeText. Markdown mentions are converted to the
+// card-compatible <at id=...></at> form so the body can keep rich rendering.
 func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, footer string) error {
 	rc, ok := rctx.(replyContext)
 	if !ok {
@@ -3797,6 +3798,7 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	}
 	// Resolve mentions in content.
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
+	content = prepareFeishuMentionSyntax(content)
 	if strings.TrimSpace(footer) == "" {
 		return p.Send(ctx, rctx, content)
 	}
@@ -4054,6 +4056,7 @@ func stripModelFillerLines(s string) string {
 
 func buildReplyContent(content string) (msgType string, body string) {
 	content = stripModelFillerLines(content)
+	content = prepareFeishuMentionSyntax(content)
 	if hasFeishuTextMention(content) || !containsMarkdown(content) {
 		b, _ := json.Marshal(map[string]string{"text": content})
 		return larkim.MsgTypeText, string(b)
@@ -4068,17 +4071,49 @@ func buildReplyContent(content string) (msgType string, body string) {
 	return larkim.MsgTypeInteractive, buildCardJSON(sanitizeMarkdownURLs(preprocessFeishuMarkdown(content)))
 }
 
-var feishuTextMentionPattern = regexp.MustCompile(`(?i)<at\s+user_id\s*=\s*"[^"]+"\s*>`)
+var (
+	feishuTextMentionPattern     = regexp.MustCompile(`(?i)<at\s+user_id\s*=\s*"[^"]+"\s*>`)
+	feishuTextMentionFullPattern = regexp.MustCompile(`(?is)<at\s+user_id\s*=\s*"([^"]+)"\s*>.*?</at>`)
+)
 
 // hasFeishuTextMention reports whether content contains a Feishu MsgTypeText
-// mention tag outside fenced code blocks. Card-style <at id=...></at> tags are
+// mention tag outside fenced/inline code. Card-style <at id=...></at> tags are
 // intentionally excluded so callers can still render them in interactive cards.
 func hasFeishuTextMention(content string) bool {
 	if !strings.Contains(strings.ToLower(content), "user_id") {
 		return false
 	}
-	withoutCode, _ := protectFencedCodeBlocks(content)
+	withoutCode, _ := protectMarkdownCodeRegions(content)
 	return feishuTextMentionPattern.MatchString(withoutCode)
+}
+
+// prepareFeishuMentionSyntax converts text-message mention tags into the
+// interactive-card form when the surrounding content is markdown that can stay
+// on the card path. Plain-text messages and >5-table Post fallbacks deliberately
+// keep <at user_id=...> so their established behavior is unchanged.
+func prepareFeishuMentionSyntax(content string) string {
+	if !containsMarkdown(content) || countMarkdownTables(content) > maxCardTables {
+		return content
+	}
+	return convertFeishuTextMentionsToCardMentions(content)
+}
+
+// convertFeishuTextMentionsToCardMentions rewrites only real protocol tags in
+// ordinary markdown text. Examples inside fenced or inline code stay byte-for-
+// byte unchanged.
+func convertFeishuTextMentionsToCardMentions(content string) string {
+	if !strings.Contains(strings.ToLower(content), "user_id") {
+		return content
+	}
+	protected, codeRegions := protectMarkdownCodeRegions(content)
+	protected = feishuTextMentionFullPattern.ReplaceAllStringFunc(protected, func(tag string) string {
+		parts := feishuTextMentionFullPattern.FindStringSubmatch(tag)
+		if len(parts) != 2 || parts[1] == "" {
+			return tag
+		}
+		return "<at id=" + parts[1] + "></at>"
+	})
+	return restoreMarkdownCodeRegions(protected, codeRegions)
 }
 
 // hasComplexMarkdown detects code blocks or tables that require card rendering.
@@ -6701,9 +6736,12 @@ func (p *Platform) onBotMenu(event *larkapplication.P2BotMenuV6) error {
 // ═══════════════════════════════════════════════════════════════
 
 const (
-	defaultToolIcon      = "app-default_outlined"
-	reasoningToolIcon    = "mindmap_outlined"
-	feishuCardTableLimit = 3
+	defaultToolIcon   = "app-default_outlined"
+	reasoningToolIcon = "mindmap_outlined"
+	// Reuse the same verified table budget for basic, rich, and streaming cards.
+	// Keeping a second literal here previously left rich/stream cards at 3 while
+	// the normal interactive-card path already supported 5.
+	feishuCardTableLimit = maxCardTables
 )
 
 var (
@@ -7340,8 +7378,6 @@ func pickThinkingVerb() string {
 	return thinkingVerbs[idx] + "..."
 }
 
-var markdownTablePattern = regexp.MustCompile(`(?m)^\|.+\|\s*\n\|[\s:|-]+\|\s*\n(?:\|.+\|\s*\n?)+`)
-
 type markdownTextMatch struct {
 	start int
 	end   int
@@ -7390,6 +7426,9 @@ var blockedRichCardImagePrefixes = []netip.Prefix{
 // Streaming frames start uploads and strip unresolved images; final frames wait
 // briefly so resolved images can be embedded before the Done update.
 func (p *Platform) ResolveRichCardMarkdown(ctx context.Context, markdown string, final bool) string {
+	// Rich-card rendering always needs card mention syntax. This also covers
+	// builder/template output that already contains a resolved text mention.
+	markdown = convertFeishuTextMentionsToCardMentions(markdown)
 	if !strings.Contains(markdown, "![") {
 		return markdown
 	}
@@ -7800,6 +7839,49 @@ func restoreFeishuAtTags(text string, tags []string) string {
 	for i, tag := range tags {
 		placeholder := fmt.Sprintf("\x00CC_FEISHU_AT_TAG_%d\x00", i)
 		text = strings.ReplaceAll(text, placeholder, tag)
+	}
+	return text
+}
+
+// protectMarkdownCodeRegions replaces both inline-code spans and fenced-code
+// blocks with placeholders in one pass. A unified scanner is important here:
+// treating fences and inline code independently can misclassify triple backticks
+// that merely appear inside an inline-code example.
+func protectMarkdownCodeRegions(text string) (string, []string) {
+	var regions []string
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		if text[i] != '`' {
+			b.WriteByte(text[i])
+			i++
+			continue
+		}
+		run := 1
+		for i+run < len(text) && text[i+run] == '`' {
+			run++
+		}
+		end, ok := findFeishuMarkdownBacktickEnd(text, i+run, run)
+		if !ok {
+			if run < 3 {
+				b.WriteString(text[i : i+run])
+				i += run
+				continue
+			}
+			// An unclosed fence semantically protects the rest of the markdown.
+			end = len(text)
+		}
+		placeholder := fmt.Sprintf("\x00CC_FEISHU_MARKDOWN_CODE_%d\x00", len(regions))
+		regions = append(regions, text[i:end])
+		b.WriteString(placeholder)
+		i = end
+	}
+	return b.String(), regions
+}
+
+func restoreMarkdownCodeRegions(text string, regions []string) string {
+	for i, region := range regions {
+		placeholder := fmt.Sprintf("\x00CC_FEISHU_MARKDOWN_CODE_%d\x00", i)
+		text = strings.ReplaceAll(text, placeholder, region)
 	}
 	return text
 }
@@ -8251,24 +8333,22 @@ func splitMarkdownByTables(md string, maxTables int) []string {
 	if maxTables <= 0 {
 		return []string{md}
 	}
-	matches := markdownTablePattern.FindAllStringIndex(md, -1)
+	matches := findMarkdownTablesOutsideCodeBlocks(md)
 	if len(matches) <= maxTables {
 		return []string{md}
 	}
-	parts := make([]string, 0, len(matches)-maxTables+1)
-	firstEnd := len(md)
-	if len(matches) > maxTables {
-		firstEnd = matches[maxTables][0]
-	}
-	first := strings.TrimSpace(md[:firstEnd])
-	if first != "" {
-		parts = append(parts, first)
-	}
-	for _, match := range matches[maxTables:] {
-		block := strings.TrimSpace(md[match[0]:match[1]])
-		if block != "" {
-			parts = append(parts, block)
+	parts := make([]string, 0, (len(matches)+maxTables-1)/maxTables)
+	start := 0
+	for i := maxTables; i < len(matches); i += maxTables {
+		splitAt := matches[i].start
+		part := md[start:splitAt]
+		if strings.TrimSpace(part) != "" {
+			parts = append(parts, part)
 		}
+		start = splitAt
+	}
+	if tail := md[start:]; strings.TrimSpace(tail) != "" {
+		parts = append(parts, tail)
 	}
 	return parts
 }
@@ -8282,6 +8362,9 @@ func (p *Platform) BuildRichCard(status core.CardStatus, title string, steps []c
 
 // SplitMarkdownByTables implements core.MarkdownTableSplitter.
 func (p *Platform) SplitMarkdownByTables(md string, maxTables int) []string {
+	if maxTables > feishuCardTableLimit {
+		maxTables = feishuCardTableLimit
+	}
 	return splitMarkdownByTables(md, maxTables)
 }
 

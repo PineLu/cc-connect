@@ -1680,6 +1680,14 @@ func TestBuildRichCard_SanitizesMarkdownForCardLimits(t *testing.T) {
 		"|---|",
 		"| 4 |",
 		"",
+		"| E |",
+		"|---|",
+		"| 5 |",
+		"",
+		"| F |",
+		"|---|",
+		"| 6 |",
+		"",
 		"![remote](https://example.com/image.png)",
 		"![ok](img_v3_abc)",
 	}, "\n")
@@ -1691,8 +1699,11 @@ func TestBuildRichCard_SanitizesMarkdownForCardLimits(t *testing.T) {
 	if !strings.Contains(content, "#### Big Result") {
 		t.Fatalf("card markdown should render h1 as h4, got %q", content)
 	}
-	if !strings.Contains(content, "```\n| D |\n|---|\n| 4 |\n```") {
-		t.Fatalf("fourth table should be downgraded to a code block, got %q", content)
+	if !strings.Contains(content, "| E |\n|---|\n| 5 |") {
+		t.Fatalf("fifth table should remain renderable, got %q", content)
+	}
+	if !strings.Contains(content, "```\n| F |\n|---|\n| 6 |\n```") {
+		t.Fatalf("sixth table should be downgraded to a code block, got %q", content)
 	}
 	if !strings.Contains(content, "```\n| code |\n|---|\n| example |\n```") {
 		t.Fatalf("existing code block tables should stay intact, got %q", content)
@@ -1861,14 +1872,22 @@ func TestBuildCardJSONWithStatusFooter_SharesCardTableBudget(t *testing.T) {
 		"| D |",
 		"|---|",
 		"| 4 |",
+		"",
+		"| E |",
+		"|---|",
+		"| 5 |",
+		"",
+		"| F |",
+		"|---|",
+		"| 6 |",
 	}, "\n")
 
 	content := strings.Join(collectCardMarkdownContents(t, buildCardJSONWithStatusFooter(body, footer)), "\n")
-	if !strings.Contains(content, "| C |\n|---|\n| 3 |") {
-		t.Fatalf("third table should remain renderable, got %q", content)
+	if !strings.Contains(content, "| E |\n|---|\n| 5 |") {
+		t.Fatalf("fifth table across card elements should remain renderable, got %q", content)
 	}
-	if !strings.Contains(content, "```\n| D |\n|---|\n| 4 |\n```") {
-		t.Fatalf("fourth table across card elements should be downgraded, got %q", content)
+	if !strings.Contains(content, "```\n| F |\n|---|\n| 6 |\n```") {
+		t.Fatalf("sixth table across card elements should be downgraded, got %q", content)
 	}
 }
 
@@ -2176,9 +2195,9 @@ func TestResolveMentions_LongestMatchFirst(t *testing.T) {
 	}
 }
 
-// TestResolveMentions_MarkdownContent verifies that @name inside markdown
-// content resolves to the MsgTypeText mention syntax so Feishu emits a real
-// mention notification.
+// TestResolveMentions_MarkdownContent verifies that @name resolution remains
+// message-type agnostic. The downstream card renderer converts this temporary
+// text-mention form when the final target is an interactive card.
 func TestResolveMentions_MarkdownContent(t *testing.T) {
 	p := &Platform{platformName: "feishu", resolveMentions: true}
 	p.chatMemberCache.Store("oc_chat", &chatMemberEntry{
@@ -2189,7 +2208,20 @@ func TestResolveMentions_MarkdownContent(t *testing.T) {
 	input := "# 巡检报告\n\n@张三 请查看\n\n```\nstatus: ok\n```"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
 	if !strings.Contains(result, `<at user_id="ou_zhangsan">张三</at>`) {
-		t.Fatalf("markdown content should resolve to text mention format, got %q", result)
+		t.Fatalf("markdown content should resolve to temporary text mention format, got %q", result)
+	}
+}
+
+func TestResolveMentions_InlineCodeExamplePreserved(t *testing.T) {
+	p := &Platform{platformName: "feishu", resolveMentions: true}
+	p.chatMemberCache.Store("oc_chat", &chatMemberEntry{
+		members:   map[string]string{"张三": "ou_zhangsan"},
+		fetchedAt: time.Now(),
+	})
+	input := "说明：`@张三` 只是示例，正文没有提及"
+	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
+	if result != input {
+		t.Fatalf("inline-code @name example must remain unchanged, got %q", result)
 	}
 }
 

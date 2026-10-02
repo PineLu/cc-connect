@@ -16,6 +16,26 @@ type mockUpdaterPlatform struct {
 	lastMsg  string
 }
 
+type mockChunkingPreviewPlatform struct {
+	mockUpdaterPlatform
+	splitCalls  int
+	maxTables   int
+	footerCalls []string
+}
+
+func (m *mockChunkingPreviewPlatform) MaxFinalReplyRunes() int { return 6000 }
+
+func (m *mockChunkingPreviewPlatform) SplitMarkdownByTables(md string, maxTables int) []string {
+	m.splitCalls++
+	m.maxTables = maxTables
+	return strings.Split(md, "\n--CARD-SPLIT--\n")
+}
+
+func (m *mockChunkingPreviewPlatform) SendWithStatusFooter(_ context.Context, _ any, content, footer string) error {
+	m.footerCalls = append(m.footerCalls, content+"|FOOTER|"+footer)
+	return nil
+}
+
 func (m *mockUpdaterPlatform) SendPreviewStart(_ context.Context, _ any, content string) (any, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -171,6 +191,75 @@ func TestStreamPreview_FinishInPlace(t *testing.T) {
 	last := msgs[len(msgs)-1]
 	if last != "update:Hello World Final" {
 		t.Errorf("last message = %q, want 'update:Hello World Final'", last)
+	}
+}
+
+func TestFinishStreamPreviewWithChunks_UpdatesPreviewAndSendsOverflow(t *testing.T) {
+	mp := &mockChunkingPreviewPlatform{}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    20,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("preview")
+	time.Sleep(50 * time.Millisecond)
+
+	var sent []string
+	send := func(_ Platform, _ any, content string) error {
+		sent = append(sent, content)
+		return nil
+	}
+	finalText := "**first card**\n--CARD-SPLIT--\n**second card**"
+	ok, err := finishStreamPreviewWithChunks(sp, mp, "ctx", finalText, "", send)
+	if err != nil || !ok {
+		t.Fatalf("finishStreamPreviewWithChunks() = ok=%v err=%v", ok, err)
+	}
+	if mp.splitCalls != 1 || mp.maxTables != 5 {
+		t.Fatalf("split calls=%d maxTables=%d, want 1/5", mp.splitCalls, mp.maxTables)
+	}
+	msgs := mp.getMessages()
+	if len(msgs) == 0 || msgs[len(msgs)-1] != "update:**first card**" {
+		t.Fatalf("preview final update = %#v, want first chunk only", msgs)
+	}
+	if len(sent) != 1 || sent[0] != "**second card**" {
+		t.Fatalf("overflow sends = %#v, want second chunk only", sent)
+	}
+}
+
+func TestFinishStreamPreviewWithChunks_PutsFooterOnLastChunk(t *testing.T) {
+	mp := &mockChunkingPreviewPlatform{}
+	cfg := StreamPreviewCfg{Enabled: true, IntervalMs: 20, MinDeltaChars: 1, MaxChars: 500}
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("preview")
+	time.Sleep(50 * time.Millisecond)
+
+	var sent []string
+	send := func(_ Platform, _ any, content string) error {
+		sent = append(sent, content)
+		return nil
+	}
+	ok, err := finishStreamPreviewWithChunks(
+		sp,
+		mp,
+		"ctx",
+		"first\n--CARD-SPLIT--\nsecond",
+		"model · ctx 5%",
+		send,
+	)
+	if err != nil || !ok {
+		t.Fatalf("finishStreamPreviewWithChunks() = ok=%v err=%v", ok, err)
+	}
+	msgs := mp.getMessages()
+	if len(msgs) == 0 || msgs[len(msgs)-1] != "update:first" {
+		t.Fatalf("first preview chunk should not carry footer: %#v", msgs)
+	}
+	if len(mp.footerCalls) != 1 || mp.footerCalls[0] != "second|FOOTER|model · ctx 5%" {
+		t.Fatalf("footer calls = %#v, want footer on overflow last chunk", mp.footerCalls)
+	}
+	if len(sent) != 0 {
+		t.Fatalf("plain overflow send should be bypassed when footer sender succeeds: %#v", sent)
 	}
 }
 

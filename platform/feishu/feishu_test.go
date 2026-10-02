@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,7 +16,6 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
-
 
 func TestApplyCardLinks_NestedActionsPreserveOrder(t *testing.T) {
 	parts := []string{"按钮A", "按钮B"}
@@ -1043,6 +1043,36 @@ func TestCountMarkdownTables(t *testing.T) {
 	}
 }
 
+func TestSplitMarkdownByTables_GroupsAndPreservesAllContent(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("# report\n\n<at user_id=\"ou_bot\">Collector-B</at>\n\n")
+	for i := 1; i <= 11; i++ {
+		sb.WriteString(fmt.Sprintf("| H%d | V |\n|---|---|\n| row | %d |\n", i, i))
+		sb.WriteString(fmt.Sprintf("note-after-%d\n\n", i))
+	}
+	sb.WriteString("tail-marker")
+	input := sb.String()
+
+	parts := splitMarkdownByTables(input, maxCardTables)
+	if len(parts) != 3 {
+		t.Fatalf("splitMarkdownByTables() parts=%d, want 3", len(parts))
+	}
+	if joined := strings.Join(parts, ""); joined != input {
+		t.Fatalf("split must preserve all bytes\njoined=%q\ninput=%q", joined, input)
+	}
+	for i, part := range parts {
+		if tables := len(findMarkdownTablesOutsideCodeBlocks(part)); tables > maxCardTables {
+			t.Fatalf("part %d has %d tables, max %d", i, tables, maxCardTables)
+		}
+	}
+	if !strings.Contains(parts[0], `<at user_id="ou_bot">Collector-B</at>`) {
+		t.Fatalf("first part lost mention: %q", parts[0])
+	}
+	if !strings.Contains(parts[1], "note-after-6") || !strings.Contains(parts[2], "tail-marker") {
+		t.Fatalf("inter-table/trailing text lost: %#v", parts)
+	}
+}
+
 func TestBuildReplyContent_FallbackWhenManyTables(t *testing.T) {
 	// Build content with 6 tables (exceeds the 5-table card limit).
 	var sb strings.Builder
@@ -1642,7 +1672,7 @@ func TestResolveMentions_PreservesFencedCodeAndExistingAtTags(t *testing.T) {
 		true,
 		map[string]string{},
 	)
-	input := "outside @BotA\n\n```text\n@BotA\n<at user_id=\"ou_code\">@BotA</at>\n```\n\n<at user_id=\"ou_existing\">@BotA</at>\n<at id=ou_card></at>"
+	input := "outside @BotA\n\n`@BotA <at user_id=\"ou_inline\">BotA</at>`\n\n```text\n@BotA\n<at user_id=\"ou_code\">@BotA</at>\n```\n\n<at user_id=\"ou_existing\">@BotA</at>\n<at id=ou_card></at>"
 	got := p.resolveMentionsInContent(context.Background(), "oc_test_group", input)
 
 	if !strings.Contains(got, `outside <at user_id="ou_bot">BotA</at>`) {
@@ -1650,6 +1680,9 @@ func TestResolveMentions_PreservesFencedCodeAndExistingAtTags(t *testing.T) {
 	}
 	if !strings.Contains(got, "```text\n@BotA\n<at user_id=\"ou_code\">@BotA</at>\n```") {
 		t.Fatalf("fenced code must remain byte-for-byte unchanged, got %q", got)
+	}
+	if !strings.Contains(got, "`@BotA <at user_id=\"ou_inline\">BotA</at>`") {
+		t.Fatalf("inline code must remain byte-for-byte unchanged, got %q", got)
 	}
 	if !strings.Contains(got, `<at user_id="ou_existing">@BotA</at>`) {
 		t.Fatalf("existing text mention tag must remain unchanged, got %q", got)
@@ -1659,6 +1692,22 @@ func TestResolveMentions_PreservesFencedCodeAndExistingAtTags(t *testing.T) {
 	}
 	if count := strings.Count(got, `user_id="ou_bot"`); count != 1 {
 		t.Fatalf("only the ordinary-text mention should be generated; count=%d got=%q", count, got)
+	}
+}
+
+func TestResolveMentions_InlineCodeWithFenceMarkersDoesNotHideLaterMention(t *testing.T) {
+	p := newTestPlatform(
+		map[string]string{"BotA": "ou_bot"},
+		true,
+		map[string]string{},
+	)
+	input := "example `literal ``` @BotA ``` token` then @BotA real"
+	got := p.resolveMentionsInContent(context.Background(), "oc_test_group", input)
+	if !strings.Contains(got, "`literal ``` @BotA ``` token`") {
+		t.Fatalf("inline code containing fence markers must remain unchanged, got %q", got)
+	}
+	if !strings.Contains(got, `then <at user_id="ou_bot">BotA</at> real`) {
+		t.Fatalf("real mention after inline code must still resolve, got %q", got)
 	}
 }
 
@@ -1672,13 +1721,61 @@ func TestBuildReplyContent_NoFalsePositiveOnEmail(t *testing.T) {
 	}
 }
 
-// TestBuildReplyContent_RealMentionForcesText confirms a resolved MsgTypeText
-// mention forces text even when markdown is present, so Feishu fires the
-// mention event.
-func TestBuildReplyContent_RealMentionForcesText(t *testing.T) {
-	msgType, _ := buildReplyContent(`**bold** <at user_id="ou_bot">Collector-B</at> please review`)
+func TestBuildReplyContent_MarkdownMentionConvertsToCard(t *testing.T) {
+	msgType, body := buildReplyContent(`**bold** <at user_id="ou_bot">Collector-B</at> please review`)
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("markdown mention should stay interactive; got %s", msgType)
+	}
+	if !strings.Contains(body, "id=ou_bot") || strings.Contains(body, "user_id") {
+		t.Fatalf("markdown mention should convert to card syntax; body=%s", body)
+	}
+}
+
+func TestBuildReplyContent_PlainTextMentionStaysText(t *testing.T) {
+	msgType, body := buildReplyContent(`hello <at user_id="ou_bot">Collector-B</at>`)
 	if msgType != larkim.MsgTypeText {
-		t.Errorf("resolved text mention should force MsgTypeText; got %s", msgType)
+		t.Fatalf("plain-text mention should stay MsgTypeText; got %s", msgType)
+	}
+	if !strings.Contains(body, "user_id") {
+		t.Fatalf("plain-text mention syntax should be preserved; body=%s", body)
+	}
+}
+
+func TestBuildReplyContent_ManyTablesMentionKeepsTextFallback(t *testing.T) {
+	table := "| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+	content := "**report** <at user_id=\"ou_bot\">Collector-B</at>\n\n" +
+		strings.Repeat(table, maxCardTables+1)
+	msgType, body := buildReplyContent(content)
+	if msgType != larkim.MsgTypeText {
+		t.Fatalf(">5-table markdown mention should keep safe text fallback; got %s", msgType)
+	}
+	if !strings.Contains(body, "user_id") || strings.Contains(body, "id=ou_bot") {
+		t.Fatalf(">5-table text fallback should preserve text mention syntax; body=%s", body)
+	}
+}
+
+func TestManyTablesMention_SplitThenBuildsInteractiveCards(t *testing.T) {
+	table := "| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+	content := "**report** <at user_id=\"ou_bot\">Collector-B</at>\n\n" +
+		strings.Repeat(table, maxCardTables+1)
+	parts := splitMarkdownByTables(content, maxCardTables)
+	if len(parts) != 2 {
+		t.Fatalf("split parts=%d, want 2", len(parts))
+	}
+
+	for i, part := range parts {
+		msgType, body := buildReplyContent(part)
+		if msgType != larkim.MsgTypeInteractive {
+			t.Fatalf("part %d should be interactive after table split; got %s", i, msgType)
+		}
+		if countMarkdownTables(part) > maxCardTables {
+			t.Fatalf("part %d still exceeds card table limit: %d", i, countMarkdownTables(part))
+		}
+		if i == 0 {
+			if !strings.Contains(body, "id=ou_bot") || strings.Contains(body, "user_id") {
+				t.Fatalf("first card should convert mention to card syntax; body=%s", body)
+			}
+		}
 	}
 }
 
@@ -1706,6 +1803,25 @@ func TestBuildReplyContent_TextMentionInsideCodeFenceDoesNotForceText(t *testing
 	}
 }
 
+func TestBuildReplyContent_TextMentionInsideInlineCodeDoesNotForceText(t *testing.T) {
+	content := "# Example\n\n`<at user_id=\"ou_bot\">Collector-B</at>` is syntax documentation"
+	msgType, body := buildReplyContent(content)
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("mention syntax shown inside inline code must remain card markdown; got %s", msgType)
+	}
+	if !strings.Contains(body, "user_id") {
+		t.Fatalf("inline-code example should remain unchanged; body=%s", body)
+	}
+}
+
+func TestResolveRichCardMarkdown_ConvertsTextMentionToCardMention(t *testing.T) {
+	p := &Platform{platformName: "feishu"}
+	got := p.ResolveRichCardMarkdown(context.Background(), `**值班** <at user_id="ou_bot">Collector-B</at>`, true)
+	if got != `**值班** <at id=ou_bot></at>` {
+		t.Fatalf("ResolveRichCardMarkdown() = %q", got)
+	}
+}
+
 func TestPlatform_MaxFinalReplyRunes(t *testing.T) {
 	p := &Platform{platformName: "feishu"}
 	if got := p.MaxFinalReplyRunes(); got != 6000 {
@@ -1713,7 +1829,21 @@ func TestPlatform_MaxFinalReplyRunes(t *testing.T) {
 	}
 }
 
-func TestResolveMentions_MarkdownForcesTextFormat(t *testing.T) {
+func TestPlatform_SplitMarkdownByTables_ClampsToCardBudget(t *testing.T) {
+	p := &Platform{platformName: "feishu"}
+	table := "| a | b |\n|---|---|\n| 1 | 2 |\n\n"
+	parts := p.SplitMarkdownByTables(strings.Repeat(table, 6), 5)
+	if len(parts) != 2 {
+		t.Fatalf("SplitMarkdownByTables() parts=%d, want 2", len(parts))
+	}
+	for i, part := range parts {
+		if got := len(findMarkdownTablesOutsideCodeBlocks(part)); got > feishuCardTableLimit {
+			t.Fatalf("part %d has %d tables, want <= %d", i, got, feishuCardTableLimit)
+		}
+	}
+}
+
+func TestResolveMentions_MarkdownConvertsToCardFormat(t *testing.T) {
 	p := &Platform{platformName: "feishu", resolveMentions: true}
 	p.chatMemberCache.Store("oc_chat", &chatMemberEntry{
 		members:   map[string]string{"Collector-B": "ou_bot_b"},
@@ -1722,12 +1852,14 @@ func TestResolveMentions_MarkdownForcesTextFormat(t *testing.T) {
 	input := "# Report\n\n@Collector-B please review\n\n**done**"
 	result := p.resolveMentionsInContent(context.Background(), "oc_chat", input)
 	if !strings.Contains(result, `<at user_id="ou_bot_b">Collector-B</at>`) {
-		t.Fatalf("markdown content must resolve to MsgTypeText mention format; got %q", result)
+		t.Fatalf("markdown content must resolve to temporary text mention format; got %q", result)
 	}
-	// Verify the full pipeline keeps the message in MsgTypeText.
-	msgType, _ := buildReplyContent(result)
-	if msgType != larkim.MsgTypeText {
-		t.Fatalf("markdown + mention must force MsgTypeText so Feishu fires the mention event; got %s", msgType)
+	msgType, body := buildReplyContent(result)
+	if msgType != larkim.MsgTypeInteractive {
+		t.Fatalf("markdown + mention should stay interactive; got %s", msgType)
+	}
+	if !strings.Contains(body, "id=ou_bot_b") {
+		t.Fatalf("resolved markdown mention should convert to card syntax; body=%s", body)
 	}
 }
 
@@ -1786,6 +1918,7 @@ func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
 		{"email", "**bold** report sent to a@b.com", larkim.MsgTypeInteractive},
 		{"url", "see [docs](http://x@y.com/z)", larkim.MsgTypeInteractive},
 		{"mention", "hey @BotA review please", larkim.MsgTypeText},
+		{"markdown_mention", "**hey** @BotA review please", larkim.MsgTypeInteractive},
 	} {
 		if err := p.SendWithStatusFooter(ctx, rc, tc.content, "done"); err != nil {
 			t.Fatalf("%s: SendWithStatusFooter error = %v", tc.name, err)
@@ -1796,6 +1929,11 @@ func TestSendWithStatusFooter_NoFallbackOnNonMentionAt(t *testing.T) {
 		if tc.name == "mention" {
 			if !strings.Contains(gotContent, "ou_bot_openid") || !strings.Contains(gotContent, "done") {
 				t.Errorf("mention: content must contain resolved mention + inline footer; got %s", gotContent)
+			}
+		}
+		if tc.name == "markdown_mention" {
+			if !strings.Contains(gotContent, "id=ou_bot_openid") || strings.Contains(gotContent, "user_id") {
+				t.Errorf("markdown mention: content must use card mention syntax; got %s", gotContent)
 			}
 		}
 	}

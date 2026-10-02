@@ -29,7 +29,12 @@ import (
 )
 
 const maxPlatformMessageLen = 4000
-const finalReplySplitVersion = 1
+
+// finalReplySplitVersion pins the chunk-boundary semantics persisted in the
+// outbox. v1 added table-aware length splitting; v2 additionally applies a
+// platform's MarkdownTableSplitter before rune-budget splitting so platform
+// card limits (for example max table count) are part of the durable plan.
+const finalReplySplitVersion = 2
 const telegramBotCommandLimit = 100
 const defaultMaxQueuedMessages = 5 // default cap for queued messages per session
 
@@ -6411,12 +6416,19 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 				slog.Debug("EventResult: suppressed duplicate side-channel text", "response_len", len(fullResponse))
-			} else if sp.finish(fullResponse, statusFooter) {
-				slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse), "footer_len", len(statusFooter))
 			} else {
-				slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "footer_len", len(statusFooter))
-				if !e.sendFinalWithOutbox(sessionKey, e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
+				previewFinished, previewErr := finishStreamPreviewWithChunks(sp, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError)
+				if previewErr != nil {
+					slog.Error("EventResult: stream preview overflow send failed", "error", previewErr)
 					return
+				}
+				if previewFinished {
+					slog.Debug("EventResult: finalized via stream preview", "response_len", len(fullResponse), "footer_len", len(statusFooter))
+				} else {
+					slog.Debug("EventResult: sending via p.Send (preview inactive or failed)", "response_len", len(fullResponse), "footer_len", len(statusFooter))
+					if !e.sendFinalWithOutbox(sessionKey, e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
+						return
+					}
 				}
 			}
 
@@ -6733,12 +6745,19 @@ channelClosed:
 					}
 				}
 			}
-		} else if sp.finish(fullResponse, "") {
-			slog.Debug("stream preview: finalized in-place (process exited)")
 		} else {
-			for _, chunk := range splitFinalReply(p, fullResponse) {
-				if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
-					return
+			previewFinished, previewErr := finishStreamPreviewWithChunks(sp, p, replyCtx, fullResponse, "", sendWorkspaceWithError)
+			if previewErr != nil {
+				slog.Error("stream preview: overflow send failed after process exit", "error", previewErr)
+				return
+			}
+			if previewFinished {
+				slog.Debug("stream preview: finalized in-place (process exited)")
+			} else {
+				for _, chunk := range splitFinalReply(p, fullResponse) {
+					if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
+						return
+					}
 				}
 			}
 		}
@@ -8469,9 +8488,22 @@ func finalReplyMaxRunes(p Platform) int {
 	return maxPlatformMessageLen
 }
 
+func splitFinalReplyBody(p Platform, body string, maxRunes int) []string {
+	parts := []string{body}
+	if splitter, ok := p.(MarkdownTableSplitter); ok {
+		parts = splitter.SplitMarkdownByTables(body, 5)
+	}
+
+	chunks := make([]string, 0, len(parts))
+	for _, part := range parts {
+		chunks = append(chunks, SplitMessageCodeFenceAware(part, maxRunes)...)
+	}
+	return chunks
+}
+
 func splitFinalReplyWithPlan(p Platform, body, statusFooter string) ([]string, int) {
 	maxRunes := finalReplyMaxRunes(p)
-	chunks := SplitMessageCodeFenceAware(body, maxRunes)
+	chunks := splitFinalReplyBody(p, body, maxRunes)
 	if statusFooter == "" || len(chunks) == 0 {
 		return chunks, maxRunes
 	}
@@ -8487,7 +8519,34 @@ func splitFinalReplyWithPlan(p Platform, body, statusFooter string) ([]string, i
 	if bodyMaxRunes < 1 {
 		bodyMaxRunes = 1
 	}
-	return SplitMessageCodeFenceAware(body, bodyMaxRunes), bodyMaxRunes
+	return splitFinalReplyBody(p, body, bodyMaxRunes), bodyMaxRunes
+}
+
+func finishStreamPreviewWithChunks(
+	sp *streamPreview,
+	p Platform,
+	replyCtx any,
+	finalText string,
+	statusFooter string,
+	sendChunk func(Platform, any, string) error,
+) (bool, error) {
+	chunks, _ := splitFinalReplyWithPlan(p, finalText, statusFooter)
+	if len(chunks) == 0 {
+		return sp.finish(finalText, statusFooter), nil
+	}
+	firstFooter := statusFooter
+	if len(chunks) > 1 {
+		firstFooter = ""
+	}
+	if !sp.finish(chunks[0], firstFooter) {
+		return false, nil
+	}
+	for i := 1; i < len(chunks); i++ {
+		if err := sendFinalChunk(sp.ctx, p, replyCtx, chunks, i, statusFooter, sendChunk); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
 }
 
 func splitFinalReply(p Platform, body string) []string {
@@ -8627,12 +8686,21 @@ func (e *Engine) replayOutboxItem(ctx context.Context, it *OutboxItem) (bool, er
 		// code-fence-aware algorithm. Preserve those boundaries so SentChunks
 		// still refers to the same prefix after an upgrade.
 		chunks = splitMessageCodeFenceAware(it.Body, maxPlatformMessageLen, false)
-	} else {
+	} else if it.SplitVersion == 1 {
+		// v1 persisted items used the table-aware *length* splitter only. Do not
+		// retroactively apply platform table-count chunking or SentChunks could
+		// point at a different prefix after upgrade.
 		maxRunes := it.SplitMaxRunes
 		if maxRunes <= 0 {
 			maxRunes = finalReplyMaxRunes(p)
 		}
 		chunks = splitMessageCodeFenceAware(it.Body, maxRunes, true)
+	} else {
+		maxRunes := it.SplitMaxRunes
+		if maxRunes <= 0 {
+			maxRunes = finalReplyMaxRunes(p)
+		}
+		chunks = splitFinalReplyBody(p, it.Body, maxRunes)
 	}
 	if it.SentChunks > len(chunks) {
 		it.SentChunks = 0 // defensive: split result changed, resend all
@@ -10774,7 +10842,7 @@ func (e *Engine) renderModelsCard(sessionKey string, agent Agent) *Card {
 		body = e.i18n.Tf(MsgModelCurrent, currentLine)
 	}
 	cb := NewCard().Title(e.i18n.T(MsgCardTitleModel), "indigo").
-		Markdown(body + "\n" + sb.String()).
+		Markdown(body+"\n"+sb.String()).
 		Select(e.i18n.T(MsgModelSelectPlaceholder), opts, initVal).
 		Buttons(e.cardBackButton())
 	cb.Note(e.i18n.T(MsgModelsUsage))

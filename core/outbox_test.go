@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +27,16 @@ type permanentOutboxPlatform struct {
 	attempts      []string
 	permanentBody string
 	failAll       bool
+}
+
+type tableChunkOutboxPlatform struct {
+	permanentOutboxPlatform
+	splitCalls int
+}
+
+func (p *tableChunkOutboxPlatform) SplitMarkdownByTables(md string, _ int) []string {
+	p.splitCalls++
+	return strings.Split(md, "\n--CARD-SPLIT--\n")
 }
 
 func (p *permanentOutboxPlatform) Send(ctx context.Context, r any, content string) error {
@@ -151,6 +162,68 @@ func TestReplayOutboxItem_PermanentFailureNotifiesOnce(t *testing.T) {
 	if attempts[0] != original || attempts[1] != e.i18n.T(MsgFinalReplyDeliveryFailed) {
 		t.Fatalf("unexpected replay attempt sequence: %v", attempts)
 	}
+}
+
+func TestReplayOutboxItem_PreservesV1AndUsesV2PlatformTableChunking(t *testing.T) {
+	const body = "**part one**\n--CARD-SPLIT--\n**part two**"
+
+	newEngine := func(p Platform) *Engine {
+		return &Engine{
+			ctx:           context.Background(),
+			i18n:          NewI18n(LangEnglish),
+			outbox:        NewOutbox(t.TempDir(), testOutboxCfg()),
+			platformReady: map[Platform]bool{p: true},
+		}
+	}
+
+	t.Run("v1 keeps historical length-only boundaries", func(t *testing.T) {
+		p := &tableChunkOutboxPlatform{permanentOutboxPlatform: permanentOutboxPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
+		e := newEngine(p)
+		it := &OutboxItem{
+			ID:            "v1",
+			UUID:          "uuid-v1",
+			Platform:      p.Name(),
+			ReplyCtx:      []byte("ctx"),
+			Body:          body,
+			SplitVersion:  1,
+			SplitMaxRunes: 6000,
+		}
+		done, err := e.replayOutboxItem(context.Background(), it)
+		if err != nil || !done {
+			t.Fatalf("v1 replay = done=%v err=%v", done, err)
+		}
+		if p.splitCalls != 0 {
+			t.Fatalf("v1 replay must not use platform table splitter; calls=%d", p.splitCalls)
+		}
+		if attempts := p.getAttempts(); len(attempts) != 1 || attempts[0] != body {
+			t.Fatalf("v1 replay attempts=%#v, want original body as one chunk", attempts)
+		}
+	})
+
+	t.Run("v2 applies platform table boundaries", func(t *testing.T) {
+		p := &tableChunkOutboxPlatform{permanentOutboxPlatform: permanentOutboxPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}}
+		e := newEngine(p)
+		it := &OutboxItem{
+			ID:            "v2",
+			UUID:          "uuid-v2",
+			Platform:      p.Name(),
+			ReplyCtx:      []byte("ctx"),
+			Body:          body,
+			SplitVersion:  2,
+			SplitMaxRunes: 6000,
+		}
+		done, err := e.replayOutboxItem(context.Background(), it)
+		if err != nil || !done {
+			t.Fatalf("v2 replay = done=%v err=%v", done, err)
+		}
+		if p.splitCalls != 1 {
+			t.Fatalf("v2 replay splitter calls=%d, want 1", p.splitCalls)
+		}
+		attempts := p.getAttempts()
+		if len(attempts) != 2 || attempts[0] != "**part one**" || attempts[1] != "**part two**" {
+			t.Fatalf("v2 replay attempts=%#v", attempts)
+		}
+	})
 }
 
 func TestOutbox_AddReturnsEmptyWhenInitialPersistFails(t *testing.T) {
