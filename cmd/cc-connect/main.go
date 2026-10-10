@@ -1201,6 +1201,8 @@ func main() {
 				FooterTemplate:       u.FooterTemplate,
 				InjectSender:         u.InjectSender,
 				PlatformAllowFrom:    u.PlatformAllowFrom,
+				WorkspaceMode:        u.WorkspaceMode,
+				WorkspaceBaseDir:     u.WorkspaceBaseDir,
 			})
 		})
 		mgmtSrv.SetGetProjectConfig(config.GetProjectConfigDetails)

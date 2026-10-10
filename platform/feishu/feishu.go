@@ -2215,7 +2215,14 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 
 	if !core.AllowList(p.allowFrom, userID) {
 		slog.Debug(p.tag()+": message from unauthorized user", "user", userID)
-		p.replyUnauthorizedAccess(ctx, replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey})
+		// Announce the rejection only when the sender deliberately addressed
+		// the bot (p2p chat or explicit @mention). Group messages merely
+		// overheard via group_reply_all are dropped silently — replying to
+		// every unauthorized group member would flood the chat, and the
+		// unauthorized-chat branch below is silent for the same reason.
+		if chatType != "group" || isBotMentioned(msg.Mentions, p.getBotOpenID()) {
+			p.replyUnauthorizedAccess(ctx, replyContext{messageID: messageID, chatID: chatID, sessionKey: sessionKey})
+		}
 		return nil
 	}
 
@@ -2452,7 +2459,31 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 	case "post":
 		textParts, images := p.parsePostContent(messageID, content)
 		text := stripMentions(strings.Join(textParts, "\n"), mentions, p.getBotOpenID())
-		if text == "" && historyText == "" && len(images) == 0 && quoted.text == "" && len(quoted.images) == 0 {
+		// Top-level files[] of a rich-text post message were silently dropped
+		// before #1884 — the user could attach a file alongside text and the
+		// bot would only ever see the text. Reuse the existing file download
+		// helper to pull each non-folder attachment and surface it to the agent.
+		var postFiles []core.FileAttachment
+		for _, pf := range p.parsePostFiles(content) {
+			if pf.FileKey == "" || pf.IsFolder {
+				continue
+			}
+			fileData, err := p.downloadResource(messageID, pf.FileKey, "file")
+			if err != nil {
+				slog.Error(p.tag()+": download post file failed",
+					"error", err,
+					"file_key", pf.FileKey,
+					"file_name", pf.FileName,
+				)
+				continue
+			}
+			postFiles = append(postFiles, core.FileAttachment{
+				MimeType: detectMimeType(fileData),
+				Data:     fileData,
+				FileName: pf.FileName,
+			})
+		}
+		if text == "" && historyText == "" && len(images) == 0 && len(postFiles) == 0 && quoted.text == "" && len(quoted.images) == 0 {
 			return
 		}
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
@@ -2461,7 +2492,7 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
-			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...),
+			Content: text, ExtraContent: quoted.text, Images: append(quoted.images, images...), Files: postFiles,
 			ReplyCtx:          rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
@@ -3234,6 +3265,18 @@ func extractPostPlainText(content string) string {
 					lang := elem.Language
 					line = append(line, "```"+lang+"\n"+elem.Text+"\n```")
 				}
+			case "hr":
+				// Lark posts render an `hr` element as a horizontal rule;
+				// map it to a standalone markdown separator on its own line
+				// so the agent (and downstream markdown renderers) can
+				// recognize the boundary. We flush any pending line text
+				// first so the rule is not glued to surrounding text
+				// (issue #508; related #470/#472).
+				if len(line) > 0 {
+					parts = append(parts, strings.Join(line, ""))
+					line = line[:0]
+				}
+				parts = append(parts, "---")
 			}
 		}
 		if len(line) > 0 {
@@ -6601,9 +6644,16 @@ type postElement struct {
 	UserName string `json:"user_name,omitempty"`
 }
 
+type postFile struct {
+	FileKey  string `json:"file_key"`
+	FileName string `json:"file_name"`
+	IsFolder bool   `json:"is_folder,omitempty"`
+}
+
 type postLang struct {
 	Title   string          `json:"title"`
 	Content [][]postElement `json:"content"`
+	Files   []postFile      `json:"files"`
 }
 
 // parsePostContent handles both formats of feishu post content:
@@ -6624,6 +6674,24 @@ func (p *Platform) parsePostContent(messageID, raw string) ([]string, []core.Ima
 	}
 	slog.Error(p.tag()+": failed to parse post content", "raw", raw)
 	return nil, nil
+}
+
+// parsePostFiles extracts the top-level file attachments of a rich-text (post)
+// message, handling the same two content shapes as parsePostContent. Returns
+// nil when neither shape carries a files array. See issue #1884 — the post
+// body's top-level files[] was silently dropped before this helper existed.
+func (p *Platform) parsePostFiles(raw string) []postFile {
+	var flat postLang
+	if err := json.Unmarshal([]byte(raw), &flat); err == nil && (flat.Content != nil || flat.Files != nil) {
+		return flat.Files
+	}
+	var langMap map[string]postLang
+	if err := json.Unmarshal([]byte(raw), &langMap); err == nil {
+		for _, lang := range langMap {
+			return lang.Files
+		}
+	}
+	return nil
 }
 
 func (p *Platform) extractPostParts(messageID string, post *postLang) ([]string, []core.ImageAttachment) {
