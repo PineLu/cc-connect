@@ -3111,3 +3111,67 @@ func TestMgmt_ProjectWorkspaces_BindRejectsPathOutsideBaseDir(t *testing.T) {
 		t.Fatalf("error = %q, want escapes base_dir", r.Error)
 	}
 }
+
+// TestMgmt_ProjectWorkspaceModePersistenceInvariants checks PATCH against the
+// effective persisted configuration, not only fields present in the request.
+func TestMgmt_ProjectWorkspaceModePersistenceInvariants(t *testing.T) {
+	tests := []struct {
+		name       string
+		existing   map[string]any
+		patch      map[string]any
+		wantError  string
+		shouldSave bool
+	}{
+		{
+			name:      "cannot enable multi-workspace with legacy work_dir",
+			existing:  map[string]any{"work_dir": "/existing/project", "workspace_base_dir": "/existing/workspaces"},
+			patch:     map[string]any{"workspace_mode": "multi-workspace"},
+			wantError: "work_dir",
+		},
+		{
+			name:      "cannot clear base_dir with mode omitted",
+			existing:  map[string]any{"workspace_mode": "multi-workspace", "workspace_base_dir": "/existing/workspaces"},
+			patch:     map[string]any{"workspace_base_dir": ""},
+			wantError: "workspace_base_dir",
+		},
+		{
+			name:       "can clear legacy work_dir while enabling multi-workspace",
+			existing:   map[string]any{"work_dir": "/existing/project", "workspace_base_dir": "/existing/workspaces"},
+			patch:      map[string]any{"workspace_mode": "multi-workspace", "work_dir": ""},
+			shouldSave: true,
+		},
+		{
+			name:      "cannot add work_dir to already multi-workspace project",
+			existing:  map[string]any{"workspace_mode": "multi-workspace", "workspace_base_dir": "/existing/workspaces"},
+			patch:     map[string]any{"work_dir": "<valid-directory>"},
+			wantError: "work_dir",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mgmt, ts, _ := testManagementServer(t, "tok")
+			mgmt.SetGetProjectConfig(func(name string) map[string]any {
+				return tc.existing
+			})
+			saveCalled := false
+			mgmt.SetSaveProjectSettings(func(name string, patch ProjectSettingsUpdate) error {
+				saveCalled = true
+				return nil
+			})
+			if wd, ok := tc.patch["work_dir"].(string); ok && wd == "<valid-directory>" {
+				tc.patch["work_dir"] = t.TempDir()
+			}
+			res := mgmtPatch(t, ts.URL+"/api/v1/projects/test-project", "tok", tc.patch)
+			if tc.wantError != "" {
+				if res.OK || !strings.Contains(res.Error, tc.wantError) {
+					t.Fatalf("PATCH = %+v, want rejection mentioning %q", res, tc.wantError)
+				}
+				if saveCalled {
+					t.Fatal("invalid PATCH persisted despite rejection")
+				}
+			} else if !res.OK || !saveCalled {
+				t.Fatalf("valid PATCH = %+v; saved=%v", res, saveCalled)
+			}
+		})
+	}
+}

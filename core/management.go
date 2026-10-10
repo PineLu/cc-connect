@@ -149,10 +149,10 @@ type GlobalProviderInfo struct {
 		Model string `json:"model"`
 		Alias string `json:"alias,omitempty"`
 	} `json:"models,omitempty"`
-	Endpoints       map[string]string              `json:"endpoints,omitempty"`
-	AgentModels     map[string]string              `json:"agent_models,omitempty"`
-	AgentModelLists map[string][]GlobalModelEntry   `json:"agent_model_lists,omitempty"`
-	Codex           *GlobalCodexConfig              `json:"codex,omitempty"`
+	Endpoints       map[string]string             `json:"endpoints,omitempty"`
+	AgentModels     map[string]string             `json:"agent_models,omitempty"`
+	AgentModelLists map[string][]GlobalModelEntry `json:"agent_model_lists,omitempty"`
+	Codex           *GlobalCodexConfig            `json:"codex,omitempty"`
 }
 
 // GlobalModelEntry is a model entry inside AgentModelLists.
@@ -416,9 +416,9 @@ func (m *ManagementServer) handleStatus(w http.ResponseWriter, r *http.Request) 
 				info := ph.PlatformHealth()
 				if info.Degraded {
 					entry := map[string]any{
-						"name":    info.Name,
-						"reason":  info.DegradedReason,
-						"since":   info.DegradedSince,
+						"name":   info.Name,
+						"reason": info.DegradedReason,
+						"since":  info.DegradedSince,
 					}
 					degradedEntries = append(degradedEntries, entry)
 				}
@@ -780,25 +780,47 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 			}
 			*body.WorkspaceBaseDir = baseDir
 		}
-		if body.WorkspaceMode != nil {
-			wm := strings.TrimSpace(*body.WorkspaceMode)
-			if wm != "" && wm != "single" && wm != "multi-workspace" {
-				mgmtError(w, http.StatusBadRequest, fmt.Sprintf("invalid workspace_mode %q", wm))
-				return
+		// Validate the effective persisted configuration, including omitted PATCH
+		// fields. A mode switch and a base-dir-only edit must never persist a
+		// configuration that will fail validation at the next service restart.
+		if body.WorkspaceMode != nil || body.WorkspaceBaseDir != nil || body.WorkDir != nil {
+			var persisted map[string]any
+			if m.getProjectConfig != nil {
+				persisted = m.getProjectConfig(name)
 			}
-			if wm == "multi-workspace" {
-				effectiveBaseDir := ""
-				if body.WorkspaceBaseDir != nil {
-					effectiveBaseDir = *body.WorkspaceBaseDir
-				} else if m.getProjectConfig != nil {
-					if extra := m.getProjectConfig(name); extra != nil {
-						if bd, ok := extra["workspace_base_dir"].(string); ok {
-							effectiveBaseDir = bd
-						}
-					}
+			effectiveMode, _ := persisted["workspace_mode"].(string)
+			effectiveBaseDir, _ := persisted["workspace_base_dir"].(string)
+			effectiveWorkDir, _ := persisted["work_dir"].(string)
+			if persisted == nil {
+				// A test or management embedding without a config callback can
+				// still expose the current agent work directory.
+				if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
+					effectiveWorkDir = wd.GetWorkDir()
 				}
-				if strings.TrimSpace(effectiveBaseDir) == "" {
+			}
+			if body.WorkspaceMode != nil {
+				effectiveMode = strings.TrimSpace(*body.WorkspaceMode)
+				if effectiveMode == "single" {
+					effectiveMode = ""
+				}
+				if effectiveMode != "" && effectiveMode != "multi-workspace" {
+					mgmtError(w, http.StatusBadRequest, fmt.Sprintf("invalid workspace_mode %q", effectiveMode))
+					return
+				}
+			}
+			if body.WorkspaceBaseDir != nil {
+				effectiveBaseDir = strings.TrimSpace(*body.WorkspaceBaseDir)
+			}
+			if body.WorkDir != nil {
+				effectiveWorkDir = strings.TrimSpace(*body.WorkDir)
+			}
+			if effectiveMode == "multi-workspace" {
+				if effectiveBaseDir == "" {
 					mgmtError(w, http.StatusBadRequest, "workspace_base_dir is required to enable multi-workspace mode")
+					return
+				}
+				if effectiveWorkDir != "" {
+					mgmtError(w, http.StatusBadRequest, "multi-workspace mode conflicts with agent work_dir (clear work_dir first)")
 					return
 				}
 			}
@@ -889,6 +911,8 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 			}
 			if err := m.saveProjectSettings(name, patch); err != nil {
 				slog.Warn("management: failed to persist project settings", "project", name, "error", err)
+				mgmtError(w, http.StatusInternalServerError, "failed to persist project settings")
+				return
 			}
 		}
 
@@ -2124,10 +2148,10 @@ func (m *ManagementServer) handleCCSwitchProviders(w http.ResponseWriter, r *htt
 // applying per-agent-type overrides for base_url, model, and models.
 func resolveGlobalProviderForAgent(g GlobalProviderInfo, agentType string) ProviderConfig {
 	pc := ProviderConfig{
-		Name:   g.Name,
-		APIKey: g.APIKey,
+		Name:    g.Name,
+		APIKey:  g.APIKey,
 		BaseURL: g.BaseURL,
-		Model:  g.Model,
+		Model:   g.Model,
 	}
 	if ep, ok := g.Endpoints[agentType]; ok && ep != "" {
 		pc.BaseURL = ep
