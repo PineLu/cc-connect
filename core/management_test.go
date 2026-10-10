@@ -2162,6 +2162,104 @@ func TestMgmt_ProjectPatch_RejectsMissingWorkDirBeforeMutation(t *testing.T) {
 	}
 }
 
+// TestMgmt_ProjectPatch_SaveFailureLeavesRuntimeUnchanged ensures a reported
+// persistence failure cannot leave the active engine on settings that won't
+// survive restart.
+func TestMgmt_ProjectPatch_SaveFailureLeavesRuntimeUnchanged(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	agent := &stubWorkDirAgent{workDir: "/existing"}
+	e.agent = agent
+	e.SetAdminFrom("old-admin")
+	e.SetDisabledCommands([]string{"help"})
+	e.SetFooterTemplate("old-footer")
+	e.SetShowContextIndicator(true)
+
+	saveCalled := false
+	mgmt.SetSaveProjectSettings(func(_ string, _ ProjectSettingsUpdate) error {
+		saveCalled = true
+		if got := agent.GetWorkDir(); got != "/existing" {
+			t.Errorf("work_dir changed before persistence: %q", got)
+		}
+		if e.i18n.CurrentLang() != LangEnglish {
+			t.Error("language changed before persistence")
+		}
+		if e.footerTemplate != "old-footer" {
+			t.Errorf("footer changed before persistence: %q", e.footerTemplate)
+		}
+		return errors.New("simulated disk write failure")
+	})
+
+	result := mgmtPatch(t, ts.URL+"/api/v1/projects/test-project", "tok", map[string]any{
+		"language":               "zh",
+		"admin_from":             "new-admin",
+		"disabled_commands":      []string{"new"},
+		"work_dir":               t.TempDir(),
+		"show_context_indicator": false,
+		"footer_template":        "new-footer",
+	})
+	if !saveCalled {
+		t.Fatal("save callback was not invoked")
+	}
+	if result.OK || !strings.Contains(result.Error, "failed to persist") {
+		t.Fatalf("PATCH = %+v, want persistence failure", result)
+	}
+	if got := agent.GetWorkDir(); got != "/existing" {
+		t.Errorf("work_dir changed on failed save: %q", got)
+	}
+	if got := e.i18n.CurrentLang(); got != LangEnglish {
+		t.Errorf("language changed on failed save: %s", got)
+	}
+	e.userRolesMu.RLock()
+	admin := e.adminFrom
+	e.userRolesMu.RUnlock()
+	if admin != "old-admin" {
+		t.Errorf("admin_from changed on failed save: %q", admin)
+	}
+	if got := e.GetDisabledCommands(); len(got) != 1 || got[0] != "help" {
+		t.Errorf("disabled_commands changed on failed save: %v", got)
+	}
+	if e.footerTemplate != "old-footer" {
+		t.Errorf("footer changed on failed save: %q", e.footerTemplate)
+	}
+	if !e.showContextIndicator {
+		t.Error("show_context_indicator changed on failed save")
+	}
+}
+
+func TestMgmt_ProjectPatch_AppliesRuntimeAfterSuccessfulSave(t *testing.T) {
+	mgmt, ts, e := testManagementServer(t, "tok")
+	agent := &stubWorkDirAgent{workDir: "/existing"}
+	e.agent = agent
+	wantDir := t.TempDir()
+	saved := false
+	mgmt.SetSaveProjectSettings(func(_ string, update ProjectSettingsUpdate) error {
+		if got := agent.GetWorkDir(); got != "/existing" {
+			t.Errorf("work_dir changed before persistence: %q", got)
+		}
+		if e.i18n.CurrentLang() != LangEnglish {
+			t.Error("language changed before persistence")
+		}
+		if update.WorkDir == nil || *update.WorkDir != wantDir {
+			t.Errorf("incorrect persisted work_dir: %v", update.WorkDir)
+		}
+		saved = true
+		return nil
+	})
+	result := mgmtPatch(t, ts.URL+"/api/v1/projects/test-project", "tok", map[string]any{
+		"work_dir": wantDir,
+		"language": "zh",
+	})
+	if !result.OK || !saved {
+		t.Fatalf("PATCH = %+v, save called: %v", result, saved)
+	}
+	if got := agent.GetWorkDir(); got != wantDir {
+		t.Errorf("work_dir = %q, want %q", got, wantDir)
+	}
+	if got := e.i18n.CurrentLang(); got != LangChinese {
+		t.Errorf("language = %s, want zh", got)
+	}
+}
+
 func TestMgmt_ProjectPatch_DisabledCommands(t *testing.T) {
 	_, ts, e := testManagementServer(t, "tok")
 	r := mgmtPatch(t, ts.URL+"/api/v1/projects/test-project", "tok", map[string]any{

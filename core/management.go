@@ -826,6 +826,52 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 			}
 		}
 
+		restartRequired := false
+		if body.AgentType != nil && *body.AgentType != e.agent.Name() {
+			registered := ListRegisteredAgents()
+			found := false
+			for _, a := range registered {
+				if a == *body.AgentType {
+					found = true
+					break
+				}
+			}
+			if !found {
+				mgmtError(w, http.StatusBadRequest, fmt.Sprintf("unknown agent type %q", *body.AgentType))
+				return
+			}
+			restartRequired = true
+		}
+		if body.WorkspaceMode != nil || body.WorkspaceBaseDir != nil {
+			restartRequired = true
+		}
+
+		if m.saveProjectSettings != nil {
+			patch := ProjectSettingsUpdate{
+				Language:             body.Language,
+				AdminFrom:            body.AdminFrom,
+				DisabledCommands:     body.DisabledCommands,
+				WorkDir:              body.WorkDir,
+				Mode:                 body.Mode,
+				AgentType:            body.AgentType,
+				ShowContextIndicator: body.ShowContextIndicator,
+				ShowWorkdirIndicator: body.ShowWorkdirIndicator,
+				ReplyFooter:          body.ReplyFooter,
+				FooterTemplate:       body.FooterTemplate,
+				InjectSender:         body.InjectSender,
+				PlatformAllowFrom:    body.PlatformAllowFrom,
+				WorkspaceMode:        body.WorkspaceMode,
+				WorkspaceBaseDir:     body.WorkspaceBaseDir,
+			}
+			if err := m.saveProjectSettings(name, patch); err != nil {
+				slog.Warn("management: failed to persist project settings", "project", name, "error", err)
+				mgmtError(w, http.StatusInternalServerError, "failed to persist project settings")
+				return
+			}
+		}
+
+		// Update the active engine only after the configuration was saved.
+		// A persistence error must not leave runtime-only settings behind.
 		if body.Language != nil {
 			switch *body.Language {
 			case "en":
@@ -870,50 +916,6 @@ func (m *ManagementServer) handleProjectDetail(w http.ResponseWriter, r *http.Re
 		}
 		if body.InjectSender != nil {
 			e.SetInjectSender(*body.InjectSender)
-		}
-
-		restartRequired := false
-		if body.AgentType != nil && *body.AgentType != e.agent.Name() {
-			registered := ListRegisteredAgents()
-			found := false
-			for _, a := range registered {
-				if a == *body.AgentType {
-					found = true
-					break
-				}
-			}
-			if !found {
-				mgmtError(w, http.StatusBadRequest, fmt.Sprintf("unknown agent type %q", *body.AgentType))
-				return
-			}
-			restartRequired = true
-		}
-		if body.WorkspaceMode != nil || body.WorkspaceBaseDir != nil {
-			restartRequired = true
-		}
-
-		if m.saveProjectSettings != nil {
-			patch := ProjectSettingsUpdate{
-				Language:             body.Language,
-				AdminFrom:            body.AdminFrom,
-				DisabledCommands:     body.DisabledCommands,
-				WorkDir:              body.WorkDir,
-				Mode:                 body.Mode,
-				AgentType:            body.AgentType,
-				ShowContextIndicator: body.ShowContextIndicator,
-				ShowWorkdirIndicator: body.ShowWorkdirIndicator,
-				ReplyFooter:          body.ReplyFooter,
-				FooterTemplate:       body.FooterTemplate,
-				InjectSender:         body.InjectSender,
-				PlatformAllowFrom:    body.PlatformAllowFrom,
-				WorkspaceMode:        body.WorkspaceMode,
-				WorkspaceBaseDir:     body.WorkspaceBaseDir,
-			}
-			if err := m.saveProjectSettings(name, patch); err != nil {
-				slog.Warn("management: failed to persist project settings", "project", name, "error", err)
-				mgmtError(w, http.StatusInternalServerError, "failed to persist project settings")
-				return
-			}
 		}
 
 		resp := map[string]any{"message": "settings updated"}
