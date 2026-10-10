@@ -224,6 +224,26 @@ func TestMapSessionUpdate_toolCall(t *testing.T) {
 	}
 }
 
+func TestMapSessionUpdate_ACPToolCallUpdatesDoNotIncreaseUseCount(t *testing.T) {
+	payloads := []string{
+		`{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Bash","status":"pending"}}`,
+		`{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","title":"Bash","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"partial"}}]}}`,
+		`{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","title":"Bash","status":"completed","content":[{"type":"content","content":{"type":"text","text":"done"}}]}}`,
+		`{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"c2","title":"Read","status":"pending"}}`,
+	}
+	uses := 0
+	for _, payload := range payloads {
+		for _, ev := range mapSessionUpdate("", json.RawMessage(payload)) {
+			if ev.Type == core.EventToolUse {
+				uses++
+			}
+		}
+	}
+	if uses != 2 {
+		t.Fatalf("2 calls with multiple updates must count twice, got %d", uses)
+	}
+}
+
 func TestPickPermissionOptionID(t *testing.T) {
 	opts := []permissionOption{
 		{OptionID: "a", Kind: "allow_once"},

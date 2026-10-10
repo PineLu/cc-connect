@@ -832,10 +832,10 @@ max_attempts = 12    # 单条最多尝试 12 次
   name = "hermes-tujia"
   reply_footer = true
   show_context_indicator = true
-  footer_template = "{{.Model}} · ctx {{.Ctx}}% · {{.Elapsed}}"
+  footer_template = "{{.Model}} · ctx {{.Ctx}}%{{if .ToolCallsText}} · {{.ToolCallsText}}{{end}} · {{.Elapsed}}"
 ```
 
-可用模板变量：`{{.Model}}` `{{.Effort}}` `{{.Out}}` `{{.In}}` `{{.CW}}` `{{.CR}}` `{{.Ctx}}` `{{.Elapsed}}` `{{.Workdir}}`。
+可用模板变量：`{{.Model}}` `{{.Effort}}` `{{.Out}}` `{{.In}}` `{{.CW}}` `{{.CR}}` `{{.Ctx}}` `{{.Elapsed}}` `{{.Workdir}}` `{{.ToolCalls}}`（本回合工具请求次数，零次为空）和 `{{.ToolCallsText}}`（本地化后的完整工具次数标签，零次为空）。
 不设置则使用默认格式。模板 parse 失败自动回退默认格式。
 ## 7. 排障方法论与常用命令
 

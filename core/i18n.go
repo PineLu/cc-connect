@@ -195,6 +195,7 @@ const (
 	MsgStarting                  MsgKey = "starting"
 	MsgThinking                  MsgKey = "thinking"
 	MsgTool                      MsgKey = "tool"
+	MsgFooterToolCalls           MsgKey = "footer_tool_calls"
 	MsgToolResult                MsgKey = "tool_result"
 	MsgToolResultFmtStatus       MsgKey = "tool_result_fmt_status"
 	MsgToolResultFmtExit         MsgKey = "tool_result_fmt_exit"
@@ -340,8 +341,8 @@ const (
 	MsgModelCardSwitched     MsgKey = "model_card_switched"
 	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
 	MsgModelNotSupported     MsgKey = "model_not_supported"
-	MsgModelsNotSupported   MsgKey = "models_not_supported"
-	MsgModelsUsage          MsgKey = "models_usage"
+	MsgModelsNotSupported    MsgKey = "models_not_supported"
+	MsgModelsUsage           MsgKey = "models_usage"
 	MsgReasoningCurrent      MsgKey = "reasoning_current"
 	MsgReasoningChanged      MsgKey = "reasoning_changed"
 	MsgReasoningNotSupported MsgKey = "reasoning_not_supported"
@@ -720,6 +721,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "🔧 **工具 #%d: %s**\n---\n%s",
 		LangJapanese:           "🔧 **ツール #%d: %s**\n---\n%s",
 		LangSpanish:            "🔧 **Herramienta #%d: %s**\n---\n%s",
+	},
+	MsgFooterToolCalls: {
+		LangEnglish:            "tools %s",
+		LangChinese:            "工具 %s",
+		LangTraditionalChinese: "工具 %s",
+		LangJapanese:           "ツール %s",
+		LangSpanish:            "herramientas %s",
 	},
 	MsgToolResult: {
 		LangEnglish:            "📤 **%s**\n---\n%s",

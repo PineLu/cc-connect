@@ -352,6 +352,101 @@ func TestBuildClaudeStatusLineFooter_HideBothLines(t *testing.T) {
 	}
 }
 
+func TestFooterTemplateToolCallsAndEffort(t *testing.T) {
+	e := newLegacyFooterEngine()
+	e.i18n = NewI18n(LangEnglish)
+	e.SetFooterTemplate(`{{.Model}}{{if .Effort}} · effort:{{.Effort}}{{end}}{{if .ToolCalls}} · tools {{.ToolCalls}}{{end}}`)
+	agent := &stubFooterAgent{model: "claude-test", effort: "high"}
+	if got, want := e.buildReplyFooter(agent, nil, "", "", time.Time{}, 3), "claude-test · effort:high · tools 3"; got != want {
+		t.Fatalf("template with tools and effort = %q, want %q", got, want)
+	}
+	if got, want := e.buildReplyFooter(agent, nil, "", "", time.Time{}, 0), "claude-test · effort:high"; got != want {
+		t.Fatalf("zero tools must be omitted: %q, want %q", got, want)
+	}
+
+	session := &controllableAgentSession{
+		model:        "hermes-model",
+		contextUsage: &ContextUsage{ContextWindow: 200000, InputTokens: 200, OutputTokens: 100, UsedTokens: 1000},
+	}
+	if got := e.buildClaudeStatusLineFooter(nil, session, "", time.Time{}, 2); got != "hermes-model · tools 2" {
+		t.Fatalf("CCD template missing tool count or added unsupported effort: %q", got)
+	}
+	if got := e.composeRichStatusFooter(false, time.Now(), nil, session, "", 2); !strings.Contains(got, "tools 2") {
+		t.Fatalf("rich footer missing tool count: %q", got)
+	}
+	if got := e.composeRichStatusFooter(true, time.Now(), nil, session, "", 2); got != "" {
+		t.Fatalf("streaming rich card must not show premature footer: %q", got)
+	}
+}
+
+func TestStatusLineToolCallsZeroAndNonzero(t *testing.T) {
+	e := newClaudeFooterEngine()
+	session := &controllableAgentSession{
+		model:        "hermes-model",
+		contextUsage: &ContextUsage{ContextWindow: 100000, InputTokens: 200, OutputTokens: 100, UsedTokens: 5000},
+	}
+	positive := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{}, 4)
+	if !strings.Contains(positive, "ctx 5% · tools 4") {
+		t.Fatalf("tool count must appear in status line, got %q", positive)
+	}
+	zero := e.buildClaudeStatusLineFooter(nil, session, "/tmp/ws", time.Time{}, 0)
+	if strings.Contains(zero, "tools ") {
+		t.Fatalf("zero tool count should be hidden, got %q", zero)
+	}
+}
+
+func TestFooterToolCountLocalization(t *testing.T) {
+	tests := []struct {
+		lang Language
+		want string
+	}{
+		{LangEnglish, "tools 2"},
+		{LangChinese, "工具 2"},
+		{LangTraditionalChinese, "工具 2"},
+		{LangJapanese, "ツール 2"},
+		{LangSpanish, "herramientas 2"},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.lang), func(t *testing.T) {
+			e := newClaudeFooterEngine()
+			e.ctx = context.Background()
+			e.i18n = NewI18n(tc.lang)
+			e.SetShowWorkdirIndicator(false)
+			agent := &stubFooterAgent{model: "test-model"}
+			session := &controllableAgentSession{
+				model: "test-model",
+				contextUsage: &ContextUsage{
+					ContextWindow: 100000,
+					InputTokens:   100,
+					OutputTokens:  50,
+					UsedTokens:    500,
+				},
+			}
+
+			for name, got := range map[string]string{
+				"legacy": e.buildReplyFooter(agent, nil, "", "", time.Time{}, 2),
+				"status": e.buildClaudeStatusLineFooter(agent, session, "", time.Time{}, 2),
+				"rich":   e.composeRichStatusFooter(false, time.Now(), agent, session, "", 2),
+			} {
+				if !strings.Contains(got, tc.want) {
+					t.Errorf("%s footer %q missing localized %q", name, got, tc.want)
+				}
+				if strings.Count(got, tc.want) != 1 {
+					t.Errorf("%s footer %q should have exactly one count segment", name, got)
+				}
+			}
+
+			e.SetFooterTemplate("{{.Model}}{{if .ToolCallsText}} · {{.ToolCallsText}}{{end}}")
+			if got := e.buildClaudeStatusLineFooter(agent, session, "", time.Time{}, 2); got != "test-model · "+tc.want {
+				t.Fatalf("localized template = %q", got)
+			}
+			if got := e.buildClaudeStatusLineFooter(agent, session, "", time.Time{}, 0); got != "test-model" {
+				t.Fatalf("zero tools should not display localized label: %q", got)
+			}
+		})
+	}
+}
+
 // ── buildReplyFooter (legacy single-line) toggle matrix ───────────────────────
 
 // stubFooterAgent is a minimal Agent that exposes GetModel/GetReasoningEffort/

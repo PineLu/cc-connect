@@ -1059,7 +1059,7 @@ func (e *Engine) SetReplyFooterEnabled(show bool) {
 
 // SetFooterTemplate sets a Go text/template for the CCD-style reply footer.
 // Available placeholders: {{.Model}}, {{.Effort}}, {{.Out}}, {{.In}},
-// {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}.
+// {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}, {{.ToolCalls}}.
 // Empty string resets to the built-in default format.
 func (e *Engine) SetFooterTemplate(tmpl string) {
 	e.footerTemplate = tmpl
@@ -6244,9 +6244,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						footerContext = fmt.Sprintf("[ctx: ~%d%%]", selfPct)
 					}
 				}
-				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir, turnStart); status != "" {
+				if status := e.buildClaudeStatusLineFooter(replyAgent, state.agentSession, workspaceDir, turnStart, toolCount); status != "" {
 					statusFooter = status
-				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext, turnStart); footer != "" {
+				} else if footer := e.buildReplyFooter(replyAgent, state.agentSession, workspaceDir, footerContext, turnStart, toolCount); footer != "" {
 					statusFooter = footer
 					legacyStatusFooter = footer
 				}
@@ -6300,16 +6300,15 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					cardBody = strings.TrimRight(cardAnswerText.String(), " \t\r\n")
 				}
 				finalContent := buildCardContent(cardThinkingText, cardToolCalls, cardBody)
+				if !isSilent && statusFooter != "" {
+					finalContent = appendReplyFooter(finalContent, statusFooter)
+				}
 				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
 					slog.Error("streaming card finalize failed, sending fallback", "error", err)
 					// Fallback: send the response as a normal message — but never
 					// for a silent reply, which has no deliverable content.
-					if !isSilent {
-						for _, chunk := range splitFinalReply(p, fullResponse) {
-							if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
-								return
-							}
-						}
+					if !isSilent && !e.sendFinalWithOutbox(sessionKey, e.ctx, p, replyCtx, fullResponse, statusFooter, sendWorkspaceWithError) {
+						return
 					}
 				}
 				if isSilent {
@@ -6339,7 +6338,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						silentBody = strings.TrimRight(stripped, " \t\r\n")
 					}
 					if silentBody != "" || len(toolSteps) > 0 {
-						card := buildResolvedRichCard(CardStatusDone, "", toolSteps, silentBody, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+						card := buildResolvedRichCard(CardStatusDone, "", toolSteps, silentBody, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir, toolCount))
 						if updater, ok := p.(MessageUpdater); ok {
 							if err := updater.UpdateMessage(e.ctx, cardMessageID, card); err != nil {
 								slog.Debug("rich card: failed to finalize card on silent reply", "platform", p.Name(), "error", err)
@@ -6360,8 +6359,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				if splitter, ok := p.(MarkdownTableSplitter); ok {
 					parts = splitter.SplitMarkdownByTables(fullResponse, 5)
 				}
-				richStatusFooter := e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir)
-				if legacyStatusFooter != "" {
+				richStatusFooter := e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir, toolCount)
+				if e.footerTemplate != "" && statusFooter != "" {
+					// Custom templates define the entire footer, including tool count.
+					richStatusFooter = statusFooter
+				} else if legacyStatusFooter != "" {
 					richStatusFooter = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang()) + "\n" + legacyStatusFooter
 				}
 				finalBody := resolveRichCardMarkdown(parts[0], true)
@@ -6663,7 +6665,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			state.mu.Unlock()
 			if hasRichCard && cardMessageID != nil {
-				errCard := buildResolvedRichCard(CardStatusError, "", toolSteps, partialText, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir))
+				errCard := buildResolvedRichCard(CardStatusError, "", toolSteps, partialText, false, e.composeRichStatusFooter(false, turnStart, e.agent, state.agentSession, state.workspaceDir, toolCount))
 				if updater, ok := p.(MessageUpdater); ok {
 					if err := updater.UpdateMessage(e.ctx, cardMessageID, errCard); err != nil {
 						slog.Debug("rich card: failed to update error card", "platform", p.Name(), "error", err)
@@ -7778,11 +7780,13 @@ func (e *Engine) commandWorkDir(agent Agent, msg *Message) string {
 // contextLeft is the legacy status text (e.g. "[ctx: ~7%]" or "100% left"); it
 // is used as a fallback source for {{.Ctx}} when the session exposes no real
 // context usage.
-func (e *Engine) buildFooterTemplateData(session AgentSession, agent Agent, workspaceDir, contextLeft string, turnStart time.Time) footerTemplateData {
+func (e *Engine) buildFooterTemplateData(session AgentSession, agent Agent, workspaceDir, contextLeft string, turnStart time.Time, toolCount int) footerTemplateData {
 	data := footerTemplateData{
-		Model:   strings.TrimSpace(replyFooterModel(session, agent)),
-		Effort:  strings.TrimSpace(replyFooterReasoningEffort(session, agent)),
-		Workdir: replyFooterWorkDir(session, agent, workspaceDir),
+		Model:         strings.TrimSpace(replyFooterModel(session, agent)),
+		Effort:        strings.TrimSpace(replyFooterReasoningEffort(session, agent)),
+		Workdir:       replyFooterWorkDir(session, agent, workspaceDir),
+		ToolCalls:     formatFooterToolCalls(toolCount),
+		ToolCallsText: e.footerToolCallsSegment(toolCount),
 	}
 	if !turnStart.IsZero() {
 		data.Elapsed = formatElapsed(time.Since(turnStart), false, e.i18n.currentLang())
@@ -7825,10 +7829,11 @@ func (e *Engine) buildFooterTemplateData(session AgentSession, agent Agent, work
 	return data
 }
 
-func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string, turnStart time.Time) string {
+func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDir string, contextLeft string, turnStart time.Time, toolCounts ...int) string {
 	if !e.replyFooterEnabled || agent == nil {
 		return ""
 	}
+	toolCount := footerToolCount(toolCounts)
 
 	// A user-supplied footer template takes precedence over the built-in legacy
 	// format: when configured, it fully defines the footer and its own {{if}}
@@ -7836,7 +7841,7 @@ func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDi
 	// falls through to the legacy format below, matching the graceful
 	// degradation used by buildClaudeStatusLineFooter.
 	if e.footerTemplate != "" {
-		if s := e.renderFooterTemplate(e.buildFooterTemplateData(session, agent, workspaceDir, contextLeft, turnStart)); s != "" {
+		if s := e.renderFooterTemplate(e.buildFooterTemplateData(session, agent, workspaceDir, contextLeft, turnStart, toolCount)); s != "" {
 			return s
 		}
 	}
@@ -7867,6 +7872,10 @@ func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDi
 			parts = append(parts, usage)
 			hasStatus = true
 		}
+		if tools := e.footerToolCallsSegment(toolCount); tools != "" {
+			parts = append(parts, tools)
+			hasStatus = true
+		}
 	}
 	if e.showWorkdirIndicator {
 		if dir := replyFooterWorkDir(session, agent, workspaceDir); dir != "" {
@@ -7886,14 +7895,14 @@ func (e *Engine) buildReplyFooter(agent Agent, session AgentSession, workspaceDi
 // RichCardSupporter.BuildRichCard. Layout (skipping any empty line):
 //
 //	line 1: ⏱ <i18n elapsed>                                  (subject to e.replyFooterEnabled)
-//	line 2: model · out N · in N cw N cr N · ctx N%           (subject to e.showContextIndicator)
+//	line 2: model · out N · in N cw N cr N · ctx N% · tools N (subject to e.showContextIndicator)
 //	line 3: <workdir>                                         (subject to e.showWorkdirIndicator)
 //
 // Returns "" when the master replyFooterEnabled toggle is off, or while the
 // turn is still streaming (footer represents finalized turn metadata —
 // token counts aren't yet settled and a live-updating elapsed line creates
 // visual noise during streaming. Header status badge already signals "Working").
-func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, agent Agent, session AgentSession, workspaceDir string) string {
+func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, agent Agent, session AgentSession, workspaceDir string, toolCounts ...int) string {
 	if !e.replyFooterEnabled {
 		return ""
 	}
@@ -7911,6 +7920,9 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 		model := replyFooterModel(session, agent)
 		effort := replyFooterReasoningEffort(session, agent)
 		if line := buildClaudeStatusLineFooter(model, effort, usage); line != "" {
+			if tools := e.footerToolCallsSegment(footerToolCount(toolCounts)); tools != "" {
+				line += " · " + tools
+			}
 			lines = append(lines, line)
 		} else if fallback := e.replyFooterUsageText(session, agent); fallback != "" {
 			// fallback for non-claudecode agents that still expose UsageReporter
@@ -7922,7 +7934,12 @@ func (e *Engine) composeRichStatusFooter(streaming bool, turnStart time.Time, ag
 				parts = append(parts, effort)
 			}
 			parts = append(parts, fallback)
+			if tools := e.footerToolCallsSegment(footerToolCount(toolCounts)); tools != "" {
+				parts = append(parts, tools)
+			}
 			lines = append(lines, strings.Join(parts, " · "))
+		} else if tools := e.footerToolCallsSegment(footerToolCount(toolCounts)); tools != "" {
+			lines = append(lines, tools)
 		}
 	}
 
@@ -8297,7 +8314,7 @@ func replyFooterHomeRelativePath(path, home string) (string, bool) {
 // buildClaudeStatusLineFooter renders a CCD-statusline-style footer for the
 // reply, composed of two lines:
 //
-//	line 1 (controlled by show_context_indicator): <model id> · [effort:X ·] out N · in N cw N cr N · ctx N% · elapsed
+//	line 1 (controlled by show_context_indicator): <model id> · [effort:X ·] out N · in N cw N cr N · ctx N% · tools N · elapsed
 //	line 2 (controlled by show_workdir_indicator): <workspace dir>
 //
 // If e.footerTemplate is set, the footer is rendered via Go text/template
@@ -8306,7 +8323,7 @@ func replyFooterHomeRelativePath(path, home string) (string, bool) {
 // Returns "" if reply_footer is disabled, or if the active session does not
 // expose per-turn cache-token data (i.e. this is not claudecode or no result
 // event has arrived yet) so callers fall back to the default footer.
-func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string, turnStart time.Time) string {
+func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, workspaceDir string, turnStart time.Time, toolCounts ...int) string {
 	if !e.replyFooterEnabled {
 		return ""
 	}
@@ -8372,15 +8389,17 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 	// Template path: render via user-supplied Go template.
 	if e.footerTemplate != "" {
 		data := footerTemplateData{
-			Model:   model,
-			Effort:  effort,
-			Out:     outStr,
-			In:      inStr,
-			CW:      cwStr,
-			CR:      crStr,
-			Ctx:     ctxPct,
-			Elapsed: elapsed,
-			Workdir: workdir,
+			Model:         model,
+			Effort:        effort,
+			Out:           outStr,
+			In:            inStr,
+			CW:            cwStr,
+			CR:            crStr,
+			Ctx:           ctxPct,
+			Elapsed:       elapsed,
+			Workdir:       workdir,
+			ToolCalls:     formatFooterToolCalls(footerToolCount(toolCounts)),
+			ToolCallsText: e.footerToolCallsSegment(footerToolCount(toolCounts)),
 		}
 		if s := e.renderFooterTemplate(data); s != "" {
 			return s
@@ -8420,6 +8439,9 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 		if used > 0 {
 			line1Parts = append(line1Parts, fmt.Sprintf("ctx %s%%", ctxPct))
 		}
+		if tools := e.footerToolCallsSegment(footerToolCount(toolCounts)); tools != "" {
+			line1Parts = append(line1Parts, tools)
+		}
 		if elapsed != "" {
 			line1Parts = append(line1Parts, elapsed)
 		}
@@ -8446,21 +8468,53 @@ func (e *Engine) buildClaudeStatusLineFooter(agent Agent, session AgentSession, 
 // footerTemplateData holds the placeholder values available to a custom
 // footer template. All fields are pre-formatted strings ready for display.
 type footerTemplateData struct {
-	Model   string // model id (e.g. "claude-opus-4-7[1m]")
-	Effort  string // reasoning effort (e.g. "xhigh"), empty if unset
-	Out     string // output token count (e.g. "1.2k")
-	In      string // input token count
-	CW      string // cache-creation input token count
-	CR      string // cached-input token count
-	Ctx     string // context-window percentage (e.g. "4%")
-	Elapsed string // elapsed wall-clock since turn start (e.g. "12s")
-	Workdir string // workspace directory path
+	Model         string // model id (e.g. "claude-opus-4-7[1m]")
+	Effort        string // reasoning effort (e.g. "xhigh"), empty if unset
+	Out           string // output token count (e.g. "1.2k")
+	In            string // input token count
+	CW            string // cache-creation input token count
+	CR            string // cached-input token count
+	Ctx           string // context-window percentage (e.g. "4%")
+	Elapsed       string // elapsed wall-clock since turn start (e.g. "12s")
+	Workdir       string // workspace directory path
+	ToolCalls     string // number of tool requests in this turn; empty when zero
+	ToolCallsText string // localized full label and count (e.g. "tools 3"); empty when zero
+}
+
+// Zero calls are omitted, including in optional custom footer templates.
+func formatFooterToolCalls(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
+
+// footerToolCallsSegment is user-visible; keep its label consistent with the
+// configured language while retaining the raw numeric ToolCalls template field.
+func (e *Engine) footerToolCallsSegment(n int) string {
+	count := formatFooterToolCalls(n)
+	if count == "" {
+		return ""
+	}
+	i18n := e.i18n
+	if i18n == nil {
+		i18n = NewI18n(LangEnglish)
+	}
+	return i18n.Tf(MsgFooterToolCalls, count)
+}
+
+// Existing test callers can omit the per-turn count.
+func footerToolCount(counts []int) int {
+	if len(counts) == 0 {
+		return 0
+	}
+	return counts[0]
 }
 
 // defaultFooterTemplate is the built-in Go template equivalent to the
 // hard-coded footer format. It is used as a reference and could be offered
 // as a starting point for users who want to customise.
-const defaultFooterTemplate = `{{if .Model}}{{.Model}}{{end}}{{if .Effort}} · effort:{{.Effort}}{{end}}{{if .Out}} · out {{.Out}}{{end}} · in {{.In}}{{if ne .CW "0"}} cw {{.CW}}{{end}}{{if ne .CR "0"}} cr {{.CR}}{{end}}{{if .Ctx}} · ctx {{.Ctx}}{{end}}{{if .Elapsed}} · {{.Elapsed}}{{end}}{{if .Workdir}}
+const defaultFooterTemplate = `{{if .Model}}{{.Model}}{{end}}{{if .Effort}} · effort:{{.Effort}}{{end}}{{if .Out}} · out {{.Out}}{{end}} · in {{.In}}{{if ne .CW "0"}} cw {{.CW}}{{end}}{{if ne .CR "0"}} cr {{.CR}}{{end}}{{if .Ctx}} · ctx {{.Ctx}}{{end}}{{if .ToolCallsText}} · {{.ToolCallsText}}{{end}}{{if .Elapsed}} · {{.Elapsed}}{{end}}{{if .Workdir}}
 {{.Workdir}}{{end}}`
 
 // renderFooterTemplate parses (lazily) and executes e.footerTemplate with the

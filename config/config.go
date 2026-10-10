@@ -545,11 +545,12 @@ type ProjectConfig struct {
 	ShowWorkdirIndicator *bool `toml:"show_workdir_indicator,omitempty"`
 	// ReplyFooter: nil/true = render the reply footer; false = disable it
 	// entirely (the per-line indicator flags above become no-ops).
-	ReplyFooter      *bool        `toml:"reply_footer,omitempty"`
+	ReplyFooter *bool `toml:"reply_footer,omitempty"`
 	// FooterTemplate is a Go text/template string for the CCD-style reply footer.
 	// Available placeholders: {{.Model}}, {{.Effort}}, {{.Out}},
-	// {{.In}}, {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}}.
-	FooterTemplate *string `toml:"footer_template,omitempty"`
+	// {{.In}}, {{.CW}}, {{.CR}}, {{.Ctx}}, {{.Elapsed}}, {{.Workdir}},
+	// {{.ToolCalls}} (empty for turns without tool calls).
+	FooterTemplate   *string      `toml:"footer_template,omitempty"`
 	InjectSender     *bool        `toml:"inject_sender,omitempty"`     // prepend sender identity (platform + user ID) to each message sent to the agent
 	DisabledCommands []string     `toml:"disabled_commands,omitempty"` // commands to disable for this project (e.g. ["restart", "upgrade"])
 	AdminFrom        string       `toml:"admin_from,omitempty"`        // comma-separated user IDs allowed to run privileged commands; "*" = all allowed users

@@ -1377,9 +1377,49 @@ func TestProcessInteractiveEvents_ToolSegmentsKeepFinalFooter(t *testing.T) {
 		t.Fatal("sent = nil, want final reply")
 	}
 	final := sent[len(sent)-1]
-	want := "已处理完成。\n\n*[ctx: ~14%] · glm-5.1 · " + compactReplyFooterPath(workDir) + "*"
+	want := "已处理完成。\n\n*[ctx: ~14%] · glm-5.1 · tools 1 · " + compactReplyFooterPath(workDir) + "*"
 	if final != want {
 		t.Fatalf("final reply = %q, want %q\nall sent = %#v", final, want, sent)
+	}
+}
+
+func TestProcessInteractiveEvents_HiddenToolCountResetsEachTurn(t *testing.T) {
+	agent := &stubFooterAgent{model: "glm-test"}
+	p := &stubPlatformEngine{n: "telegram"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetReplyFooterEnabled(true)
+	e.SetShowContextIndicator(true)
+	e.SetShowWorkdirIndicator(false)
+	e.SetDisplayConfig(DisplayCfg{ToolMessages: false})
+
+	sessionKey := "telegram:hidden-tools"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("hidden-tools")
+	state := &interactiveState{agentSession: agentSession, platform: p, replyCtx: "reply", agent: agent}
+	e.interactiveStates[sessionKey] = state
+
+	for _, name := range []string{"Read", "Bash", "Write"} {
+		agentSession.events <- Event{Type: EventToolUse, ToolName: name}
+		agentSession.events <- Event{Type: EventToolResult, ToolName: name}
+	}
+	agentSession.events <- Event{Type: EventResult, Content: "first", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "msg1", time.Now(), nil, nil, state.replyCtx, 0)
+
+	sent := p.getSent()
+	if len(sent) != 1 || !strings.Contains(sent[0], "tools 3") {
+		t.Fatalf("hidden tool progress must still be counted once per tool: %#v", sent)
+	}
+	for _, name := range []string{"Read", "Bash", "Write"} {
+		if strings.Contains(sent[0], name) {
+			t.Errorf("tool name %q leaked into hidden progress reply %q", name, sent[0])
+		}
+	}
+
+	agentSession.events <- Event{Type: EventResult, Content: "second", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "msg2", time.Now(), nil, nil, state.replyCtx, 0)
+	sent = p.getSent()
+	if len(sent) != 2 || !strings.Contains(sent[1], "second") || strings.Contains(sent[1], "tools ") {
+		t.Fatalf("next turn with zero tools must not carry prior count: %#v", sent)
 	}
 }
 
@@ -4705,7 +4745,6 @@ func TestCmdModel_DoesNotClaimSuccessWhenModelSaveFails(t *testing.T) {
 		t.Fatalf("reply = %q, want model change failure message", sent[0])
 	}
 }
-
 
 func TestHandleModelsCardAction_MultiWorkspaceUsesBoundAgentType(t *testing.T) {
 	p := &stubPlatformEngine{n: "feishu"}
@@ -16574,9 +16613,10 @@ func TestAgentSystemPrompt_DocumentsAudioVideoFlags(t *testing.T) {
 // recordingStreamCard captures the content passed to Finalize so tests can
 // assert what was rendered into the card.
 type recordingStreamCard struct {
-	mu      sync.Mutex
-	final   bool
-	content string
+	mu          sync.Mutex
+	final       bool
+	content     string
+	finalizeErr error
 }
 
 func (c *recordingStreamCard) Update(_ context.Context, _ string) error { return nil }
@@ -16585,7 +16625,7 @@ func (c *recordingStreamCard) Finalize(_ context.Context, content string) error 
 	c.final = true
 	c.content = content
 	c.mu.Unlock()
-	return nil
+	return c.finalizeErr
 }
 func (c *recordingStreamCard) Failed() bool { return false }
 func (c *recordingStreamCard) finalized() bool {
@@ -16643,6 +16683,48 @@ func TestProcessInteractiveEvents_StreamingCard_BareNoReply_Suppressed(t *testin
 	}
 	if strings.Contains(card.finalContent(), "NO_REPLY") {
 		t.Fatalf("silent reply leaked NO_REPLY into the streaming card: %q", card.finalContent())
+	}
+}
+
+// A failed card finalization must use the same footer-aware delivery path
+// as ordinary final replies, including the per-turn tool count.
+func TestProcessInteractiveEvents_StreamingCardFinalizeFailurePreservesFooter(t *testing.T) {
+	card := &recordingStreamCard{finalizeErr: errors.New("card update failed")}
+	p := &recordingStreamCardPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "slack"},
+		card:               card,
+	}
+	agent := &stubFooterAgent{model: "test-model"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetReplyFooterEnabled(true)
+	e.SetShowContextIndicator(true)
+	e.SetShowWorkdirIndicator(false)
+	e.SetDisplayConfig(DisplayCfg{ToolMessages: false})
+
+	key := "slack:stream-card-finalize-failure"
+	session := e.sessions.GetOrCreateActive(key)
+	agentSession := newControllableSession("s-stream-card-finalize-failure")
+	state := &interactiveState{agentSession: agentSession, platform: p, replyCtx: "ctx", agent: agent}
+	e.interactiveStates[key] = state
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "pwd"}
+	agentSession.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "ok"}
+	agentSession.events <- Event{Type: EventResult, Content: "answer", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, key, "msg", time.Now(), nil, nil, state.replyCtx, 0)
+
+	if !card.finalized() {
+		t.Fatal("Finalize must have been attempted")
+	}
+	sent := p.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("fallback sent %d messages, want 1: %q", len(sent), sent)
+	}
+	for _, want := range []string{"answer", "test-model", "tools 1"} {
+		if !strings.Contains(sent[0], want) {
+			t.Errorf("fallback lost %q: %q", want, sent[0])
+		}
+	}
+	if strings.Count(sent[0], "tools 1") != 1 {
+		t.Errorf("tool count should appear once, got %q", sent[0])
 	}
 }
 
