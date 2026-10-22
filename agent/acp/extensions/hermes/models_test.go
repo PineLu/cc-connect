@@ -74,18 +74,7 @@ func TestListModelsDetail_Hermes(t *testing.T) {
 	writeHermesProfile(t, home)
 	t.Setenv("HERMES_HOME", home)
 
-	agent, err := New(map[string]any{
-		"command": "sh",
-		"args":    []any{"-p", "tujia", "acp"},
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	lister, ok := agent.(core.ModelLister)
-	if !ok {
-		t.Fatal("acp agent does not implement core.ModelLister")
-	}
-	got := lister.ListModelsDetail(t.Context())
+	got := ListModels(t.Context(), []string{"-p", "tujia", "acp"})
 
 	byCommand := map[string]core.ModelDetail{}
 	for _, d := range got {
@@ -147,14 +136,7 @@ func TestListModelsDetail_MultipleCustomProvidersDoNotShareCache(t *testing.T) {
 	}
 	t.Setenv("HERMES_HOME", home)
 
-	agent, err := New(map[string]any{
-		"command": "sh",
-		"args":    []any{"-p", "tujia", "acp"},
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	got := agent.(core.ModelLister).ListModelsDetail(t.Context())
+	got := ListModels(t.Context(), []string{"-p", "tujia", "acp"})
 
 	byCommand := map[string]core.ModelDetail{}
 	for _, d := range got {
@@ -186,11 +168,7 @@ func TestListModelsDetail_MultipleCustomProvidersDoNotShareCache(t *testing.T) {
 
 func TestListModelsDetail_MissingProfile(t *testing.T) {
 	t.Setenv("HERMES_HOME", filepath.Join(t.TempDir(), "does-not-exist"))
-	agent, err := New(map[string]any{"command": "sh", "args": []any{"-p", "tujia", "acp"}})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	if got := agent.(core.ModelLister).ListModelsDetail(t.Context()); len(got) != 0 {
+	if got := ListModels(t.Context(), []string{"-p", "tujia", "acp"}); len(got) != 0 {
 		t.Fatalf("expected no models for a missing profile, got %d", len(got))
 	}
 }
