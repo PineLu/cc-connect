@@ -125,11 +125,21 @@ func acpSwitchCommand(prefix, model string) string {
 
 var _ core.ModelLister = (*Agent)(nil)
 
+// ListModelsDetail dispatches optional model discovery. Generic ACP must never
+// read Hermes local configuration; an unconfigured model provider returns no list.
 // ListModelsDetail implements core.ModelLister for Hermes-backed ACP agents.
 // It reads the Hermes profile's own config.yaml and provider_models_cache.json
 // directly — no network, no LLM — so it still answers while the currently
 // selected model is unreachable.
 func (a *Agent) ListModelsDetail(ctx context.Context) []core.ModelDetail {
+	a.mu.RLock()
+	extension := a.modelExtension
+	a.mu.RUnlock()
+	if extension == "generic" { return nil }
+	return a.listHermesModels(ctx)
+}
+
+func (a *Agent) listHermesModels(ctx context.Context) []core.ModelDetail {
 	a.mu.RLock()
 	args := append(append([]string(nil), a.cliExtraArgs...), a.args...)
 	a.mu.RUnlock()
