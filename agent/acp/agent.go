@@ -28,6 +28,7 @@ type Agent struct {
 	sessionEnv   []string
 	authMethod   string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
 	displayName  string // optional, for doctor (default "ACP")
+	modelExtension string // model discovery backend: "hermes" or "generic"
 
 	// mode is the pending permission mode to apply to new sessions.
 	// When set, StartSession applies it via session/set_mode right after
@@ -107,6 +108,13 @@ func New(opts map[string]any) (core.Agent, error) {
 	if displayName == "" {
 		displayName = "ACP"
 	}
+	modelExtension, _ := opts["extension"].(string)
+	modelExtension = strings.ToLower(strings.TrimSpace(modelExtension))
+	// Legacy default retains existing Hermes /models behaviour until projects migrate.
+	if modelExtension == "" { modelExtension = "hermes" }
+	if modelExtension != "hermes" && modelExtension != "generic" {
+		return nil, fmt.Errorf("acp: unsupported extension %q (expected hermes or generic)", modelExtension)
+	}
 	mode, _ := opts["mode"].(string)
 	mode = strings.TrimSpace(mode)
 	compressCommand, _ := opts["compress_command"].(string)
@@ -123,6 +131,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		extraEnv:        extra,
 		authMethod:      authMethod,
 		displayName:     displayName,
+		modelExtension: modelExtension,
 		mode:            mode,
 		compressCommand: compressCommand,
 		modelCommand:    modelCommand,
@@ -229,6 +238,7 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 		}
 		opts["env"] = env
 	}
+	if a.modelExtension != "" { opts["extension"] = a.modelExtension }
 	if a.authMethod != "" {
 		opts["auth_method"] = a.authMethod
 	}
