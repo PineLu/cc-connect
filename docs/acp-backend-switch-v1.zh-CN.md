@@ -7,14 +7,14 @@
 | 后端 | ACP CLI | extension | 其他 |
 | --- | --- | --- | --- |
 | Hermes | hermes -p tujia acp | hermes | 首次纳管时保留现有 mode、model_command、compress_command |
-| CodeBuddy | /opt/homebrew/bin/codebuddy --acp | generic | 原生模型/压缩命令不继承 Hermes |
-| QoderCN | ~/.local/bin/qoderclicn --acp | generic | 原生模型/压缩命令不继承 Hermes |
+| CodeBuddy | /opt/homebrew/bin/codebuddy --acp | generic | 模型目录与 session/set_model 使用标准 ACP；compact 由服务端公告动态启用 |
+| QoderCN | ~/.local/bin/qoderclicn --acp | generic | 模型目录与 session/set_model 使用标准 ACP；模型展示用名称，切换用 ID |
 
 2026-10-23 在本机核验：CodeBuddy 2.158.0 和 QoderCN 1.1.76 均通过 stdio ACP initialize 握手。这只证明基础协议握手，不证明 session/new、prompt、permissions、session/load 或工具调用都可用。正式切换后需在飞书实测。
 
 ## 命令
 
-在开发分支 worktree 根目录执行：
+在 cc-connect 主工作区根目录执行（无独立 worktree）：
 
 ~~~sh
 ./tools/cc-acp status
@@ -54,4 +54,12 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 ./tools/cc-acp use qodercn --dry-run
 ~~~
 
-切换后的实测顺序：cc-acp status；飞书普通对话；/models（Generic 模式可能没有离线列表）；工具权限与会话恢复；切回 Hermes 并测试 /models 的列表。三个后端均可通过 check，但真实对话验证是独立验收门禁。
+切换后的实测顺序：cc-acp status；飞书普通对话；/models；选择模型并验证回复；/compact（只有 ACP 服务端正式公告 compact 时开放，须核验真实历史压缩）；工具权限与会话恢复；切回 Hermes 并测试 /models 的列表。三个后端均可通过 check，但真实对话验证是独立验收门禁。
+
+## Generic ACP 模型与压缩（2026-10-23）
+
+- CodeBuddy 2.158.0 与 QoderCN 1.1.76 的实际 ACP `session/new` 返回 `models.availableModels`，分别有 20、11 个模型，两个后端的当前模型 `session/set_model` 同 ID RPC 均成功。
+- cc-connect 在 `session/new|load` 缓存模型 ID、显示名、描述；每个存活会话保留自己的当前模型。飞书 `/models` 采用显示名，模型切换发送真实 `modelId`，RPC 失败不报成功；Hermes 仍走专属扩展。
+- CodeBuddy 的 ACP `available_commands_update` 确认公告 `compact`。Generic 只有收到公告后才开放 `/compact`；不依赖厂商名称和额外的预设配置。
+- 隔离空会话 `/compact` 可返回协议 `end_turn`，但非空历史测试尚未完成一个可验证的初始回合，**真正减少上下文 token 尚未验收**。飞书实测前不得声称完整压缩 PASS。
+- 飞书脚注请给 `Ctx` 加空值判断；目标项目的 `footer_template` 必须包含 `{{if .Ctx}} · ctx {{.Ctx}}%{{end}}`，不能直接固定拼接 `ctx {{.Ctx}}%`，否则 QoderCN 缺上下文数据时仍显示 `ctx %`。

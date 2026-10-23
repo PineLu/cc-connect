@@ -463,6 +463,20 @@ type ModelSwitcher interface {
 	AvailableModels(ctx context.Context) []ModelOption
 }
 
+// LiveSessionModelSwitcher is implemented by sessions that expose ACP
+// session/set_model, rather than an agent-wide default for the next session.
+// Model IDs are raw wire identifiers. Details may include a display label.
+type LiveSessionModelSwitcher interface {
+	SessionModelDetails() []ModelDetail
+	SwitchSessionModel(modelID string) error
+}
+
+// SessionModelSwitchAgent opts a model-capable agent into the live-session
+// path without assuming every ACP implementation supports that RPC.
+type SessionModelSwitchAgent interface {
+	UsesSessionModelSwitch() bool
+}
+
 // ModelLister is an optional interface for agents that can enumerate every
 // switchable model together with the provider each one belongs to. Unlike
 // ModelSwitcher.AvailableModels, which returns a flat list meant for the /model
@@ -482,6 +496,9 @@ type ModelLister interface {
 type ModelDetail struct {
 	// Name is the model identifier as the agent expects it.
 	Name string
+	// DisplayName is the human-readable label reported by the backend.
+	// Empty means render the raw Name identifier.
+	DisplayName string
 	// Provider is the agent's provider slug, empty when the agent has a single
 	// implicit provider.
 	Provider string

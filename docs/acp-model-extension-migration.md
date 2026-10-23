@@ -50,3 +50,12 @@ Gateway ACP `slash_mutation` otherwise forwards the latter as a model string
 and can cause the upstream to receive a bogus provider prefix. This is independent of
 `extension=generic` and of the compiled Web frontend.
 A previously pinned invalid Hermes session model must be switched again explicitly.
+
+## Generic ACP model state (2026-10-23)
+
+Generic ACP discovers `models.availableModels` from `session/new|load`.
+The agent caches a catalog, while each active session preserves its own models/current
+ID. The picker renders the human-readable `name` but uses the raw `modelId`
+for `session/set_model`. Failed RPCs do not claim success. Hermes keeps its
+provider-aware extension. Generic ACP exposes `/compact` only when an actual ACP
+`available_commands_update` advertises the native command.

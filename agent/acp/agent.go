@@ -66,6 +66,11 @@ type Agent struct {
 	modesCache   []core.PermissionModeInfo
 	modesCurrent string
 
+	// Generic ACP model directory is cached after a real session/new|load.
+	modelsMu      sync.RWMutex
+	modelsCache   []core.ModelDetail
+	modelsCurrent string
+
 	mu sync.RWMutex
 }
 
@@ -210,6 +215,14 @@ func parseStringSlice(v any) []string {
 	default:
 		return nil
 	}
+}
+
+// UsesSessionModelSwitch enables standard ACP per-session model control only
+// for generic adapters. Hermes keeps its established slash command routing.
+func (a *Agent) UsesSessionModelSwitch() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.modelExtension == "generic"
 }
 
 func (a *Agent) Name() string { return "acp" }

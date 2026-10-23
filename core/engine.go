@@ -10706,6 +10706,10 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		e.cmdForwardModelCommand(p, msg, passer.ModelCommand(), sessions, args)
 		return
 	}
+	if isLiveSessionModelAgent(agent) {
+		e.cmdLiveSessionModel(p, msg, args, agent)
+		return
+	}
 
 	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
@@ -10825,7 +10829,7 @@ func (e *Engine) cmdModels(p Platform, msg *Message, args []string) {
 
 // cmdModelsText is the text fallback for /models on platforms without cards.
 func (e *Engine) cmdModelsText(p Platform, msg *Message, agent Agent) {
-	groups, total := e.collectModelDetails(agent)
+	groups, total := e.collectSessionModelDetails(msg.SessionKey, agent)
 	if total == 0 {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgModelsNotSupported))
 		return
@@ -10835,6 +10839,9 @@ func (e *Engine) cmdModelsText(p Platform, msg *Message, agent Agent) {
 	for _, g := range groups {
 		sb.WriteString(fmt.Sprintf("**%s**\n", g.title))
 		for _, d := range g.details {
+			if d.DisplayName != "" && d.DisplayName != d.Name {
+				sb.WriteString(d.DisplayName + " — ")
+			}
 			sb.WriteString("`" + d.SwitchCommand + "`")
 			if d.Current {
 				sb.WriteString(" ← 当前")
@@ -10853,7 +10860,7 @@ func (e *Engine) cmdModelsText(p Platform, msg *Message, agent Agent) {
 // renderModelsCard builds the /models dropdown card and remembers the flattened
 // listing in interactive state so a selection resolves to the exact detail.
 func (e *Engine) renderModelsCard(sessionKey string, agent Agent) *Card {
-	groups, total := e.collectModelDetails(agent)
+	groups, total := e.collectSessionModelDetails(sessionKey, agent)
 	if total == 0 {
 		body := e.i18n.T(MsgModelsNotSupported)
 		if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
@@ -10876,6 +10883,9 @@ func (e *Engine) renderModelsCard(sessionKey string, agent Agent) *Card {
 			n++
 			flat = append(flat, d)
 			label := d.Name
+			if d.DisplayName != "" {
+				label = d.DisplayName
+			}
 			if d.ProviderLabel != "" {
 				label = d.ProviderLabel + " · " + d.Name
 			} else if d.Provider != "" {
@@ -10980,6 +10990,10 @@ func (e *Engine) handleModelsCardAction(args, sessionKey string) *Card {
 		return e.renderModelSwitchingCard(target.SwitchCommand)
 	}
 
+	if isLiveSessionModelAgent(agent) {
+		label, serr := e.switchLiveSessionModel(sessionKey, target.Name)
+		return e.renderModelsSwitchResultCard(label, serr)
+	}
 	if _, ok := agent.(ModelSwitcher); !ok {
 		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
 	}
@@ -11721,8 +11735,7 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 		return
 	}
 
-	compressor, ok := agent.(ContextCompressor)
-	if !ok || compressor.CompressCommand() == "" {
+	if _, ok := agent.(ContextCompressor); !ok {
 		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCompressNotSupported))
 		return
 	}
@@ -11746,6 +11759,11 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 		return
 	}
 
+	command := e.compressCommandForState(state)
+	if command == "" {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgCompressNotSupported))
+		return
+	}
 	session := sessions.GetOrCreateActive(msg.SessionKey)
 	lockGen, locked := session.TryLock()
 	if !locked {
@@ -11755,7 +11773,7 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 
 	e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
 
-	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, compressor.CompressCommand(), false, lockGen)
+	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, command, false, lockGen)
 }
 
 // compressCommandForState resolves the command from the agent owning the
@@ -11763,15 +11781,24 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 // to the engine default agent.
 func (e *Engine) compressCommandForState(state *interactiveState) string {
 	agent := e.agent
+	var session AgentSession
 	if state != nil {
 		state.mu.Lock()
 		if state.agent != nil {
 			agent = state.agent
 		}
+		session = state.agentSession
 		state.mu.Unlock()
 	}
 	if compressor, ok := agent.(ContextCompressor); ok {
-		return compressor.CompressCommand()
+		if configured := compressor.CompressCommand(); configured != "" {
+			return configured
+		}
+	}
+	if isLiveSessionModelAgent(agent) && session != nil && session.Alive() {
+		if native, ok := session.(interface{ NativeCompressCommand() string }); ok {
+			return native.NativeCompressCommand()
+		}
 	}
 	return ""
 }
@@ -13599,6 +13626,9 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 	if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
 		return e.renderModelsCard(sessionKey, agent)
 	}
+	if isLiveSessionModelAgent(agent) {
+		return e.renderModelsCard(sessionKey, agent)
+	}
 	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
 		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
@@ -14466,6 +14496,9 @@ func (e *Engine) renderModelCard(sessionKey string) *Card {
 	// capability, but it does not implement the structured ModelSwitcher.
 	// Reuse the /models picker, which already supports native ACP commands.
 	if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+		return e.renderModelsCard(sessionKey, agent)
+	}
+	if isLiveSessionModelAgent(agent) {
 		return e.renderModelsCard(sessionKey, agent)
 	}
 

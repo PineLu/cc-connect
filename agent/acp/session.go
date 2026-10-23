@@ -81,6 +81,10 @@ type acpSession struct {
 	// session/new|load response (models.currentModelId).
 	modelMu      sync.RWMutex
 	currentModel string
+	models       []acpModelInfo
+
+	commandsMu        sync.RWMutex
+	availableCommands map[string]bool
 
 	callbacks sessionCallbacks // may be nil (tests, integration harness)
 }
@@ -306,8 +310,15 @@ func (s *acpSession) handshake(resumeSessionID string, authMethod string) (err e
 
 // acpModelBlock is the subset of the session/new|load `models` field we need:
 // the agent's current model id (SessionModelState.currentModelId).
+type acpModelInfo struct {
+	ID          string `json:"modelId"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
 type acpModelBlock struct {
-	CurrentModelID string `json:"currentModelId"`
+	CurrentModelID  string         `json:"currentModelId"`
+	AvailableModels []acpModelInfo `json:"availableModels"`
 }
 
 // absorbModel records the current model id announced on session/new|load.
@@ -315,8 +326,16 @@ func (s *acpSession) absorbModel(block *acpModelBlock) {
 	if block == nil {
 		return
 	}
+	s.modelMu.Lock()
 	if m := strings.TrimSpace(block.CurrentModelID); m != "" {
-		s.SetModel(m)
+		s.currentModel = m
+	}
+	if block.AvailableModels != nil {
+		s.models = append([]acpModelInfo{}, block.AvailableModels...)
+	}
+	s.modelMu.Unlock()
+	if r, ok := s.callbacks.(interface{ reportModels(acpModelBlock) }); ok {
+		r.reportModels(*block)
 	}
 }
 
@@ -380,12 +399,57 @@ func (s *acpSession) GetContextUsage() *core.ContextUsage {
 	return &clone
 }
 
-// GetModel returns the raw model id announced on session/new|load
-// (models.currentModelId). Empty when the agent never reported one.
+// GetModel returns a human-readable model label where one is advertised,
+// otherwise the raw wire model ID. Never use it as session/set_model modelId.
 func (s *acpSession) GetModel() string {
 	s.modelMu.RLock()
 	defer s.modelMu.RUnlock()
+	for _, m := range s.models {
+		if m.ID == s.currentModel && m.Name != "" {
+			return m.Name
+		}
+	}
 	return s.currentModel
+}
+
+// SessionModelDetails returns an immutable snapshot of the ACP model catalog.
+func (s *acpSession) SessionModelDetails() []core.ModelDetail {
+	s.modelMu.RLock()
+	defer s.modelMu.RUnlock()
+	return acpModelDetails(s.models, s.currentModel)
+}
+
+// SwitchSessionModel uses the standard ACP RPC to switch the current session.
+// Validate the ID locally to prevent display labels or fabricated values
+// becoming a different wire model. No process or other session is changed.
+func (s *acpSession) SwitchSessionModel(modelID string) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	if !s.alive.Load() {
+		return fmt.Errorf("acp: session closed")
+	}
+	modelID = strings.TrimSpace(modelID)
+	s.modelMu.RLock()
+	known := false
+	for _, m := range s.models {
+		if m.ID == modelID {
+			known = true
+			break
+		}
+	}
+	s.modelMu.RUnlock()
+	if !known {
+		return fmt.Errorf("acp: unknown model ID %q", modelID)
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+	defer cancel()
+	if _, err := s.tr.call(ctx, "session/set_model", map[string]any{
+		"sessionId": s.currentACPSessionID(), "modelId": modelID,
+	}); err != nil {
+		return fmt.Errorf("acp: session/set_model: %w", err)
+	}
+	s.SetModel(modelID)
+	return nil
 }
 
 // CurrentMode returns the ACP modeId most recently applied or reported
@@ -479,6 +543,8 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	}
 	s.cacheToolCallInput(params)
 	s.maybeAbsorbCurrentModeUpdate(params)
+	s.maybeAbsorbModelUpdate(params)
+	s.maybeAbsorbAvailableCommands(params)
 	s.absorbUsageUpdate(params)
 	sid := s.currentACPSessionID()
 	// Debug log to capture raw session/update JSON for troubleshooting vendor compatibility
@@ -493,6 +559,65 @@ func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	}
 	for _, ev := range mapSessionUpdate(sid, params) {
 		s.emit(ev)
+	}
+}
+
+// maybeAbsorbAvailableCommands records server-advertised slash commands.
+// An explicit available_commands_update is the only source of automatic
+// native command support; unknown backends keep compression unavailable.
+func (s *acpSession) maybeAbsorbAvailableCommands(params json.RawMessage) {
+	var wire struct {
+		Update struct {
+			Kind     string `json:"sessionUpdate"`
+			Commands []struct {
+				Name string `json:"name"`
+			} `json:"availableCommands"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &wire) != nil || wire.Update.Kind != "available_commands_update" {
+		return
+	}
+	commands := make([]string, 0, len(wire.Update.Commands))
+	for _, item := range wire.Update.Commands {
+		commands = append(commands, strings.TrimSpace(item.Name))
+	}
+	s.commandsMu.Lock()
+	s.availableCommands = make(map[string]bool, len(commands))
+	for _, command := range commands {
+		s.availableCommands[command] = true
+	}
+	s.commandsMu.Unlock()
+}
+
+// NativeCompressCommand only reflects this particular live ACP session's
+// advertised slash commands; sibling sessions may have different capabilities.
+func (s *acpSession) NativeCompressCommand() string {
+	s.commandsMu.RLock()
+	defer s.commandsMu.RUnlock()
+	if s.availableCommands["compact"] {
+		return "/compact"
+	}
+	return ""
+}
+
+// maybeAbsorbModelUpdate applies ACP server-pushed model state changes.
+func (s *acpSession) maybeAbsorbModelUpdate(params json.RawMessage) {
+	var wrap struct {
+		Update struct {
+			Kind            string         `json:"sessionUpdate"`
+			CurrentModelID  string         `json:"currentModelId"`
+			AvailableModels []acpModelInfo `json:"availableModels"`
+		} `json:"update"`
+	}
+	if json.Unmarshal(params, &wrap) != nil {
+		return
+	}
+	switch wrap.Update.Kind {
+	case "current_model_update", "available_models_update":
+		s.absorbModel(&acpModelBlock{
+			CurrentModelID:  wrap.Update.CurrentModelID,
+			AvailableModels: wrap.Update.AvailableModels,
+		})
 	}
 }
 
