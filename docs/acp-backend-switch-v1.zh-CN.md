@@ -2,15 +2,16 @@
 
 仅适用于现有项目 **tujia-feishu-hermes**。项目名、飞书应用、工作目录、凭据、其他四个项目及 Generic ACP 实现均不变。代码位于 tools/cc-acp-switch.py；入口为 tools/cc-acp。
 
-## 当前三套后端
+## 当前四套后端
 
 | 后端 | ACP CLI | extension | 其他 |
 | --- | --- | --- | --- |
 | Hermes | hermes -p tujia acp | hermes | 首次纳管时保留现有 mode、model_command、compress_command |
 | CodeBuddy | /opt/homebrew/bin/codebuddy --acp | generic | 模型目录与 session/set_model 使用标准 ACP；compact 由服务端公告动态启用 |
 | QoderCN | ~/.local/bin/qoderclicn --acp | generic | 模型目录与 session/set_model 使用标准 ACP；模型展示用名称，切换用 ID |
+| Cline | /opt/homebrew/bin/cline --acp --auto-approve false | generic | 保留人工审批，复用 Generic ACP 的会话级模型列表和切换 |
 
-2026-10-23 在本机核验：CodeBuddy 2.158.0 和 QoderCN 1.1.76 均通过 stdio ACP initialize 握手。这只证明基础协议握手，不证明 session/new、prompt、permissions、session/load 或工具调用都可用。正式切换后需在飞书实测。
+2026-10-23 在本机核验：CodeBuddy 2.158.0 和 QoderCN 1.1.76 均通过 stdio ACP initialize 握手。Cline 3.0.73 通过 initialize 与 session/new，返回 316 个模型条目、2 种模式和 4 个配置选项。以上预检不能证明模型都可用，也不代表已完成真实 prompt、权限审批、会话恢复或工具调用验收。
 
 ## 命令
 
@@ -21,9 +22,12 @@
 ./tools/cc-acp list
 ./tools/cc-acp check codebuddy
 ./tools/cc-acp check qodercn
+./tools/cc-acp check cline
 ./tools/cc-acp use codebuddy --dry-run
+./tools/cc-acp use cline --dry-run
 ./tools/cc-acp use codebuddy --yes
 ./tools/cc-acp use qodercn --yes
+./tools/cc-acp use cline --yes
 ./tools/cc-acp use hermes --yes
 ./tools/cc-acp rollback --yes
 ./tools/cc-acp recover --yes  # 仅在检测到未完成的切换事务时
@@ -54,7 +58,7 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 ./tools/cc-acp use qodercn --dry-run
 ~~~
 
-切换后的实测顺序：cc-acp status；飞书普通对话；/models；选择模型并验证回复；/compact（只有 ACP 服务端正式公告 compact 时开放，须核验真实历史压缩）；工具权限与会话恢复；切回 Hermes 并测试 /models 的列表。三个后端均可通过 check，但真实对话验证是独立验收门禁。
+切换后的实测顺序：cc-acp status；飞书普通对话；/models；选择模型并验证回复；/compact（只有 ACP 服务端正式公告 compact 时开放，须核验真实历史压缩）；工具权限与会话恢复；切回 Hermes 并测试 /models 的列表。四个后端均提供 check 预检，但真实对话与权限审批验证是独立验收门禁。
 
 ## Generic ACP 模型与压缩（2026-10-23）
 
@@ -71,3 +75,11 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 - 新增压缩绝对上限 5 分钟（与其他普通 Agent 消息的超时分离），超过后明确报错并清理卡住的会话，而不是继续等待默认的 2 小时空闲超时。该上限是安全兜底，不代表实际压缩已成功。
 - QoderCN 1.1.76 的 `available_commands_update` 未公告手动 `compact`。官方 ACP 文档列出「上下文压缩」支持，但当前 ACP 斜杠命令列表未包含手动压缩。因此应区分「自动上下文压缩机制支持」与「用户主动通过 ACP 斜杠命令压缩」：暂不向 QoderCN 暴露手动按钮，不能按 CLI 交互模式的 `/compact` 支持情况猜测 ACP 行为。
 - 以上修复仍需真实 CodeBuddy 长会话、飞书压缩回合和压缩前后上下文用量复测，不把单元测试当作终端验收。
+
+## Cline ACP 扩展（2026-10-23）
+
+- 本机实际 CLI：`/opt/homebrew/bin/cline`，版本 `3.0.73`。官方使用 `cline --acp` 提供 stdio ACP，认证数据仍由 Cline 自身管理；预设不会修改 `~/.cline` 的认证和模型设置。
+- 新预设 `--acp --auto-approve false` 明确保留人工审批，不依赖 Cline CLI 的自动批准默认值；不要未经评估改成 true。
+- 模型列表、显示名和会话切换复用 Generic ACP 的 `models.availableModels`、`session/set_model`；压缩仍根据实际 ACP `available_commands_update` 决定是否开放。**未公告就不声称手动压缩受支持。**
+- 旧版 V1 的 `state.json` 只有三种预设。新脚本在 `status/list/check/dry-run` 时**仅在内存补充 Cline**，旧状态和配置文件保持原样；首次真正 `use cline --yes` 成功后才持久化新预设。Cline 独立使用 `sessions/cline.json`，不复用其他 Agent 的 ACP Session ID；`rollback --yes` 仍可切回上一后端。
+- 切换会重启整个 cc-connect launchd 服务，影响全部 5 个项目；本次仅部署切换工具能力，不主动切换正在运行的 CodeBuddy。

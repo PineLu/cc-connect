@@ -71,6 +71,80 @@ class TestSwitcher(unittest.TestCase):
         back=switch.patch_config(changed,state["profiles"]["hermes"])
         self.assertEqual(switch.tomllib.loads(back.decode()),original)
 
+    def test_cline_profile_uses_generic_acp_with_explicit_approvals(self):
+        state, active = switch.profile_and_active(self.project["agent"]["options"], None)
+        self.assertEqual(active, "hermes")
+        self.assertEqual(set(state["profiles"]), set(switch.BACKENDS))
+        cline = state["profiles"]["cline"]
+        self.assertEqual(cline["cmd"], "/opt/homebrew/bin/cline")
+        self.assertEqual(cline["args"], ["--acp", "--auto-approve", "false"])
+        self.assertEqual(cline["extension"], "generic")
+        self.assertNotIn("model_command", cline)
+        self.assertNotIn("compress_command", cline)
+        new = switch.patch_config(self.raw, cline)
+        newobj = switch.tomllib.loads(new.decode())
+        self.assertEqual(newobj["projects"][0], self.parsed["projects"][0])
+        self.assertEqual(newobj["projects"][1]["platforms"],
+                         self.parsed["projects"][1]["platforms"])
+
+    def test_existing_three_profiles_migrate_in_memory_without_writes(self):
+        definitions, _ = switch.profile_and_active(self.project["agent"]["options"], None)
+        legacy = {
+            "active": "codebuddy", "previous": "qodercn",
+            "profiles": {k: v for k, v in definitions["profiles"].items()
+                         if k != "cline"},
+        }
+        codebuddy_raw = switch.patch_config(self.raw, definitions["profiles"]["codebuddy"])
+        self.config.write_bytes(codebuddy_raw)
+        root, _ = switch.private_root(switch.get_config(self.config)[1])
+        root.mkdir(parents=True)
+        state_file = root / "state.json"
+        state_file.write_text(json.dumps(legacy))
+        old_state_bytes = state_file.read_bytes()
+        options = switch.get_config(self.config)[2]["agent"]["options"]
+        state, active = switch.profile_and_active(options, switch.load_state(root))
+        self.assertEqual(active, "codebuddy")
+        self.assertEqual(state["previous"], "qodercn")
+        self.assertEqual(state["profiles"]["codebuddy"], legacy["profiles"]["codebuddy"])
+        self.assertIn("cline", state["profiles"])
+        self.assertEqual(state_file.read_bytes(), old_state_bytes)
+        with mock.patch.object(switch, "binary", return_value="/tmp/fake"):
+            result = switch.use(self.config, self.plist, "cline", dry_run=True)
+        self.assertIn("codebuddy -> cline", result)
+        self.assertEqual(self.config.read_bytes(), codebuddy_raw)
+        self.assertEqual(state_file.read_bytes(), old_state_bytes)
+        self.assertEqual(self.session.read_bytes(), self.previous)
+
+    def test_cline_session_isolation_and_rollback(self):
+        contexts = (mock.patch.object(switch, "binary", return_value="/tmp/fake"),
+                    mock.patch.object(switch, "service"),
+                    mock.patch.object(switch, "await_state"),
+                    mock.patch.object(switch, "service_state",
+                                      return_value=("running", 1234)))
+        for item in contexts:
+            item.start()
+        self.addCleanup(lambda: [item.stop() for item in reversed(contexts)])
+        self.assertIn("hermes -> cline",
+                      switch.use(self.config, self.plist, "cline",
+                                 yes=True, probe_target=False))
+        root, _ = switch.private_root(self.parsed)
+        self.assertEqual((root / "sessions/hermes.json").read_bytes(), self.previous)
+        self.assertFalse(self.session.exists())
+        cline_state = json.dumps({"sessions": {
+            "cline": {"agent_session_id": "cline-private", "agent_type": "acp"}}}).encode()
+        self.session.write_bytes(cline_state)
+        self.assertIn("cline -> hermes",
+                      switch.use(self.config, self.plist, "hermes",
+                                 yes=True, probe_target=False))
+        self.assertEqual((root / "sessions/cline.json").read_bytes(), cline_state)
+        self.assertEqual(self.session.read_bytes(), self.previous)
+        self.assertEqual(json.loads((root / "state.json").read_text())["previous"], "cline")
+        self.assertIn("hermes -> cline",
+                      switch.use(self.config, self.plist, "cline",
+                                 yes=True, probe_target=False))
+        self.assertEqual(self.session.read_bytes(), cline_state)
+        self.assertEqual(json.loads((root / "state.json").read_text())["active"], "cline")
+
     def test_workspace_session_files_fail_closed(self):
         extra=self.dir/"sessions"/(switch.PROJECT+"_ws_deadbeef.json")
         extra.write_text(json.dumps({"sessions":{"x":{"agent_session_id":"other-backend"}}}))

@@ -25,7 +25,13 @@ OTHER = {
                   "extension": "generic", "display_name": "CodeBuddy (ACP)"},
     "qodercn": {"cmd": str(Path.home() / ".local/bin/qoderclicn"),
                 "args": ["--acp"], "extension": "generic", "display_name": "QoderCN (ACP)"},
+    # Cline CLI's --auto-approve default differs across versions; use an
+    # explicit false value so file edits/terminal calls require approval.
+    "cline": {"cmd": "/opt/homebrew/bin/cline",
+              "args": ["--acp", "--auto-approve", "false"],
+              "extension": "generic", "display_name": "Cline (ACP)"},
 }
+BACKENDS = ("hermes", *OTHER)
 
 class Refuse(RuntimeError):
     pass
@@ -110,8 +116,10 @@ def load_state(root):
     if not f.exists():
         return None
     state = json.loads(f.read_text())
-    if state.get("active") not in ("hermes", "codebuddy", "qodercn"):
+    if state.get("active") not in BACKENDS:
         raise Refuse("bad managed state")
+    if not isinstance(state.get("profiles"), dict) or state["active"] not in state["profiles"]:
+        raise Refuse("active ACP backend missing from managed profiles")
     return state
 
 def profile_and_active(options, state):
@@ -119,7 +127,13 @@ def profile_and_active(options, state):
         active = state["active"]
         if fields(options) != state["profiles"][active]:
             raise Refuse("ACP configuration modified outside switcher; refusing to overwrite")
-        return state, active
+        # Old V1 installations persist only three backend profiles. Add newly
+        # supported presets in memory without rewriting the state on status,
+        # list, check or dry-run, and keep existing user profiles untouched.
+        profiles = dict(state["profiles"])
+        for name, preset in OTHER.items():
+            profiles.setdefault(name, dict(preset))
+        return {**state, "profiles": profiles}, active
     if options.get("cmd") != "hermes" or options.get("args") != ["-p", "tujia", "acp"] or options.get("extension") != "hermes":
         raise Refuse("first use requires unchanged Hermes ACP configuration")
     return {"active": "hermes", "previous": None,
@@ -280,7 +294,7 @@ def recover(configfile, plist, yes=False):
         session_backup=txn/"session.json"
         state_backup=txn/"state.json"
         saved_backend=info.get("from")
-        if saved_backend not in ("hermes","codebuddy","qodercn"):
+        if saved_backend not in BACKENDS:
             raise Refuse("invalid source backend in transaction")
         previous_snapshot=root/"sessions"/(saved_backend+".json")
         previous_backup=txn/"previous-snapshot.json"
@@ -444,9 +458,9 @@ def main():
     sub.add_parser("status")
     sub.add_parser("list")
     check=sub.add_parser("check")
-    check.add_argument("backend",choices=("hermes","codebuddy","qodercn"))
+    check.add_argument("backend",choices=BACKENDS)
     choice=sub.add_parser("use")
-    choice.add_argument("backend",choices=("hermes","codebuddy","qodercn"))
+    choice.add_argument("backend",choices=BACKENDS)
     back=sub.add_parser("rollback")
     fix=sub.add_parser("recover")
     fix.add_argument("--yes",action="store_true",help="acknowledge service-wide restart")
