@@ -108,7 +108,11 @@ func New(opts map[string]any) (core.Agent, error) {
 	if displayName == "" {
 		displayName = "ACP"
 	}
-	modelExtension, _ := opts["extension"].(string)
+	rawExtension, hasExtension := opts["extension"]
+	modelExtension, isString := rawExtension.(string)
+	if hasExtension && rawExtension != nil && !isString {
+		return nil, fmt.Errorf("acp: extension must be a string (hermes or generic), got %T", rawExtension)
+	}
 	modelExtension = strings.ToLower(strings.TrimSpace(modelExtension))
 	// Legacy default retains existing Hermes /models behaviour until projects migrate.
 	if modelExtension == "" {

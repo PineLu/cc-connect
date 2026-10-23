@@ -14,6 +14,15 @@ func TestModelExtensionRejectsUnknown(t *testing.T) {
 	}
 }
 
+func TestModelExtensionRejectsNonString(t *testing.T) {
+	for _, value := range []any{true, 42, []string{"generic"}} {
+		_, err := New(map[string]any{"command": "go", "extension": value})
+		if err == nil {
+			t.Fatalf("expected invalid extension type %T to be rejected", value)
+		}
+	}
+}
+
 func TestModelExtensionGenericDoesNotReadHermes(t *testing.T) {
 	home := t.TempDir()
 	profileDir := filepath.Join(home, "profiles", "isolated")
