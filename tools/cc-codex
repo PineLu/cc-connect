@@ -27,7 +27,20 @@ fi
 case "${1:-}" in
   acp)
     if [ "$#" -gt 0 ]; then shift; fi
-    exec /opt/homebrew/bin/codex-acp "$@"
+    # Fixed build of PineLu/codex-acp, commit a8dd694 (upstream networking PR #608).
+    # Fail closed: never silently fall back to the unpatched global adapter.
+    ACP_BUILD="a8dd694dd34b51a8ac8d8731b939c668b4eb15fc"
+    ACP_ENTRY="$HOME/.cc-connect/adapters/codex-acp/$ACP_BUILD/index.js"
+    ACP_SHA256="533b48c346b87c72b10582917b07b265b6a39fccc72d6864d30bbea57f856a55"
+    if [ ! -f "$ACP_ENTRY" ] || [ -L "$ACP_ENTRY" ]; then
+      echo "cc-codex: pinned codex-acp build missing or unsafe" >&2
+      exit 1
+    fi
+    if [ "$(/usr/bin/shasum -a 256 "$ACP_ENTRY" | /usr/bin/awk '{print $1}')" != "$ACP_SHA256" ]; then
+      echo "cc-codex: pinned codex-acp checksum mismatch" >&2
+      exit 1
+    fi
+    exec /opt/homebrew/bin/node "$ACP_ENTRY" "$@"
     ;;
   login)
     shift

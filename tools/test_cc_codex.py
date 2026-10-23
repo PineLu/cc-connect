@@ -52,6 +52,12 @@ class CodexLauncherTests(unittest.TestCase):
         self.assertFalse((self.private_home / "auth.json").exists())
         self.assertFalse((self.home / ".codex").exists())
 
+    def test_acp_fails_closed_when_pinned_adapter_is_absent(self):
+        self.bootstrap()
+        result = self.command("acp", "--version")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pinned codex-acp build missing or unsafe", result.stderr)
+
     def test_no_args_dispatches_to_interactive_cli_not_acp(self):
         self.bootstrap()
         env = {**self.env, "TERM": "dumb"}

@@ -109,6 +109,17 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 - 对已经在线使用旧版共享 Home 的 Codex，`cc-acp status/list/check/dry-run` 不修改运行态。独立登录后，`cc-acp use codex --dry-run` 将显示 `codex -> codex (isolate Codex Home)`；执行 `cc-acp use codex --yes` 才通过事务停止服务、备份旧会话到 `sessions/codex.json`，然后在独立 Home 新建会话。中断可用 `recover --yes` 恢复旧运行态。`rollback --yes` 切回前一个**其他**后端。
 - 独立登录之前一律拒绝真实 Codex 切换，避免切到未经认证的服务。旧 Codex Desktop 中已出现的历史会话不会自动删除。
 
+
+### 独立 Fork codex-acp 与 workspace-write 联网修复（2026-10-23）
+
+- 上游兼容问题：`codex-acp` 的 `agent` / `workspace-write` 预设原先会在 `turn/start` 发送 `networkAccess=false`，覆盖独立 `CODEX_HOME` 中的 `sandbox_workspace_write.network_access`。修复参考 [agentclientprotocol/codex-acp PR #608](https://github.com/agentclientprotocol/codex-acp/pull/608)。
+- 源码 Fork：`PineLu/codex-acp`，隔离分支 `fix/workspace-network-1023`，固定提交 `a8dd694dd34b51a8ac8d8731b939c668b4eb15fc`（[Fork PR #1](https://github.com/PineLu/codex-acp/pull/1)）。上游合并后应优先切回官方，而非长期追加魔改。
+- 运行构建固定放在 `~/.cc-connect/adapters/codex-acp/<commit>/`，由 `tools/cc-codex acp` 启动并检验 `index.js` SHA-256：`533b48c346b87c72b10582917b07b265b6a39fccc72d6864d30bbea57f856a55`。构建把 `@openai/codex` 标为 external，运行目录同时封装 `@openai/codex@0.160.1` 与 macOS arm64 原生依赖，避免依赖可变的全局 npm 或源码目录；原生 Codex CLI/桌面版无需修改。
+- 专用 Home（不入 Git）：`~/.cc-connect/.codex-home/config.toml` 保留 `sandbox_mode = "workspace-write"`，配置 `approval_policy = "on-request"`、`[sandbox_workspace_write] network_access = true`。ACP 每回合审批仍以 ACP mode 为准，不能仅凭 Home 字段宣称没有自动审批。
+- 工作模式维持 ACP `agent`，不会改成 `agent-full-access`；网络开关允许**普通网络访问**，并非公司域名白名单。`read-only` 模式保持禁网，文件系统受 workspace-write 边界约束。真实越界写入应验证申请审批且未获准时不会落盘。
+- 安全备份：`~/.cc-connect/backups/codex-acp-network-20261023-1540/` 内含原启动脚本与原专用 `config.toml`，不在仓库中提交。若回滚，复制原文件到对应位置（保持 0600），通过 `launchctl kickstart -k gui/$(id -u)/com.cc-connect.service` 重启，再核对 `cc-acp status` 与项目日志。
+- 回归验收（2026-10-23）：Fork 全量测试 **1878 passed / 36 skipped / 0 failed**，cc-connect ACP 启动与切换工具 **29/29 passed**。使用固定版本实际 ACP 运行 `gpt-6-luna[medium]`，在 `agent` 模式中成功解析 `qa.corp.tujia.com` 并通过不带凭据的只读 HTTP HEAD 返回 **200 OK**；在 `workspace-write` 模式中越界 `touch` 临时文件被系统明确拒绝（`Operation not permitted`），未生成文件。测试全过程未给予额外审批。通过 `launchctl kickstart -k` 重启后服务仍 `running`，当前后端仍 `qodercn`。真实业务接口的凭据与权限尚未测试，不能把上述检查解读为业务数据全量可查询。部署不影响非 Codex ACP 的权限模型。
+
 ### cc-codex 作为终端 Codex CLI（2026-10-23）
 
 `cc-codex` 已是原生 Codex CLI 的通用包装器。无参数启动交互模式，其余参数（例如 `-m`、`-c`、`-C`）原样转交给 Codex：
