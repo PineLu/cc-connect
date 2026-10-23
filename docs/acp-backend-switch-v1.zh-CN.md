@@ -1,0 +1,57 @@
+# cc-connect ACP 后端切换 V1（本机）
+
+仅适用于现有项目 **tujia-feishu-hermes**。项目名、飞书应用、工作目录、凭据、其他四个项目及 Generic ACP 实现均不变。代码位于 tools/cc-acp-switch.py；入口为 tools/cc-acp。
+
+## 当前三套后端
+
+| 后端 | ACP CLI | extension | 其他 |
+| --- | --- | --- | --- |
+| Hermes | hermes -p tujia acp | hermes | 首次纳管时保留现有 mode、model_command、compress_command |
+| CodeBuddy | /opt/homebrew/bin/codebuddy --acp | generic | 原生模型/压缩命令不继承 Hermes |
+| QoderCN | ~/.local/bin/qoderclicn --acp | generic | 原生模型/压缩命令不继承 Hermes |
+
+2026-10-23 在本机核验：CodeBuddy 2.158.0 和 QoderCN 1.1.76 均通过 stdio ACP initialize 握手。这只证明基础协议握手，不证明 session/new、prompt、permissions、session/load 或工具调用都可用。正式切换后需在飞书实测。
+
+## 命令
+
+在开发分支 worktree 根目录执行：
+
+~~~sh
+./tools/cc-acp status
+./tools/cc-acp list
+./tools/cc-acp check codebuddy
+./tools/cc-acp check qodercn
+./tools/cc-acp use codebuddy --dry-run
+./tools/cc-acp use codebuddy --yes
+./tools/cc-acp use qodercn --yes
+./tools/cc-acp use hermes --yes
+./tools/cc-acp rollback --yes
+./tools/cc-acp recover --yes  # 仅在检测到未完成的切换事务时
+~~~
+
+--yes 表示已确认所有 cc-connect 项目没有正在进行的消息/任务；脚本执行的是 launchd 整体服务重启，而不是单独热更换一个 Agent。切换过程中所有 5 个项目短暂中断；不要在其他项目有未完成工作时运行。--dry-run 不修改配置、会话或服务。check 只发送 ACP initialize，不启动 session/new 或 prompt。
+
+不建议未经预检便运行 use。目标 ACP 握手失败时脚本会直接拒绝切换；不会改变 Hermes 配置。
+
+## 会话隔离、备份与回滚
+
+- 在停止 launchd 服务之后，脚本才触碰会话文件。目标是 ~/.cc-connect/sessions/tujia-feishu-hermes_<workdir-hash>.json（会自动匹配旧版 legacy 位置）。会话文件依 backend 保存到 ~/.cc-connect/acp-switch/tujia-feishu-hermes/sessions/<backend>.json。
+- 第一次切到 CodeBuddy 时备份当前 Hermes 会话文件；新后端从空的会话文件开始。切回来时恢复之前保存的 Hermes 会话快照，避免同属 agent type=acp 而跨后端恢复错误会话 ID。
+- 切换时保留完整配置和目标会话备份：~/.cc-connect/acp-switch/tujia-feishu-hermes/transactions/<timestamp>-<pid>-<nonce>/。私有目录权限 0700；备份文件权限 0600，**含会话历史或敏感配置，请勿提交到 Git**。
+- 切换失败会尝试恢复原 config、会话文件并启动旧服务。极端情况下如果 launchd 或文件系统故障导致自动回滚失败，脚本会报告手动恢复备份的位置。不要直接覆盖当前运行中的会话文件。
+- 每次切换前会写入私有 pending.json 事务记录。若脚本在完成服务启动与持久化状态之间被意外中断，后续命令会拒绝继续切换；用 recover --yes 从事务备份恢复之前的 config、会话文件、各后端快照、管理状态及服务。
+- rollback 的语义是“切回上一次 Agent 后端”，不是 Git revert；本工具不会执行 git commit/merge/deploy。
+- 仅管理 ACP 选项 cmd、args、extension、display_name、mode、model_command、compress_command，不改 work_dir、reset_on_idle_mins、Feishu 凭据和其他配置。纳管后如手动改动这些选项，脚本会拒绝覆盖，需先明确处理冲突。
+- V1 仅支持单工作区。若启用了 multi-workspace 或留有项目的 *_ws_*.json 会话快照，将拒绝切换，防止跨 ACP 后端恢复错会话。\n- 如果项目曾通过运行时 project-state 设置 work_dir_override，V1 会明确拒绝切换（避免计算出错误会话文件路径）。该限制不影响当前无 override 的 Hermes 项目。 同时兼容 work_dir 中的 ~/ 和 HOME 环境占位符；其他未经核对的环境变量占位符会拒绝切换。
+- 当前尚未实现 **针对运行中会话的原子无中断切换**，亦不会自动判断其他项目是否正在执行任务；这是 V1 的明确限制。后续若需要飞书内按会话切换，另行设计 V2。
+
+## 验证
+
+~~~sh
+python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
+./tools/cc-acp status
+./tools/cc-acp use codebuddy --dry-run
+./tools/cc-acp use qodercn --dry-run
+~~~
+
+切换后的实测顺序：cc-acp status；飞书普通对话；/models（Generic 模式可能没有离线列表）；工具权限与会话恢复；切回 Hermes 并测试 /models 的列表。三个后端均可通过 check，但真实对话验证是独立验收门禁。

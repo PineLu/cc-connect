@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+source_file=$0
+while [ -L "$source_file" ]; do
+  parent=$(cd -P "$(dirname "$source_file")" && pwd)
+  target=$(readlink "$source_file")
+  case "$target" in
+    /*) source_file=$target ;;
+    *) source_file="$parent/$target" ;;
+  esac
+done
+script_dir=$(cd -P "$(dirname "$source_file")" && pwd)
+if command -v python3.14 >/dev/null 2>&1; then
+  exec python3.14 "$script_dir/cc-acp-switch.py" "$@"
+elif command -v python3.13 >/dev/null 2>&1; then
+  exec python3.13 "$script_dir/cc-acp-switch.py" "$@"
+elif command -v python3.12 >/dev/null 2>&1; then
+  exec python3.12 "$script_dir/cc-acp-switch.py" "$@"
+elif command -v python3.11 >/dev/null 2>&1; then
+  exec python3.11 "$script_dir/cc-acp-switch.py" "$@"
+fi
+echo "cc-acp: Python >= 3.11 required" >&2
+exit 1
