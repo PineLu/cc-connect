@@ -103,8 +103,26 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 
 固定位置：`~/.cc-connect/.codex-home/`，面向**整个 cc-connect**，不是某一飞书项目的 `acp-switch` 私有目录。其他 cc-connect Codex 任务可设置 `CODEX_HOME=$HOME/.cc-connect/.codex-home` 直接共用它。权限：目录 0700、独立 `config.toml` 0600，不在 Git 中维护其文件。
 
-- 初始独立配置：默认模型 `gpt-6-sol`、思考等级 `medium`、`sandbox_mode = "workspace-write"`；后续改这里不影响桌面版 `~/.codex/config.toml`。
+- 独立配置：默认模型 `gpt-6-luna`、思考等级 `medium`、`sandbox_mode = "workspace-write"`；后续改这里不影响桌面版 `~/.codex/config.toml`。
 - 认证**完全独立**：没有复制、软链接或导入桌面版 `~/.codex/auth.json`。首次需在 Mac 终端运行 `cc-codex login --device-auth`，按 CLI 给出的设备授权说明完成登录，再运行 `cc-codex login-status` 复核。不要共享或复制认证文件。
 - 通用入口 `~/.local/bin/cc-codex` 指向项目的启动包装器；`cc-codex acp`、`cc-codex login`、`cc-codex login-status` 均固定使用上述 CODEX_HOME。
 - 对已经在线使用旧版共享 Home 的 Codex，`cc-acp status/list/check/dry-run` 不修改运行态。独立登录后，`cc-acp use codex --dry-run` 将显示 `codex -> codex (isolate Codex Home)`；执行 `cc-acp use codex --yes` 才通过事务停止服务、备份旧会话到 `sessions/codex.json`，然后在独立 Home 新建会话。中断可用 `recover --yes` 恢复旧运行态。`rollback --yes` 切回前一个**其他**后端。
 - 独立登录之前一律拒绝真实 Codex 切换，避免切到未经认证的服务。旧 Codex Desktop 中已出现的历史会话不会自动删除。
+
+### cc-codex 作为终端 Codex CLI（2026-10-23）
+
+`cc-codex` 已是原生 Codex CLI 的通用包装器。无参数启动交互模式，其余参数（例如 `-m`、`-c`、`-C`）原样转交给 Codex：
+
+```bash
+cc-codex                              # 终端交互，默认 gpt-6-luna (medium)
+cc-codex -C /path/to/project          # 在指定项目根目录启动
+cc-codex exec "检查当前项目问题"         # 非交互运行
+cc-codex exec -C /path/to/project "检查代码"
+cc-codex resume --last                # 恢复独立 Home 的最近会话
+cc-codex review --uncommitted         # 独立 Home 下进行审查
+cc-codex -m gpt-6-sol                 # 仅本次覆盖模型
+cc-codex login-status                 # 查询独立认证
+cc-codex acp                          # ACP stdio 入口
+```
+
+所有命令均导出 `CODEX_HOME=$HOME/.cc-connect/.codex-home`，不修改 `HOME`。独立目录 `config.toml` 当前默认模型为 `gpt-6-luna`、思考等级 `medium`；修改这里不影响桌面版本。`-C` 指工作目录而不是 Codex Home；`resume` 访问独立会话存储。此前共享 Home 的飞书历史会话不会自动迁移或删除。

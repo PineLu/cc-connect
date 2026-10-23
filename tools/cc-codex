@@ -1,5 +1,6 @@
 #!/bin/sh
 # Shared, independently authenticated Codex environment for cc-connect.
+# Usage: cc-codex [native CLI args]; cc-codex acp for ACP stdio.
 # Deliberately never inherits or links ~/.codex/auth.json.
 set -eu
 : "${HOME:?HOME required}"
@@ -17,13 +18,13 @@ if [ ! -d "$CODEX_HOME" ] || [ -L "$CODEX_HOME" ]; then
   exit 1
 fi
 if [ "${1:-acp}" = login ] && [ ! -e "$CODEX_HOME/config.toml" ] && [ ! -L "$CODEX_HOME/config.toml" ]; then
-  (umask 077; set -C; printf '%s\n' '# cc-connect shared independent Codex Home' 'model = "gpt-6-sol"' 'model_reasoning_effort = "medium"' 'sandbox_mode = "workspace-write"' > "$CODEX_HOME/config.toml")
+  (umask 077; set -C; printf '%s\n' '# cc-connect shared independent Codex Home' 'model = "gpt-6-luna"' 'model_reasoning_effort = "medium"' 'sandbox_mode = "workspace-write"' > "$CODEX_HOME/config.toml")
 fi
 if [ -L "$CODEX_HOME/auth.json" ] || [ -L "$CODEX_HOME/config.toml" ]; then
   echo "cc-codex: independent auth/config must not be symlinked to another Home" >&2
   exit 1
 fi
-case "${1:-acp}" in
+case "${1:-}" in
   acp)
     if [ "$#" -gt 0 ]; then shift; fi
     exec /opt/homebrew/bin/codex-acp "$@"
@@ -37,7 +38,9 @@ case "${1:-acp}" in
     exec /opt/homebrew/bin/codex login status "$@"
     ;;
   *)
-    echo "usage: cc-codex [acp|login|login-status]" >&2
-    exit 2
+    # Pass every native Codex CLI command and option unchanged, including
+    # interactive, exec, resume, review and model override options.
+    # HOME is not modified. Only CODEX_HOME is pinned to the private store.
+    exec /opt/homebrew/bin/codex "$@"
     ;;
 esac
