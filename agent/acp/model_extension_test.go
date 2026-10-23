@@ -59,16 +59,30 @@ func TestModelExtensionGenericDoesNotReadHermes(t *testing.T) {
 	}
 }
 
-func TestModelExtensionLegacyDefault(t *testing.T) {
-	a, err := New(map[string]any{"command": "go"})
+func TestModelExtensionExplicitHermes(t *testing.T) {
+	a, err := New(map[string]any{"command": "go", "extension": "hermes"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	impl := a.(*Agent)
 	if impl.modelExtension != "hermes" {
-		t.Fatalf("legacy extension = %q", impl.modelExtension)
+		t.Fatalf("explicit Hermes extension=%q", impl.modelExtension)
 	}
 	if got := impl.WorkspaceAgentOptions()["extension"]; got != "hermes" {
+		t.Fatalf("workspace extension=%v", got)
+	}
+}
+
+func TestModelExtensionGenericDefault(t *testing.T) {
+	a, err := New(map[string]any{"command": "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	impl := a.(*Agent)
+	if impl.modelExtension != "generic" {
+		t.Fatalf("default extension = %q", impl.modelExtension)
+	}
+	if got := impl.WorkspaceAgentOptions()["extension"]; got != "generic" {
 		t.Fatalf("workspace extension = %v", got)
 	}
 }

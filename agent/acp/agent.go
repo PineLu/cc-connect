@@ -114,9 +114,9 @@ func New(opts map[string]any) (core.Agent, error) {
 		return nil, fmt.Errorf("acp: extension must be a string (hermes or generic), got %T", rawExtension)
 	}
 	modelExtension = strings.ToLower(strings.TrimSpace(modelExtension))
-	// Legacy default retains existing Hermes /models behaviour until projects migrate.
+	// Standard ACP model discovery is vendor-neutral; Hermes is opt-in.
 	if modelExtension == "" {
-		modelExtension = "hermes"
+		modelExtension = "generic"
 	}
 	if modelExtension != "hermes" && modelExtension != "generic" {
 		return nil, fmt.Errorf("acp: unsupported extension %q (expected hermes or generic)", modelExtension)

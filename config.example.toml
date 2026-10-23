@@ -2102,11 +2102,10 @@ app_secret = "your-feishu-app-secret"
 # 针对 Devin 建议直接使用上面的 type = "devin"；下面的 type = "acp" 主要给其他
 # 通用 ACP 工具使用。
 
-# Compatibility: omitted ACP extension currently selects Hermes only to
-# preserve existing projects. For all other ACP agents set extension="generic"
-# explicitly so model discovery never reads local Hermes profiles.
-# 兼容说明：不填 extension 暂时使用 Hermes。其他 ACP Agent 必须显式配置
-# extension = "generic"，避免误读本机 Hermes 模型缓存。
+# ACP defaults to generic model discovery, so non-Hermes agents can omit
+# extension or explicitly set it to "generic".
+# Hermes MUST set extension = "hermes" to enable Hermes local model discovery.
+# 默认 generic；非 Hermes Agent 可省略扩展，Hermes 必须显式配置 hermes。
 #
 # --- Example: Cursor Agent CLI (npm: @anthropic-ai/cursor-agent) ---
 # [[projects]]
@@ -2225,7 +2224,7 @@ app_secret = "your-feishu-app-secret"
 # cmd = "hermes"
 # args = ["acp"]                       # add "-p", "<profile>" to select a Hermes profile
 # mode = "dont_ask"
-# extension = "hermes"              # explicit legacy-compatible model discovery
+# extension = "hermes"              # required for Hermes local model discovery
 # display_name = "Hermes"
 # compress_command = "/compress"       # native command used by cc-connect's /compact
 # model_command = "/model"             # native command used by cc-connect's /model (in-place switch)
