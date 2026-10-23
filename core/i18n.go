@@ -352,6 +352,7 @@ const (
 	MsgCompressing          MsgKey = "compressing"
 	MsgCompressNoSession    MsgKey = "compress_no_session"
 	MsgCompressDone         MsgKey = "compress_done"
+	MsgCompressTimeout      MsgKey = "compress_timeout"
 
 	// MsgModelSwitching / MsgModelNoSession are used when /model is forwarded
 	// to the agent as a native slash command (ModelCommand, e.g. ACP/Hermes).
@@ -2479,6 +2480,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "✅ 上下文壓縮完成。",
 		LangJapanese:           "✅ コンテキスト圧縮完了。",
 		LangSpanish:            "✅ Contexto comprimido.",
+	},
+	MsgCompressTimeout: {
+		LangEnglish:            "❌ Context compression exceeded %v. The stalled session was closed; you can send a new message.",
+		LangChinese:            "❌ 上下文压缩超过 %v 仍未完成，已关闭卡住的会话。可以重新发送消息。",
+		LangTraditionalChinese: "❌ 上下文壓縮超過 %v 仍未完成，已關閉卡住的會話。可以重新傳送訊息。",
+		LangJapanese:           "❌ コンテキスト圧縮が %v を超えました。停止したセッションを終了しました。新しいメッセージを送信できます。",
+		LangSpanish:            "❌ La compresión del contexto superó %v. Se cerró la sesión bloqueada; puedes enviar otro mensaje.",
 	},
 	MsgModelSwitching: {
 		LangEnglish:            "🔄 Switching model...",

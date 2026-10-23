@@ -11077,7 +11077,7 @@ func (e *Engine) forwardModelsSwitchAsync(sessionKey string, state *interactiveS
 			replyCtx = rctx
 		}
 	}
-	_, rerr := e.runForwardedCommand(state, session, sessions, iKey, targetPlatform, replyCtx, command, false, "", lockGen)
+	_, rerr := e.runForwardedCommand(state, session, sessions, iKey, targetPlatform, replyCtx, command, false, "", lockGen, false)
 	if e.ctx.Err() != nil || state.isStopped() {
 		e.cleanupInteractiveState(iKey, state)
 		return
@@ -11725,7 +11725,7 @@ func (e *Engine) cmdForwardModelCommand(p Platform, msg *Message, baseCmd string
 
 	e.send(p, msg.ReplyCtx, e.i18n.T(MsgModelSwitching))
 
-	go e.runForwardedCommand(state, session, sessions, iKey, p, msg.ReplyCtx, command, false, "", lockGen)
+	go e.runForwardedCommand(state, session, sessions, iKey, p, msg.ReplyCtx, command, false, "", lockGen, false)
 }
 
 func (e *Engine) cmdCompress(p Platform, msg *Message) {
@@ -11814,7 +11814,7 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 		return
 	}
 	e.runForwardedCommand(state, session, sessions, iKey, p, replyCtx,
-		command, auto, e.i18n.T(MsgCompressDone), lockGen)
+		command, auto, e.i18n.T(MsgCompressDone), lockGen, true)
 }
 
 // runForwardedCommand sends a native agent slash command (e.g. Hermes'
@@ -11826,7 +11826,7 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 // deferred fallback on an early-return path. When auto is true the command
 // runs silently. emptyText is shown only when the command produces no text;
 // pass "" to stay silent in that case.
-func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, command string, auto bool, emptyText string, lockGen uint64) (string, error) {
+func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, command string, auto bool, emptyText string, lockGen uint64, compression bool) (string, error) {
 	commandUnlocked := false
 	defer func() {
 		if !commandUnlocked {
@@ -11844,17 +11844,24 @@ func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, 
 
 	drainEvents(state.agentSession.Events())
 
-	if err := state.agentSession.Send(command, "", nil, nil); err != nil {
-		if !auto {
-			e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
-		}
-		if !state.agentSession.Alive() {
-			e.cleanupInteractiveState(iKey)
-		}
-		return "", err
-	}
+	// ACP session/prompt may synchronously wait for its JSON-RPC response
+	// while streaming more notifications than Events() can buffer.
+	// Drain events concurrently with Send to avoid transport backpressure.
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- state.agentSession.Send(command, "", nil, nil)
+	}()
+	return e.processForwardedEvents(state, session, sessions, iKey, p, replyCtx, &commandUnlocked, auto, emptyText, lockGen, sendDone, forwardedCommandTimeout(compression))
+}
 
-	return e.processForwardedEvents(state, session, sessions, iKey, p, replyCtx, &commandUnlocked, auto, emptyText, lockGen)
+// forwardedCommandTimeout is based on the operation, not a vendor-specific
+// command string; arbitrary user-configured compression commands get the same
+// bound, while forwarded model switches retain existing timeouts.
+func forwardedCommandTimeout(compression bool) time.Duration {
+	if compression {
+		return 5 * time.Minute
+	}
+	return 0
 }
 
 // processForwardedEvents drains agent events after a forwarded slash command
@@ -11862,9 +11869,10 @@ func (e *Engine) runForwardedCommand(state *interactiveState, session *Session, 
 // does NOT record history and treats an empty result as success rather than
 // "(empty response)". emptyText is relayed only when no text comes back; an
 // empty emptyText means "stay silent".
-func (e *Engine) processForwardedEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, emptyText string, lockGen uint64) (string, error) {
+func (e *Engine) processForwardedEvents(state *interactiveState, session *Session, sessions *SessionManager, sessionKey string, p Platform, replyCtx any, unlocked *bool, auto bool, emptyText string, lockGen uint64, sendDone <-chan error, maxDuration time.Duration) (string, error) {
 
 	var textParts []string
+	var pendingTerminal *Event // do not release session lock before Send finishes
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
 
@@ -11876,37 +11884,69 @@ func (e *Engine) processForwardedEvents(state *interactiveState, session *Sessio
 		idleCh = idleTimer.C
 	}
 
+	var hardDeadline <-chan time.Time
+	if maxDuration > 0 {
+		timer := time.NewTimer(maxDuration)
+		defer timer.Stop()
+		hardDeadline = timer.C
+	}
 	for {
 		var event Event
 		var ok bool
 
-		select {
-		case <-stopCh:
-			return "", nil
-		case event, ok = <-events:
-			if !ok {
-				e.cleanupInteractiveState(sessionKey, state)
-				if !auto {
-					if len(textParts) > 0 {
-						e.send(p, replyCtx, strings.Join(textParts, ""))
-					} else if emptyText != "" {
-						e.reply(p, replyCtx, emptyText)
+		if pendingTerminal != nil && sendDone == nil {
+			event = *pendingTerminal
+			pendingTerminal = nil
+			ok = true
+		} else {
+			select {
+			case err := <-sendDone:
+				sendDone = nil
+				if err != nil {
+					if !auto {
+						e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
 					}
+					if !state.agentSession.Alive() {
+						e.cleanupInteractiveState(sessionKey, state)
+					}
+					return "", err
 				}
-				forwardErr := fmt.Errorf("agent process exited during forwarded command")
+				continue
+			case <-hardDeadline:
+				err := fmt.Errorf("compression exceeded time limit (%v)", maxDuration)
+				if !auto {
+					e.reply(p, replyCtx, e.i18n.Tf(MsgCompressTimeout, maxDuration))
+				}
+				e.cleanupInteractiveState(sessionKey, state)
+				e.notifyDroppedQueuedMessages(state, err)
+				return strings.Join(textParts, ""), err
+			case <-stopCh:
+				return "", nil
+			case event, ok = <-events:
+				if !ok {
+					e.cleanupInteractiveState(sessionKey, state)
+					if !auto {
+						if len(textParts) > 0 {
+							e.send(p, replyCtx, strings.Join(textParts, ""))
+						} else if emptyText != "" {
+							e.reply(p, replyCtx, emptyText)
+						}
+					}
+					forwardErr := fmt.Errorf("agent process exited during forwarded command")
+					e.notifyDroppedQueuedMessages(state, forwardErr)
+					return strings.Join(textParts, ""), forwardErr
+				}
+			case <-idleCh:
+				if !auto {
+					e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
+				}
+				forwardErr := fmt.Errorf("forwarded command timed out")
+				e.cleanupInteractiveState(sessionKey, state)
 				e.notifyDroppedQueuedMessages(state, forwardErr)
 				return strings.Join(textParts, ""), forwardErr
+			case <-e.ctx.Done():
+				return "", nil
 			}
-		case <-idleCh:
-			if !auto {
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "compress timed out"))
-			}
-			forwardErr := fmt.Errorf("forwarded command timed out")
-			e.cleanupInteractiveState(sessionKey, state)
-			e.notifyDroppedQueuedMessages(state, forwardErr)
-			return strings.Join(textParts, ""), forwardErr
-		case <-e.ctx.Done():
-			return "", nil
 		}
 
 		if state.isStopped() {
@@ -11944,6 +11984,16 @@ func (e *Engine) processForwardedEvents(state *interactiveState, session *Sessio
 				textParts = append(textParts, fmt.Sprintf(e.i18n.T(MsgToolResult), tn, out)+"\n")
 			}
 		case EventResult:
+			if sendDone != nil {
+				// A synchronous adapter can emit Result immediately before
+				// its Send returns; wait for the send's actual error status.
+				// Preserve an earlier terminal error rather than claiming success.
+				if pendingTerminal == nil {
+					pending := event
+					pendingTerminal = &pending
+				}
+				continue
+			}
 			result := event.Content
 			if result == "" && len(textParts) > 0 {
 				result = strings.Join(textParts, "")
@@ -11960,6 +12010,14 @@ func (e *Engine) processForwardedEvents(state *interactiveState, session *Sessio
 			e.drainQueuedMessagesAfterCompress(state, session, sessions, sessionKey, unlocked, lockGen)
 			return result, nil
 		case EventError:
+			if sendDone != nil {
+				// A synchronous adapter may emit an error notification before
+				// its Send returns. Keep the session locked until Send finishes
+				// so a new turn cannot overlap the still-active JSON-RPC call.
+				pending := event
+				pendingTerminal = &pending
+				continue
+			}
 			if !auto && event.Error != nil {
 				e.reply(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), event.Error))
 			}

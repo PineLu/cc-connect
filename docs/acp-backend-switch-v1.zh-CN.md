@@ -63,3 +63,11 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 - CodeBuddy 的 ACP `available_commands_update` 确认公告 `compact`。Generic 只有收到公告后才开放 `/compact`；不依赖厂商名称和额外的预设配置。
 - 隔离空会话 `/compact` 可返回协议 `end_turn`，但非空历史测试尚未完成一个可验证的初始回合，**真正减少上下文 token 尚未验收**。飞书实测前不得声称完整压缩 PASS。
 - 飞书脚注请给 `Ctx` 加空值判断；目标项目的 `footer_template` 必须包含 `{{if .Ctx}} · ctx {{.Ctx}}%{{end}}`，不能直接固定拼接 `ctx {{.Ctx}}%`，否则 QoderCN 缺上下文数据时仍显示 `ctx %`。
+
+## 上下文压缩补充排查（2026-10-23）
+
+- CodeBuddy 2.158.0 的隔离 ACP `available_commands_update` 包含 `compact` 与 `_compact`，其原生手动压缩命令存在，但飞书 `/compress` 曾长时间停留在压缩中。
+- 找到 cc-connect 事件背压问题：`runForwardedCommand` 原来同步等待 `session/prompt` 返回，随后才读取事件；ACP Session 的 128 条事件缓冲区满时，读循环会阻塞，从而无法继续读取 JSON-RPC 的完成响应。已用 200 条同步事件故障注入复现，修复为异步发送同时实时消费；发送失败也立即回报。
+- 新增压缩绝对上限 5 分钟（与其他普通 Agent 消息的超时分离），超过后明确报错并清理卡住的会话，而不是继续等待默认的 2 小时空闲超时。该上限是安全兜底，不代表实际压缩已成功。
+- QoderCN 1.1.76 的 `available_commands_update` 未公告手动 `compact`。官方 ACP 文档列出「上下文压缩」支持，但当前 ACP 斜杠命令列表未包含手动压缩。因此应区分「自动上下文压缩机制支持」与「用户主动通过 ACP 斜杠命令压缩」：暂不向 QoderCN 暴露手动按钮，不能按 CLI 交互模式的 `/compact` 支持情况猜测 ACP 行为。
+- 以上修复仍需真实 CodeBuddy 长会话、飞书压缩回合和压缩前后上下文用量复测，不把单元测试当作终端验收。
