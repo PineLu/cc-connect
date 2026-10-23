@@ -10120,6 +10120,64 @@ func TestAutoCompress_TriggerAfterResult(t *testing.T) {
 	}
 }
 
+// TestAutoCompress_UsesBoundWorkspaceAgentCommand guards the multi-workspace
+// path: the active session must not inherit the global agent's slash command.
+func TestAutoCompress_UsesBoundWorkspaceAgentCommand(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	sess := newQueuingSession("auto-workspace-compress")
+	sess.contextUsage = &ContextUsage{UsedTokens: 50_000, ContextWindow: 200_000}
+	defaultAgent := &stubCompressorAgent{cmd: "/wrong-global-command"}
+	workspaceAgent := &stubCompressorAgent{cmd: "/compress"}
+	e := NewEngine("test", defaultAgent, []Platform{p}, "", LangEnglish)
+	e.SetAutoCompressConfig(true, 4, 0)
+	key := "test:user1"
+	state := &interactiveState{
+		agentSession: sess,
+		agent:        workspaceAgent,
+		platform:     p,
+		replyCtx:     "ctx",
+	}
+	e.interactiveMu.Lock()
+	e.interactiveStates[key] = state
+	e.interactiveMu.Unlock()
+	session := e.sessions.GetOrCreateActive(key)
+	session.AddHistory("user", "hello")
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, key, "msg1", time.Now(), func() {}, nil, nil, 0)
+		close(done)
+	}()
+	sess.events <- Event{Type: EventResult, Content: "response", Done: true}
+	deadline := time.After(3 * time.Second)
+	for {
+		sess.sendMu.Lock()
+		n := len(sess.sendCalls)
+		var cmd string
+		if n != 0 {
+			cmd = sess.sendCalls[0]
+		}
+		sess.sendMu.Unlock()
+		if n != 0 {
+			if cmd != "/compress" {
+				t.Fatalf("workspace compression sent %q, want /compress", cmd)
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for workspace auto-compress")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	sess.events <- Event{Type: EventResult, Done: true}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("auto-compress did not finish")
+	}
+}
+
 // TestAutoCompress_UsesRealUsageWhenAvailable verifies that when the agent session
 // implements ContextUsageReporter and reports a real API token count, the auto-compress
 // trigger uses that real number instead of the text-only heuristic — even when the

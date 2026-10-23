@@ -6461,8 +6461,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			// Auto-compress after finishing a turn, before sending any queued messages.
 			if triggerAutoCompress {
-				compressor, ok := e.agent.(ContextCompressor)
-				if ok && compressor.CompressCommand() != "" {
+				// Follow the live session agent, not the engine default in multi-workspace mode.
+				command := e.compressCommandForState(state)
+				if command != "" {
 					if pendingSend != nil {
 						if err := <-pendingSend; err != nil {
 							slog.Debug("async send error before compress", "error", err)
@@ -6482,7 +6483,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					e.send(state.platform, state.replyCtx, compressNotice)
 
 					// Run compress inline while the session is still locked.
-					e.runCompress(state, session, sessions, sessionKey, state.platform, state.replyCtx, true, lockGen)
+					e.runCompress(state, session, sessions, sessionKey, state.platform, state.replyCtx, command, true, lockGen)
 					return
 				}
 			}
@@ -11750,16 +11751,31 @@ func (e *Engine) cmdCompress(p Platform, msg *Message) {
 
 	e.send(p, msg.ReplyCtx, e.i18n.T(MsgCompressing))
 
-	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, false, lockGen)
+	go e.runCompress(state, session, sessions, iKey, p, msg.ReplyCtx, compressor.CompressCommand(), false, lockGen)
 }
 
-// runCompress resolves the agent's native compression command and forwards
-// it. It is a thin wrapper over runForwardedCommand; the session lock passed
-// in by the caller is always released here. When auto is true (automatic
-// compression), all user-visible messages are suppressed.
-func (e *Engine) runCompress(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, auto bool, lockGen uint64) {
-	compressor, ok := e.agent.(ContextCompressor)
-	if !ok || compressor.CompressCommand() == "" {
+// compressCommandForState resolves the command from the agent owning the
+// live session. A nil session owner (legacy state or test fixture) falls back
+// to the engine default agent.
+func (e *Engine) compressCommandForState(state *interactiveState) string {
+	agent := e.agent
+	if state != nil {
+		state.mu.Lock()
+		if state.agent != nil {
+			agent = state.agent
+		}
+		state.mu.Unlock()
+	}
+	if compressor, ok := agent.(ContextCompressor); ok {
+		return compressor.CompressCommand()
+	}
+	return ""
+}
+
+// runCompress forwards the native command resolved by its caller. The session
+// lock is always released here. Automatic compression is silent.
+func (e *Engine) runCompress(state *interactiveState, session *Session, sessions *SessionManager, iKey string, p Platform, replyCtx any, command string, auto bool, lockGen uint64) {
+	if strings.TrimSpace(command) == "" {
 		if !auto {
 			e.reply(p, replyCtx, e.i18n.T(MsgCompressNotSupported))
 		}
@@ -11767,7 +11783,7 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 		return
 	}
 	e.runForwardedCommand(state, session, sessions, iKey, p, replyCtx,
-		compressor.CompressCommand(), auto, e.i18n.T(MsgCompressDone), lockGen)
+		command, auto, e.i18n.T(MsgCompressDone), lockGen)
 }
 
 // runForwardedCommand sends a native agent slash command (e.g. Hermes'
