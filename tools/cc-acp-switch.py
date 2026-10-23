@@ -30,12 +30,44 @@ OTHER = {
     "cline": {"cmd": "/opt/homebrew/bin/cline",
               "args": ["--acp", "--auto-approve", "false"],
               "extension": "generic", "display_name": "Cline (ACP)"},
-    # Codex CLI itself is not an ACP server. This installed adapter bridges
-    # ACP stdio to Codex App Server and reuses existing ~/.codex auth.
-    "codex": {"cmd": "/opt/homebrew/bin/codex-acp",
-              "args": [], "extension": "generic", "display_name": "Codex (ACP)"},
+    # All cc-connect Codex ACP sessions use a shared, independently
+    # authenticated CODEX_HOME; never inherit the desktop ~/.codex state.
+    "codex": {"cmd": str(Path(__file__).resolve().parent / "cc-codex"),
+              "args": ["acp"], "extension": "generic", "display_name": "Codex (ACP)"},
 }
 BACKENDS = ("hermes", *OTHER)
+LEGACY_CODEX = {"cmd": "/opt/homebrew/bin/codex-acp", "args": [],
+                "extension": "generic", "display_name": "Codex (ACP)"}
+
+def snapshot_name(backend, profile):
+    # Legacy ~/.codex thread IDs cannot be loaded by isolated CODEX_HOME.
+    # Keep the old snapshot as codex.json, and use a separate name henceforth.
+    return "codex-isolated" if backend == "codex" and profile == OTHER["codex"] else backend
+
+def codex_isolation_upgrade(profiles, target, strict=True):
+    if target != "codex":
+        return False
+    existing = profiles["codex"]
+    if existing == OTHER["codex"]:
+        return False
+    if existing != LEGACY_CODEX:
+        if strict:
+            raise Refuse("custom Codex ACP profile; cannot automatically migrate to isolated CODEX_HOME")
+        return False
+    return True
+
+def require_independent_codex_login():
+    root = Path.home() / ".cc-connect" / ".codex-home"
+    if root.is_symlink() or not root.is_dir():
+        raise Refuse("private Codex Home is missing or unsafe")
+    auth = root / "auth.json"
+    if auth.is_symlink():
+        raise Refuse("independent Codex auth must not be a symlink to desktop credentials")
+    proc = subprocess.run([str(Path(__file__).resolve().parent / "cc-codex"), "login-status"],
+                          capture_output=True, text=True, timeout=20)
+    if proc.returncode != 0:
+        raise Refuse("cc-connect Codex is not independently logged in; run tools/cc-codex login --device-auth")
+
 
 class Refuse(RuntimeError):
     pass
@@ -300,7 +332,10 @@ def recover(configfile, plist, yes=False):
         saved_backend=info.get("from")
         if saved_backend not in BACKENDS:
             raise Refuse("invalid source backend in transaction")
-        previous_snapshot=root/"sessions"/(saved_backend+".json")
+        snapshot_key=info.get("previous_snapshot", saved_backend)
+        if snapshot_key not in (*BACKENDS, "codex-isolated"):
+            raise Refuse("invalid recovery session snapshot key")
+        previous_snapshot=root/"sessions"/(snapshot_key+".json")
         previous_backup=txn/"previous-snapshot.json"
         for x in (session_backup,state_backup,previous_snapshot,previous_backup):
             regular(x)
@@ -339,16 +374,21 @@ def use(configfile, plist, target, dry_run=False, yes=False, probe_target=True):
     ensure_single_workspace(cfg,data)
     state0=load_state(root)
     definition,old=profile_and_active(opts,state0)
-    if old==target: return f"already using {target}; no restart"
-    profile=definition["profiles"][target]
+    upgrade=codex_isolation_upgrade(definition["profiles"], target)
+    if old==target and not upgrade:
+        return f"already using {target}; no restart"
+    profile=OTHER["codex"] if upgrade else definition["profiles"][target]
     session=session_path(data,opts)
     regular(configfile); regular(session); regular(plist)
     binary(profile)
     next_config=patch_config(raw,profile)
     if dry_run:
-        return f"PLAN {old} -> {target}; preserve {session.name} separately; restart whole service; no changes"
+        detail=" (isolate Codex Home)" if upgrade else ""
+        return f"PLAN {old} -> {target}{detail}; preserve {session.name} separately; restart whole service; no changes"
     if not yes:
         raise Refuse("will restart all cc-connect projects; use --yes only when no active tasks")
+    if target=="codex":
+        require_independent_codex_login()
     if probe_target:
         probe(profile)
     # Private store and advisory lock: only one switcher process at a time.
@@ -377,8 +417,12 @@ def use(configfile, plist, target, dry_run=False, yes=False, probe_target=True):
         session_changed=False
         previous_changed=False
         txn=root/"transactions"/(time.strftime("%Y%m%dT%H%M%S")+"-"+str(os.getpid())+"-"+str(time.time_ns()))
-        prev_snapshot=root/"sessions"/(old+".json")
-        target_snapshot=root/"sessions"/(target+".json")
+        old_snapshot_key=snapshot_name(old, definition["profiles"][old])
+        next_snapshot_key=snapshot_name(target, profile)
+        prev_snapshot=root/"sessions"/(old_snapshot_key+".json")
+        target_snapshot=root/"sessions"/(next_snapshot_key+".json")
+        if prev_snapshot==target_snapshot:
+            raise Refuse("cannot isolate ACP session snapshot when paths are equal")
         try:
             # Re-evaluate after shutdown in case runtime workdir state changed.
             if session_path(data,opts) != session:
@@ -405,6 +449,7 @@ def use(configfile, plist, target, dry_run=False, yes=False, probe_target=True):
             # Durable journal + all backups must exist before touching ANY
             # vendor snapshot, live session file, or config.
             journal={"transaction":txn.name,"from":old,
+                     "previous_snapshot":old_snapshot_key,
                      "had_session":before_session is not None,
                      "had_state":prior_state.exists(),
                      "had_previous_snapshot":previous_data is not None}
@@ -424,8 +469,13 @@ def use(configfile, plist, target, dry_run=False, yes=False, probe_target=True):
             service(plist,"start")
             await_state(True)
             updated=dict(definition)
+            updated["profiles"]=dict(definition["profiles"])
+            if upgrade:
+                updated["profiles"]["codex"]=dict(profile)
             updated["active"]=target
-            updated["previous"]=old
+            # Re-profiling an active Codex is a migration, not a backend
+            # switch; keep rollback pointing at the previous *other* agent.
+            updated["previous"]=definition.get("previous") if old==target else old
             atomic(root/"state.json",json.dumps(updated,ensure_ascii=False,indent=2).encode())
             pending_path(root).unlink()
         except Exception as err:
@@ -483,12 +533,18 @@ def main():
                                         load_state(root))
         if args.action=="status":
             live,pid=service_state()
-            print(f"{PROJECT}: {active}; service={live}, pid={pid or '-'}")
+            legacy=" (legacy shared Codex Home; migration pending)" if (
+                active=="codex" and codex_isolation_upgrade(state["profiles"],"codex",strict=False)) else ""
+            print(f"{PROJECT}: {active}{legacy}; service={live}, pid={pid or '-'}")
         elif args.action=="list":
             for name,profile in state["profiles"].items():
-                print(f"{name}: {'ACTIVE' if name==active else 'available' if shutil.which(profile['cmd']) else 'MISSING'}")
+                status='ACTIVE' if name==active else 'available' if shutil.which(profile['cmd']) else 'MISSING'
+                if name=="codex" and codex_isolation_upgrade(state["profiles"],"codex",strict=False):
+                    status += " (legacy shared Home; isolated upgrade available)"
+                print(f"{name}: {status}")
         elif args.action=="check":
-            probe(state["profiles"][args.backend])
+            upgrade=codex_isolation_upgrade(state["profiles"],args.backend,strict=False)
+            probe(OTHER["codex"] if upgrade else state["profiles"][args.backend])
             print(f"{args.backend}: initialize PASS (no chat or session created)")
         else:
             target=args.backend if args.action=="use" else state.get("previous")

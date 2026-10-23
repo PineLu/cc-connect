@@ -151,8 +151,8 @@ class TestSwitcher(unittest.TestCase):
         self.assertEqual(active, "hermes")
         self.assertEqual(set(state["profiles"]), set(switch.BACKENDS))
         codex = state["profiles"]["codex"]
-        self.assertEqual(codex["cmd"], "/opt/homebrew/bin/codex-acp")
-        self.assertEqual(codex["args"], [])
+        self.assertEqual(codex["cmd"], str(HERE / "cc-codex"))
+        self.assertEqual(codex["args"], ["acp"])
         self.assertEqual(codex["extension"], "generic")
         self.assertNotIn("model_command", codex)
         self.assertNotIn("compress_command", codex)
@@ -162,7 +162,7 @@ class TestSwitcher(unittest.TestCase):
         self.assertEqual(obj["projects"][1]["platforms"],
                          self.parsed["projects"][1]["platforms"])
         self.assertEqual(obj["projects"][1]["agent"]["options"]["cmd"], codex["cmd"])
-        self.assertEqual(obj["projects"][1]["agent"]["options"]["args"], [])
+        self.assertEqual(obj["projects"][1]["agent"]["options"]["args"], ["acp"])
         restored = switch.patch_config(changed, state["profiles"]["hermes"])
         self.assertEqual(switch.tomllib.loads(restored.decode()), self.parsed)
 
@@ -194,7 +194,9 @@ class TestSwitcher(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), cline_raw)
         self.assertEqual(self.session.read_bytes(), self.previous)
 
-    def test_codex_session_isolation_and_rollback(self):
+    @mock.patch.object(switch, "require_independent_codex_login")
+    def test_codex_session_isolation_and_rollback(self, check_login):
+        check_login.return_value = None
         contexts = (mock.patch.object(switch, "binary", return_value="/tmp/fake"),
                     mock.patch.object(switch, "service"),
                     mock.patch.object(switch, "await_state"),
@@ -216,13 +218,114 @@ class TestSwitcher(unittest.TestCase):
         self.assertIn("codex -> hermes",
                       switch.use(self.config, self.plist, "hermes",
                                  yes=True, probe_target=False))
-        self.assertEqual((root / "sessions/codex.json").read_bytes(), codex_data)
+        self.assertEqual((root / "sessions/codex-isolated.json").read_bytes(), codex_data)
         self.assertEqual(self.session.read_bytes(), self.previous)
         self.assertIn("hermes -> codex",
                       switch.use(self.config, self.plist, "codex",
                                  yes=True, probe_target=False))
         self.assertEqual(self.session.read_bytes(), codex_data)
         self.assertEqual(json.loads((root / "state.json").read_text())["active"], "codex")
+
+    def test_codex_active_legacy_migration_preserves_old_snapshot_and_previous_backend(self):
+        definition, _ = switch.profile_and_active(self.project["agent"]["options"], None)
+        profiles = dict(definition["profiles"])
+        profiles["codex"] = dict(switch.LEGACY_CODEX)
+        legacy = {"active": "codex", "previous": "codebuddy", "profiles": profiles}
+        old_config = switch.patch_config(self.raw, switch.LEGACY_CODEX)
+        self.config.write_bytes(old_config)
+        root, _ = switch.private_root(switch.get_config(self.config)[1])
+        root.mkdir(parents=True)
+        (root/"state.json").write_text(json.dumps(legacy))
+        old_session = b'{"sessions":{"old-codex":{"agent_session_id":"desktop-home-thread"}}}'
+        self.session.write_bytes(old_session)
+        with mock.patch.object(switch, "binary", return_value="/tmp/fake"), \
+             mock.patch.object(switch, "require_independent_codex_login"), \
+             mock.patch.object(switch, "service"), \
+             mock.patch.object(switch, "await_state"), \
+             mock.patch.object(switch, "service_state", return_value=("running", 1234)):
+            result = switch.use(self.config, self.plist, "codex", yes=True, probe_target=False)
+        self.assertIn("codex -> codex", result)
+        self.assertFalse(self.session.exists())
+        self.assertEqual((root/"sessions/codex.json").read_bytes(), old_session)
+        self.assertFalse((root/"sessions/codex-isolated.json").exists())
+        state = json.loads((root/"state.json").read_text())
+        self.assertEqual(state["active"], "codex")
+        self.assertEqual(state["previous"], "codebuddy")
+        self.assertEqual(state["profiles"]["codex"], switch.OTHER["codex"])
+        self.assertEqual(switch.get_config(self.config)[2]["agent"]["options"]["cmd"],
+                         switch.OTHER["codex"]["cmd"])
+
+    def test_codex_migration_requires_independent_login_before_restart(self):
+        definition, _ = switch.profile_and_active(self.project["agent"]["options"], None)
+        profiles = dict(definition["profiles"])
+        profiles["codex"] = dict(switch.LEGACY_CODEX)
+        state = {"active": "codex", "previous": "codebuddy", "profiles": profiles}
+        self.config.write_bytes(switch.patch_config(self.raw, switch.LEGACY_CODEX))
+        before = self.config.read_bytes()
+        root, _ = switch.private_root(switch.get_config(self.config)[1])
+        root.mkdir(parents=True)
+        (root/"state.json").write_text(json.dumps(state))
+        with mock.patch.object(switch, "binary", return_value="/tmp/fake"), \
+             mock.patch.object(switch, "require_independent_codex_login",
+                               side_effect=switch.Refuse("not independently logged in")), \
+             mock.patch.object(switch, "service", side_effect=AssertionError("restarted")):
+            with self.assertRaisesRegex(switch.Refuse, "not independently logged in"):
+                switch.use(self.config, self.plist, "codex", yes=True, probe_target=False)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.session.read_bytes(), self.previous)
+        self.assertEqual(json.loads((root/"state.json").read_text()), state)
+
+    def test_codex_legacy_migration_recovers_interrupted_switch(self):
+        definition, _ = switch.profile_and_active(self.project["agent"]["options"], None)
+        profiles = dict(definition["profiles"]); profiles["codex"] = dict(switch.LEGACY_CODEX)
+        state = {"active": "codex", "previous": "codebuddy", "profiles": profiles}
+        self.config.write_bytes(switch.patch_config(self.raw, switch.LEGACY_CODEX))
+        original_config = self.config.read_bytes()
+        root, _ = switch.private_root(switch.get_config(self.config)[1]); root.mkdir(parents=True)
+        (root/"state.json").write_text(json.dumps(state))
+        first = {"value": True}
+        def interrupt(plist, action):
+            if action == "start" and first["value"]:
+                first["value"] = False
+                raise KeyboardInterrupt("simulated restart interruption")
+        with mock.patch.object(switch, "binary", return_value="/tmp/fake"), \
+             mock.patch.object(switch, "require_independent_codex_login"), \
+             mock.patch.object(switch, "service", side_effect=interrupt), \
+             mock.patch.object(switch, "await_state"), \
+             mock.patch.object(switch, "service_state", return_value=("running",1234)):
+            with self.assertRaises(KeyboardInterrupt):
+                switch.use(self.config, self.plist, "codex", yes=True, probe_target=False)
+        self.assertTrue((root/"pending.json").exists())
+        with mock.patch.object(switch, "service"), \
+             mock.patch.object(switch, "await_state"), \
+             mock.patch.object(switch, "service_state", return_value=("running",1234)):
+            switch.recover(self.config, self.plist, yes=True)
+        self.assertEqual(self.config.read_bytes(), original_config)
+        self.assertEqual(self.session.read_bytes(), self.previous)
+        self.assertEqual(json.loads((root/"state.json").read_text()), state)
+        self.assertFalse((root/"pending.json").exists())
+
+    def test_custom_codex_profile_is_readable_but_not_automatically_migrated(self):
+        original, _ = switch.profile_and_active(self.project["agent"]["options"], None)
+        custom = dict(original["profiles"]["codex"])
+        custom["cmd"] = "/tmp/user-custom-codex-acp"
+        profiles = dict(original["profiles"])
+        profiles["codex"] = custom
+        self.assertFalse(switch.codex_isolation_upgrade(profiles, "codex", strict=False))
+        with self.assertRaisesRegex(switch.Refuse, "custom Codex ACP profile"):
+            switch.codex_isolation_upgrade(profiles, "codex")
+        state = {"active": "codex", "previous": "codebuddy", "profiles": profiles}
+        self.config.write_bytes(switch.patch_config(self.raw, custom))
+        root, _ = switch.private_root(switch.get_config(self.config)[1])
+        root.mkdir(parents=True)
+        (root/"state.json").write_text(json.dumps(state))
+        opts = switch.get_config(self.config)[2]["agent"]["options"]
+        recovered, current = switch.profile_and_active(opts, switch.load_state(root))
+        self.assertEqual(current, "codex")
+        self.assertEqual(recovered["profiles"]["codex"], custom)
+        with mock.patch.object(switch, "binary", return_value="/tmp/fake"):
+            with self.assertRaisesRegex(switch.Refuse, "custom Codex ACP profile"):
+                switch.use(self.config, self.plist, "codex", dry_run=True)
 
     def test_workspace_session_files_fail_closed(self):
         extra=self.dir/"sessions"/(switch.PROJECT+"_ws_deadbeef.json")
