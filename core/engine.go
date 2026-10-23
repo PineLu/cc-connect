@@ -10855,7 +10855,11 @@ func (e *Engine) cmdModelsText(p Platform, msg *Message, agent Agent) {
 func (e *Engine) renderModelsCard(sessionKey string, agent Agent) *Card {
 	groups, total := e.collectModelDetails(agent)
 	if total == 0 {
-		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelsNotSupported))
+		body := e.i18n.T(MsgModelsNotSupported)
+		if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+			body += "\n\n" + e.i18n.Tf(MsgModelsNativeCommandAvailable, passer.ModelCommand())
+		}
+		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", body)
 	}
 
 	var opts []CardSelectOption
@@ -13589,6 +13593,12 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 
 func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 	agent, sessions := e.sessionContextForKey(sessionKey)
+	// Legacy /model card callback indices are NOT interchangeable with those
+	// in /models. Always render a fresh picker for ModelCommand agents and
+	// ignore legacy callback args to avoid switching to the wrong model.
+	if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+		return e.renderModelsCard(sessionKey, agent)
+	}
 	switcher, ok := agent.(ModelSwitcher)
 	if !ok {
 		return e.simpleCard(e.i18n.T(MsgCardTitleModel), "indigo", e.i18n.T(MsgModelNotSupported))
@@ -14451,6 +14461,12 @@ func (e *Engine) renderModelCard(sessionKey string) *Card {
 	agent := e.agent
 	if sessionKey != "" {
 		agent, _ = e.sessionContextForKey(sessionKey)
+	}
+	// /help links to nav:/model. ACP's ModelCommand is a valid switching
+	// capability, but it does not implement the structured ModelSwitcher.
+	// Reuse the /models picker, which already supports native ACP commands.
+	if passer, ok := agent.(ModelCommand); ok && passer.ModelCommand() != "" {
+		return e.renderModelsCard(sessionKey, agent)
 	}
 
 	switcher, ok := agent.(ModelSwitcher)

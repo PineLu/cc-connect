@@ -16865,6 +16865,64 @@ func cardMarkdownText(card *Card) string {
 	return sb.String()
 }
 
+// stubModelCommandListerAgent models an ACP agent whose /model uses a native
+// slash command, while /models comes from vendor-specific offline discovery.
+type stubModelCommandListerAgent struct {
+	stubModelCommandAgent
+}
+
+func (a *stubModelCommandListerAgent) ListModelsDetail(_ context.Context) []ModelDetail {
+	return []ModelDetail{{
+		Name:          "model-a",
+		Provider:      "test-provider",
+		SwitchCommand: "/model test-provider:model-a",
+	}}
+}
+
+// TestModelHelpCard_UsesNativeACPCommand prevents the /help -> "Model" card
+// from claiming ACP model switching is unsupported when /model is configured.
+// Structured ModelSwitcher and ModelCommand are alternate capabilities.
+func TestModelHelpCard_UsesNativeACPCommand(t *testing.T) {
+	agent := &stubModelCommandListerAgent{stubModelCommandAgent: stubModelCommandAgent{cmd: "/model"}}
+	e := NewEngine("test", agent, nil, "", LangChinese)
+	sessionKey := "feishu:channel1:user1"
+	card := e.handleCardNav("nav:/model", sessionKey)
+	if card == nil {
+		t.Fatal("expected a model navigation card")
+	}
+	got := card.RenderText()
+	if strings.Contains(got, e.i18n.T(MsgModelNotSupported)) || !strings.Contains(got, "model-a") {
+		t.Fatalf("/help model card should show ACP model list, got %q", got)
+	}
+	// Stale /model actions should never be interpreted via the structured
+	// switcher or change a model without a live ACP session.
+	card = e.handleCardNav("act:/model", sessionKey)
+	if card == nil || !strings.Contains(card.RenderText(), "model-a") {
+		t.Fatalf("ACP model action should open model list, got %v", card)
+	}
+	card = e.handleCardNav("act:/model switch 1", sessionKey)
+	if card == nil || !strings.Contains(card.RenderText(), "model-a") {
+		t.Fatalf("stale ACP model callback must only render a fresh picker, got %v", card)
+	}
+}
+
+func TestModelHelpCard_NativeCommandWithoutModelDiscovery(t *testing.T) {
+	agent := &stubModelCommandAgent{cmd: "/model"}
+	e := NewEngine("test", agent, nil, "", LangChinese)
+	sessionKey := "feishu:channel1:user1"
+	card := e.handleCardNav("nav:/model", sessionKey)
+	if card == nil {
+		t.Fatal("expected a model card for an agent with a native command")
+	}
+	got := card.RenderText()
+	if !strings.Contains(got, e.i18n.T(MsgModelsNotSupported)) ||
+		!strings.Contains(got, "/model") ||
+		!strings.Contains(got, "已配置原生模型命令") ||
+		strings.Contains(got, e.i18n.T(MsgModelNotSupported)) {
+		t.Fatalf("command-capable agent must show command fallback, got %q", got)
+	}
+}
+
 // TestModelsCardAction_ModelCommand_SwitchNotifiesAndRefreshes verifies the
 // full card-switch path with a live session: the dropdown selection returns a
 // "switching" card, forwards "/model ..." to the agent, relays the agent's

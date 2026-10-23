@@ -332,20 +332,21 @@ const (
 	MsgCronBtnUnmute          MsgKey = "cron_btn_unmute"
 	MsgCronBtnDelete          MsgKey = "cron_btn_delete"
 
-	MsgStatusTitle           MsgKey = "status_title"
-	MsgReplyFooterRemaining  MsgKey = "reply_footer_remaining"
-	MsgModelCurrent          MsgKey = "model_current"
-	MsgModelChanged          MsgKey = "model_changed"
-	MsgModelChangeFailed     MsgKey = "model_change_failed"
-	MsgModelCardSwitching    MsgKey = "model_card_switching"
-	MsgModelCardSwitched     MsgKey = "model_card_switched"
-	MsgModelCardSwitchFailed MsgKey = "model_card_switch_failed"
-	MsgModelNotSupported     MsgKey = "model_not_supported"
-	MsgModelsNotSupported    MsgKey = "models_not_supported"
-	MsgModelsUsage           MsgKey = "models_usage"
-	MsgReasoningCurrent      MsgKey = "reasoning_current"
-	MsgReasoningChanged      MsgKey = "reasoning_changed"
-	MsgReasoningNotSupported MsgKey = "reasoning_not_supported"
+	MsgStatusTitle                  MsgKey = "status_title"
+	MsgReplyFooterRemaining         MsgKey = "reply_footer_remaining"
+	MsgModelCurrent                 MsgKey = "model_current"
+	MsgModelChanged                 MsgKey = "model_changed"
+	MsgModelChangeFailed            MsgKey = "model_change_failed"
+	MsgModelCardSwitching           MsgKey = "model_card_switching"
+	MsgModelCardSwitched            MsgKey = "model_card_switched"
+	MsgModelCardSwitchFailed        MsgKey = "model_card_switch_failed"
+	MsgModelNotSupported            MsgKey = "model_not_supported"
+	MsgModelsNotSupported           MsgKey = "models_not_supported"
+	MsgModelsNativeCommandAvailable MsgKey = "models_native_command_available"
+	MsgModelsUsage                  MsgKey = "models_usage"
+	MsgReasoningCurrent             MsgKey = "reasoning_current"
+	MsgReasoningChanged             MsgKey = "reasoning_changed"
+	MsgReasoningNotSupported        MsgKey = "reasoning_not_supported"
 
 	MsgCompressNotSupported MsgKey = "compress_not_supported"
 	MsgCompressing          MsgKey = "compressing"
@@ -2332,6 +2333,13 @@ var messages = map[MsgKey]map[Language]string{
 		LangTraditionalChinese: "當前 Agent 不支援列出模型列表。",
 		LangJapanese:           "このエージェントはモデル一覧を提供していません。",
 		LangSpanish:            "Este agente no informa una lista de modelos.",
+	},
+	MsgModelsNativeCommandAvailable: {
+		LangEnglish:            "Native model command %s is configured. Send it directly in an active session to query or change the model as supported by the agent.",
+		LangChinese:            "已配置原生模型命令 %s。请在活跃会话中直接发送该命令，按 Agent 支持的格式查询或切换模型。",
+		LangTraditionalChinese: "已配置原生模型命令 %s。請在活躍會話中直接發送該命令，按 Agent 支援的格式查詢或切換模型。",
+		LangJapanese:           "ネイティブモデルコマンド %s が設定されています。アクティブなセッションで直接送信すると、Agent がサポートする方法でモデルを確認・変更できます。",
+		LangSpanish:            "El comando nativo de modelo %s está configurado. Envíalo directamente en una sesión activa para consultar o cambiar el modelo según lo admita el agente.",
 	},
 	MsgModelsUsage: {
 		LangEnglish:            "Copy a line and send it to switch models.",
