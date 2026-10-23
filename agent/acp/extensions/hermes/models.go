@@ -63,7 +63,7 @@ type hermesModelConfig struct {
 		Provider string `yaml:"provider"`
 		BaseURL  string `yaml:"base_url"`
 	} `yaml:"model"`
-	Providers map[string]hermesProviderConfig `yaml:"providers"`
+	Providers         map[string]hermesProviderConfig `yaml:"providers"`
 	FallbackProviders []struct {
 		Provider string `yaml:"provider"`
 		Model    string `yaml:"model"`
@@ -122,7 +122,6 @@ func beijingTime(ts float64) string {
 func acpSwitchCommand(prefix, model string) string {
 	return "/model " + prefix + ":" + model
 }
-
 
 func ListModels(ctx context.Context, args []string) []core.ModelDetail {
 
@@ -195,8 +194,13 @@ func ListModels(ctx context.Context, args []string) []core.ModelDetail {
 				ProviderLabel:  prov + " 自定源",
 				CustomProvider: true,
 				SwitchCommand:  acpSwitchCommand(prefix, m),
-				Note:           func() string { if ok { return "缓存 " + beijingTime(entry.At) }; return "config 指定" }(),
-				Current:        hermesCurrentModel(cfg, prov, endpoint, m),
+				Note: func() string {
+					if ok {
+						return "缓存 " + beijingTime(entry.At)
+					}
+					return "config 指定"
+				}(),
+				Current: hermesCurrentModel(cfg, prov, endpoint, m),
 			})
 		}
 	}
@@ -206,12 +210,12 @@ func ListModels(ctx context.Context, args []string) []core.ModelDetail {
 			continue
 		}
 		out = append(out, core.ModelDetail{
-			Name:           fb.Model,
-			Provider:       fb.Provider,
-			ProviderLabel:  fb.Provider,
-			SwitchCommand:  acpSwitchCommand(fb.Provider, fb.Model),
-			Note:           "fallback，config 指定",
-			Current:        fb.Model == cfg.Model.Default && fb.Provider == cfg.Model.Provider,
+			Name:          fb.Model,
+			Provider:      fb.Provider,
+			ProviderLabel: fb.Provider,
+			SwitchCommand: acpSwitchCommand(fb.Provider, fb.Model),
+			Note:          "fallback，config 指定",
+			Current:       fb.Model == cfg.Model.Default && fb.Provider == cfg.Model.Provider,
 		})
 	}
 
@@ -225,12 +229,12 @@ func ListModels(ctx context.Context, args []string) []core.ModelDetail {
 		}
 		for _, m := range entry.Models {
 			out = append(out, core.ModelDetail{
-				Name:           m,
-				Provider:       key,
-				ProviderLabel:  key,
-				SwitchCommand:  acpSwitchCommand(key, m),
-				Note:           "仅缓存有、config 未声明，能否切换不确定，缓存 " + beijingTime(entry.At),
-				Current:        m == cfg.Model.Default && key == cfg.Model.Provider,
+				Name:          m,
+				Provider:      key,
+				ProviderLabel: key,
+				SwitchCommand: acpSwitchCommand(key, m),
+				Note:          "仅缓存有、config 未声明，能否切换不确定，缓存 " + beijingTime(entry.At),
+				Current:       m == cfg.Model.Default && key == cfg.Model.Provider,
 			})
 		}
 	}

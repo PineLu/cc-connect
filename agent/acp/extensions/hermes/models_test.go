@@ -109,7 +109,6 @@ func TestListModelsDetail_Hermes(t *testing.T) {
 	}
 }
 
-
 func TestListModelsDetail_MultipleCustomProvidersDoNotShareCache(t *testing.T) {
 	home := t.TempDir()
 	dir := hermesProfileDir(home, "tujia")

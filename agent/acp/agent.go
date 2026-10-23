@@ -19,15 +19,15 @@ func init() {
 
 // Agent runs an ACP (Agent Client Protocol) agent subprocess over stdio JSON-RPC.
 type Agent struct {
-	workDir      string
-	cmd          string
-	cliExtraArgs []string // extra args from cmd, prepended before args
-	args         []string
-	staticEnv    map[string]string
-	extraEnv     []string
-	sessionEnv   []string
-	authMethod   string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
-	displayName  string // optional, for doctor (default "ACP")
+	workDir        string
+	cmd            string
+	cliExtraArgs   []string // extra args from cmd, prepended before args
+	args           []string
+	staticEnv      map[string]string
+	extraEnv       []string
+	sessionEnv     []string
+	authMethod     string // optional, e.g. "cursor_login" for Cursor CLI (see authenticate RPC)
+	displayName    string // optional, for doctor (default "ACP")
 	modelExtension string // model discovery backend: "hermes" or "generic"
 
 	// mode is the pending permission mode to apply to new sessions.
@@ -111,7 +111,9 @@ func New(opts map[string]any) (core.Agent, error) {
 	modelExtension, _ := opts["extension"].(string)
 	modelExtension = strings.ToLower(strings.TrimSpace(modelExtension))
 	// Legacy default retains existing Hermes /models behaviour until projects migrate.
-	if modelExtension == "" { modelExtension = "hermes" }
+	if modelExtension == "" {
+		modelExtension = "hermes"
+	}
 	if modelExtension != "hermes" && modelExtension != "generic" {
 		return nil, fmt.Errorf("acp: unsupported extension %q (expected hermes or generic)", modelExtension)
 	}
@@ -131,7 +133,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		extraEnv:        extra,
 		authMethod:      authMethod,
 		displayName:     displayName,
-		modelExtension: modelExtension,
+		modelExtension:  modelExtension,
 		mode:            mode,
 		compressCommand: compressCommand,
 		modelCommand:    modelCommand,
@@ -238,7 +240,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 		}
 		opts["env"] = env
 	}
-	if a.modelExtension != "" { opts["extension"] = a.modelExtension }
+	if a.modelExtension != "" {
+		opts["extension"] = a.modelExtension
+	}
 	if a.authMethod != "" {
 		opts["auth_method"] = a.authMethod
 	}
