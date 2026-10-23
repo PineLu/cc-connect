@@ -165,6 +165,76 @@ func TestListModelsDetail_MultipleCustomProvidersDoNotShareCache(t *testing.T) {
 	}
 }
 
+// A real Hermes profile may declare provider models as a mapping of model IDs
+// to options, rather than a YAML sequence. That representation must not make
+// model discovery discard otherwise valid cached providers.
+func TestListModelsDetail_ProviderModelsMappingAndTwoCaches(t *testing.T) {
+	home := t.TempDir()
+	dir := hermesProfileDir(home, "tujia")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "model:\n  default: beta\n  provider: cpa\n" +
+		"providers:\n" +
+		"  gateway:\n    api: https://first.example/v1\n    default_model: alpha\n" +
+		"  cpa:\n    base_url: https://second.example/v1\n    model: beta\n" +
+		"    models:\n      beta: {}\n      gamma: {}\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cache := "{\"custom:https://first.example/v1#f1\":{\"at\":1,\"models\":[\"alpha\"]}," +
+		"\"custom:https://second.example/v1#f2\":{\"at\":2,\"models\":[\"beta\",\"gamma\"]}}"
+	if err := os.WriteFile(filepath.Join(dir, "provider_models_cache.json"), []byte(cache), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERMES_HOME", home)
+	got := ListModels(t.Context(), []string{"-p", "tujia", "acp"})
+	byCommand := map[string]core.ModelDetail{}
+	for _, model := range got {
+		byCommand[model.SwitchCommand] = model
+	}
+	for _, command := range []string{
+		"/model custom:gateway:alpha",
+		"/model custom:cpa:beta",
+		"/model custom:cpa:gamma",
+	} {
+		if _, ok := byCommand[command]; !ok {
+			t.Fatalf("missing %s; got %v", command, keysOf(byCommand))
+		}
+	}
+	if !byCommand["/model custom:cpa:beta"].Current {
+		t.Fatal("cpa beta must be current")
+	}
+	if byCommand["/model custom:gateway:alpha"].Current {
+		t.Fatal("gateway alpha must not be current")
+	}
+}
+
+func TestListModelsDetail_ProviderModelsMappingWithoutCache(t *testing.T) {
+	home := t.TempDir()
+	dir := hermesProfileDir(home, "tujia")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "model:\n  default: beta\n  provider: cpa\n" +
+		"providers:\n  cpa:\n    base_url: https://second.example/v1\n" +
+		"    models:\n      beta: {}\n      gamma: {}\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERMES_HOME", home)
+	got := ListModels(t.Context(), []string{"-p", "tujia", "acp"})
+	byCommand := map[string]core.ModelDetail{}
+	for _, model := range got {
+		byCommand[model.SwitchCommand] = model
+	}
+	for _, command := range []string{"/model custom:cpa:beta", "/model custom:cpa:gamma"} {
+		if _, ok := byCommand[command]; !ok {
+			t.Fatalf("missing static model %s", command)
+		}
+	}
+}
+
 func TestListModelsDetail_MissingProfile(t *testing.T) {
 	t.Setenv("HERMES_HOME", filepath.Join(t.TempDir(), "does-not-exist"))
 	if got := ListModels(t.Context(), []string{"-p", "tujia", "acp"}); len(got) != 0 {

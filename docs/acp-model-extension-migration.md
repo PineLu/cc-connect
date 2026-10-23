@@ -36,3 +36,7 @@ For a different project using a non-Hermes ACP server, set `extension = "generic
 ## Validation gates
 
 Static tests verify option parsing, model isolation and workspace-specific compression dispatch. Real Hermes/CodeBuddy ACP handshake, permission, resume and reconnection tests are separate P2 gates. Live Hermes configuration must be migrated and backed up before deployment; static Go tests do not establish runtime compatibility.
+
+## Hermes profile model discovery compatibility
+
+Hermes provider configuration can declare models either as a YAML sequence of model IDs or as a mapping from model ID to options. Both shapes must be accepted; a single mapping must not prevent reading the other providers' model caches. For named profiles, the cache is read from the profile directory. If the cache is missing or invalid, explicitly declared models (and the provider default) remain available without querying any external endpoint. Regression tests use synthetic configurations and a separate read-only local profile probe verified the two cached custom providers plus fallbacks.

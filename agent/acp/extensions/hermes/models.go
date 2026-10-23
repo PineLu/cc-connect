@@ -50,11 +50,13 @@ func hermesProfileDir(home, profile string) string {
 }
 
 type hermesProviderConfig struct {
-	DefaultModel string   `yaml:"default_model"`
-	API          string   `yaml:"api"`
-	BaseURL      string   `yaml:"base_url"`
-	URL          string   `yaml:"url"`
-	Models       []string `yaml:"models"`
+	DefaultModel string `yaml:"default_model"`
+	Model        string `yaml:"model"`
+	API          string `yaml:"api"`
+	BaseURL      string `yaml:"base_url"`
+	URL          string `yaml:"url"`
+	// Hermes accepts both sequences and maps from model ID to options.
+	Models yaml.Node `yaml:"models"`
 }
 
 type hermesModelConfig struct {
@@ -77,6 +79,35 @@ type hermesModelCacheEntry struct {
 
 func normalizeHermesEndpoint(v string) string {
 	return strings.TrimRight(strings.TrimSpace(v), "/")
+}
+
+// hermesStaticModels extracts model IDs from both YAML representations.
+func hermesStaticModels(p hermesProviderConfig) []string {
+	var models []string
+	switch p.Models.Kind {
+	case yaml.SequenceNode:
+		for _, item := range p.Models.Content {
+			if item.Kind == yaml.ScalarNode && strings.TrimSpace(item.Value) != "" {
+				models = append(models, strings.TrimSpace(item.Value))
+			}
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(p.Models.Content); i += 2 {
+			name := p.Models.Content[i]
+			if name.Kind == yaml.ScalarNode && strings.TrimSpace(name.Value) != "" {
+				models = append(models, strings.TrimSpace(name.Value))
+			}
+		}
+	}
+	if len(models) == 0 {
+		if p.DefaultModel != "" {
+			return []string{p.DefaultModel}
+		}
+		if p.Model != "" {
+			return []string{p.Model}
+		}
+	}
+	return models
 }
 
 func hermesProviderEndpoint(p hermesProviderConfig) string {
@@ -140,13 +171,13 @@ func ListModels(ctx context.Context, args []string) []core.ModelDetail {
 		return nil
 	}
 
-	rawCache, err := os.ReadFile(filepath.Join(dir, "provider_models_cache.json"))
-	if err != nil {
-		return nil
-	}
-	var cache map[string]hermesModelCacheEntry
-	if err := json.Unmarshal(rawCache, &cache); err != nil {
-		return nil
+	// A populated Hermes config can still enumerate explicit models if
+	// the cache has not yet been generated or is malformed.
+	cache := make(map[string]hermesModelCacheEntry)
+	if rawCache, err := os.ReadFile(filepath.Join(dir, "provider_models_cache.json")); err == nil {
+		if err := json.Unmarshal(rawCache, &cache); err != nil {
+			cache = make(map[string]hermesModelCacheEntry)
+		}
 	}
 
 	var out []core.ModelDetail
@@ -182,10 +213,7 @@ func ListModels(ctx context.Context, args []string) []core.ModelDetail {
 		if !ok || len(models) == 0 {
 			// A declared static model list/default is still useful when model
 			// discovery is disabled or its cache is unavailable.
-			models = append([]string(nil), providerCfg.Models...)
-			if len(models) == 0 && providerCfg.DefaultModel != "" {
-				models = []string{providerCfg.DefaultModel}
-			}
+			models = hermesStaticModels(providerCfg)
 		}
 		for _, m := range models {
 			out = append(out, core.ModelDetail{
