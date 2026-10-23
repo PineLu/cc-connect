@@ -147,10 +147,15 @@ func beijingTime(ts float64) string {
 	return t.Format("2006-01-02 15:04:05")
 }
 
-// acpSwitchCommand builds the copy-pasteable switch command for the ACP
-// (Hermes) switch path: acp_adapter parses "provider:model" with no flag
-// support, and user-defined endpoints must carry the "custom:" prefix.
+// acpSwitchCommand builds a Hermes ACP gateway slash command. For named
+// providers, /model's gateway mutation parses the model and explicit provider
+// separately. The apparent "custom:cpa:model" picker ID is a *different*
+// ACP session/set_model representation: sending it via the slash command can
+// turn "cpa:model" into the downstream wire model and trigger 400 errors.
 func acpSwitchCommand(prefix, model string) string {
+	if strings.HasPrefix(prefix, "custom:") {
+		return "/model " + model + " --provider " + strings.TrimPrefix(prefix, "custom:")
+	}
 	return "/model " + prefix + ":" + model
 }
 

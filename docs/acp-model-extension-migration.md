@@ -40,3 +40,13 @@ Static tests verify option parsing, model isolation and workspace-specific compr
 ## Hermes profile model discovery compatibility
 
 Hermes provider configuration can declare models either as a YAML sequence of model IDs or as a mapping from model ID to options. Both shapes must be accepted; a single mapping must not prevent reading the other providers' model caches. For named profiles, the cache is read from the profile directory. If the cache is missing or invalid, explicitly declared models (and the provider default) remain available without querying any external endpoint. Regression tests use synthetic configurations and a separate read-only local profile probe verified the two cached custom providers plus fallbacks.
+
+## Hermes slash model-switch compatibility (2026-10-23)
+
+For named custom providers the Hermes extension constructs
+`/model <model-id> --provider <provider-name>`,
+instead of the ACP picker ID representation `custom:<provider-name>:<model-id>`.
+Gateway ACP `slash_mutation` otherwise forwards the latter as a model string
+and can cause the upstream to receive a bogus provider prefix. This is independent of
+`extension=generic` and of the compiled Web frontend.
+A previously pinned invalid Hermes session model must be switched again explicitly.

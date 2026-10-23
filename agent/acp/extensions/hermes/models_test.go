@@ -69,6 +69,25 @@ func writeHermesProfile(t *testing.T, home string) {
 	}
 }
 
+// Named Hermes providers are parsed through gateway slash_mutation.
+// The three-colon form "custom:cpa:model" is passed as the *model* string
+// to the gateway owner, which can produce a bogus cpa:model wire model.
+// Explicit --provider keeps the model ID intact.
+func TestACPSwitchCommand_NamedProviderSeparatesModelID(t *testing.T) {
+	for _, tc := range []struct {
+		provider, model, want string
+	}{
+		{"custom:cpa", "gpt-5.6-luna", "/model gpt-5.6-luna --provider cpa"},
+		{"custom:new-api-01", "cbcn/glm-5.3", "/model cbcn/glm-5.3 --provider new-api-01"},
+		{"custom:cpa", "vendor/model:free", "/model vendor/model:free --provider cpa"},
+		{"nous", "stepfun/step-3.7-flash:free", "/model nous:stepfun/step-3.7-flash:free"},
+	} {
+		if got := acpSwitchCommand(tc.provider, tc.model); got != tc.want {
+			t.Errorf("acpSwitchCommand(%q, %q) = %q, want %q", tc.provider, tc.model, got, tc.want)
+		}
+	}
+}
+
 func TestListModelsDetail_Hermes(t *testing.T) {
 	home := t.TempDir()
 	writeHermesProfile(t, home)
@@ -81,12 +100,12 @@ func TestListModelsDetail_Hermes(t *testing.T) {
 		byCommand[d.SwitchCommand] = d
 	}
 
-	// A user-defined endpoint must be addressed with the custom: prefix, and a
+	// A named endpoint must specify its provider explicitly, and a
 	// model id containing a colon must survive intact.
 	for _, want := range []string{
-		"/model custom:new-api-01:glm-5.3-flash",
-		"/model custom:new-api-01:cbcn/glm-5.3",
-		"/model custom:new-api-01:muse-spark-1.3",
+		"/model glm-5.3-flash --provider new-api-01",
+		"/model cbcn/glm-5.3 --provider new-api-01",
+		"/model muse-spark-1.3 --provider new-api-01",
 		"/model nous:stepfun/step-3.7-flash:free",
 		"/model opencode-free:mimo-v2.5-free",
 	} {
@@ -95,13 +114,13 @@ func TestListModelsDetail_Hermes(t *testing.T) {
 		}
 	}
 
-	if d := byCommand["/model custom:new-api-01:muse-spark-1.3"]; !d.Current {
+	if d := byCommand["/model muse-spark-1.3 --provider new-api-01"]; !d.Current {
 		t.Error("default model not marked Current")
 	}
-	if d := byCommand["/model custom:new-api-01:glm-5.3-flash"]; d.Current {
+	if d := byCommand["/model glm-5.3-flash --provider new-api-01"]; d.Current {
 		t.Error("non-default model marked Current")
 	}
-	if d := byCommand["/model custom:new-api-01:glm-5.3-flash"]; !d.CustomProvider {
+	if d := byCommand["/model glm-5.3-flash --provider new-api-01"]; !d.CustomProvider {
 		t.Error("custom endpoint not flagged CustomProvider")
 	}
 	if d := byCommand["/model nous:stepfun/step-3.7-flash:free"]; d.CustomProvider {
@@ -142,25 +161,25 @@ func TestListModelsDetail_MultipleCustomProvidersDoNotShareCache(t *testing.T) {
 		byCommand[d.SwitchCommand] = d
 	}
 	for _, want := range []string{
-		"/model custom:provider-a:only-a",
-		"/model custom:provider-b:only-b",
+		"/model only-a --provider provider-a",
+		"/model only-b --provider provider-b",
 	} {
 		if _, ok := byCommand[want]; !ok {
 			t.Fatalf("missing %q; got %v", want, keysOf(byCommand))
 		}
 	}
 	for _, wrong := range []string{
-		"/model custom:provider-a:only-b",
-		"/model custom:provider-b:only-a",
+		"/model only-b --provider provider-a",
+		"/model only-a --provider provider-b",
 	} {
 		if _, ok := byCommand[wrong]; ok {
 			t.Fatalf("provider cache leaked across endpoints: unexpectedly found %q", wrong)
 		}
 	}
-	if byCommand["/model custom:provider-a:shared-model"].Current {
+	if byCommand["/model shared-model --provider provider-a"].Current {
 		t.Fatal("provider-a shared model must not be marked current when provider-b is active")
 	}
-	if !byCommand["/model custom:provider-b:shared-model"].Current {
+	if !byCommand["/model shared-model --provider provider-b"].Current {
 		t.Fatal("provider-b shared model should be marked current")
 	}
 }
@@ -194,18 +213,18 @@ func TestListModelsDetail_ProviderModelsMappingAndTwoCaches(t *testing.T) {
 		byCommand[model.SwitchCommand] = model
 	}
 	for _, command := range []string{
-		"/model custom:gateway:alpha",
-		"/model custom:cpa:beta",
-		"/model custom:cpa:gamma",
+		"/model alpha --provider gateway",
+		"/model beta --provider cpa",
+		"/model gamma --provider cpa",
 	} {
 		if _, ok := byCommand[command]; !ok {
 			t.Fatalf("missing %s; got %v", command, keysOf(byCommand))
 		}
 	}
-	if !byCommand["/model custom:cpa:beta"].Current {
+	if !byCommand["/model beta --provider cpa"].Current {
 		t.Fatal("cpa beta must be current")
 	}
-	if byCommand["/model custom:gateway:alpha"].Current {
+	if byCommand["/model alpha --provider gateway"].Current {
 		t.Fatal("gateway alpha must not be current")
 	}
 }
@@ -228,7 +247,7 @@ func TestListModelsDetail_ProviderModelsMappingWithoutCache(t *testing.T) {
 	for _, model := range got {
 		byCommand[model.SwitchCommand] = model
 	}
-	for _, command := range []string{"/model custom:cpa:beta", "/model custom:cpa:gamma"} {
+	for _, command := range []string{"/model beta --provider cpa", "/model gamma --provider cpa"} {
 		if _, ok := byCommand[command]; !ok {
 			t.Fatalf("missing static model %s", command)
 		}

@@ -607,7 +607,24 @@ adapter 两个都没实现，于是命令在 core 直接被「不支持」拦下
 > 且 Hermes `/model` 不返回可选列表，所以**不采用**「让 ACP 实现完整 ModelSwitcher」的方案。
 > 代价：透传模式下 `/model` 没有点按钮选模型的卡片，需要自己知道模型名（无参可查当前）。
 
-**自定义网关（new-api 等）必须用三段式，裸模型名会掉回 openrouter 报错**：
+
+**2026-10-23 兼容性更正（当前 Hermes gateway ACP，优先遵循本段）**
+
+cc-connect 的 `/models` 模型卡片曾转发 `/model custom:cpa:gpt-5.6-luna`。在当前 Hermes Gateway ACP
+`slash_mutation` 路径，这种三段式内容会被作为一个模型字符串提交；真实运行中导致
+CPA 接收到 `cpa:gpt-5.6-luna` 并返回 HTTP 400 `model_not_found`，而后 Hermes 启用 Nous fallback。
+
+**现应使用明确的 Provider 参数：**
+- `/model gpt-5.6-luna --provider cpa`
+- `/model z-ai/glm-5.3-flash --provider new-api-01`
+
+模型 ID 与 Provider 必须分离。`session/set_model` 的结构化 ACP 模型选项允许
+`custom:cpa:gpt-5.6-luna` 这样的 `modelId`，但它与 Gateway ACP 的斜杠命令不是同一个解析入口。
+cc-connect 的 Hermes 扩展只为命名自定义 Provider 生成 `/model <model> --provider <name>`；
+原有内置 Provider 的行为暂保持不变。无需修改 CPA 或 Hermes Profile。
+下面的三段式为历史场景记录，在当前链路不再作为操作规范。
+
+**历史行为记录（旧 ACP 路径：三段式）：**
 
 Hermes 解析 `/model` 入参用的是**冒号 `:`** 分段（不是斜杠）。当 provider 是配置里的自定义
 网关（如 `new-api-01` → `http://localhost:3003/v1`）时，必须写成 `custom:<provider配置key>:<模型id>`：
