@@ -30,6 +30,10 @@ OTHER = {
     "cline": {"cmd": "/opt/homebrew/bin/cline",
               "args": ["--acp", "--auto-approve", "false"],
               "extension": "generic", "display_name": "Cline (ACP)"},
+    # Codex CLI itself is not an ACP server. This installed adapter bridges
+    # ACP stdio to Codex App Server and reuses existing ~/.codex auth.
+    "codex": {"cmd": "/opt/homebrew/bin/codex-acp",
+              "args": [], "extension": "generic", "display_name": "Codex (ACP)"},
 }
 BACKENDS = ("hermes", *OTHER)
 

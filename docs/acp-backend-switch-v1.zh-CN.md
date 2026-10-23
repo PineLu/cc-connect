@@ -2,7 +2,7 @@
 
 仅适用于现有项目 **tujia-feishu-hermes**。项目名、飞书应用、工作目录、凭据、其他四个项目及 Generic ACP 实现均不变。代码位于 tools/cc-acp-switch.py；入口为 tools/cc-acp。
 
-## 当前四套后端
+## 当前五套后端
 
 | 后端 | ACP CLI | extension | 其他 |
 | --- | --- | --- | --- |
@@ -10,6 +10,7 @@
 | CodeBuddy | /opt/homebrew/bin/codebuddy --acp | generic | 模型目录与 session/set_model 使用标准 ACP；compact 由服务端公告动态启用 |
 | QoderCN | ~/.local/bin/qoderclicn --acp | generic | 模型目录与 session/set_model 使用标准 ACP；模型展示用名称，切换用 ID |
 | Cline | /opt/homebrew/bin/cline --acp --auto-approve false | generic | 保留人工审批，复用 Generic ACP 的会话级模型列表和切换 |
+| Codex | /opt/homebrew/bin/codex-acp | generic | ACP→Codex App Server 适配器，复用本机 ~/.codex 登录及 Generic ACP 模型选择 |
 
 2026-10-23 在本机核验：CodeBuddy 2.158.0 和 QoderCN 1.1.76 均通过 stdio ACP initialize 握手。Cline 3.0.73 通过 initialize 与 session/new，返回 316 个模型条目、2 种模式和 4 个配置选项。以上预检不能证明模型都可用，也不代表已完成真实 prompt、权限审批、会话恢复或工具调用验收。
 
@@ -23,11 +24,14 @@
 ./tools/cc-acp check codebuddy
 ./tools/cc-acp check qodercn
 ./tools/cc-acp check cline
+./tools/cc-acp check codex
 ./tools/cc-acp use codebuddy --dry-run
 ./tools/cc-acp use cline --dry-run
+./tools/cc-acp use codex --dry-run
 ./tools/cc-acp use codebuddy --yes
 ./tools/cc-acp use qodercn --yes
 ./tools/cc-acp use cline --yes
+./tools/cc-acp use codex --yes
 ./tools/cc-acp use hermes --yes
 ./tools/cc-acp rollback --yes
 ./tools/cc-acp recover --yes  # 仅在检测到未完成的切换事务时
@@ -58,7 +62,7 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 ./tools/cc-acp use qodercn --dry-run
 ~~~
 
-切换后的实测顺序：cc-acp status；飞书普通对话；/models；选择模型并验证回复；/compact（只有 ACP 服务端正式公告 compact 时开放，须核验真实历史压缩）；工具权限与会话恢复；切回 Hermes 并测试 /models 的列表。四个后端均提供 check 预检，但真实对话与权限审批验证是独立验收门禁。
+切换后的实测顺序：cc-acp status；飞书普通对话；/models；选择模型并验证回复；/compact（只有 ACP 服务端正式公告 compact 时开放，须核验真实历史压缩）；工具权限与会话恢复；切回 Hermes 并测试 /models 的列表。五个后端均提供 check 预检，但真实对话与权限审批验证是独立验收门禁。
 
 ## Generic ACP 模型与压缩（2026-10-23）
 
@@ -83,3 +87,12 @@ python3.14 -m unittest discover -s tools -p 'test_cc_acp_switch.py' -v
 - 模型列表、显示名和会话切换复用 Generic ACP 的 `models.availableModels`、`session/set_model`；压缩仍根据实际 ACP `available_commands_update` 决定是否开放。**未公告就不声称手动压缩受支持。**
 - 旧版 V1 的 `state.json` 只有三种预设。新脚本在 `status/list/check/dry-run` 时**仅在内存补充 Cline**，旧状态和配置文件保持原样；首次真正 `use cline --yes` 成功后才持久化新预设。Cline 独立使用 `sessions/cline.json`，不复用其他 Agent 的 ACP Session ID；`rollback --yes` 仍可切回上一后端。
 - 切换会重启整个 cc-connect launchd 服务，影响全部 5 个项目；本次仅部署切换工具能力，不主动切换正在运行的 CodeBuddy。
+
+## Codex ACP 扩展（2026-10-23）
+
+- Codex CLI 本身不提供原生 `--acp`；使用本机已安装的 `@agentclientprotocol/codex-acp 2.2.2`，执行文件 `/opt/homebrew/bin/codex-acp`。它将 ACP stdio 转发到 Codex App Server，可复用已有 `~/.codex` 登录凭据。不要把 ACPX 客户端 `acpx codex` 错当作 ACP 服务端命令。
+- 已在 Mac 上对真实进程完成隔离验证：`initialize` 和 `session/new` 都通过，`models.availableModels` 共有 40 个模型，4 种 ACP 模式（read-only、workspace-write、agent、agent-full-access），模型的 `session/set_model` 同 ID 调用成功。
+- 适配器默认启动模式实测为 `agent`；本预设未添加全权限参数，也未绕过审批。Codex 可通过 ACP mode/configOption 改变运行模式，实际文件变更审批需要首次真实飞书任务测试后验收。当前项目级预设不改 Codex 全局 config，adapter 默认使用 npm 所附带兼容 Codex 二进制，不强制覆盖本机的 Codex CLI 版本。
+- 现有 Generic ACP 模型目录和会话内模型切换复用此预设；手动 `/compact` 只有该后端的 ACP 命令公告确实包含 `compact` 时才开放，不能以适配器文档列出 slash 命令代替运行时验证。
+- V1 状态兼容：已保存的 Hermes/CodeBuddy/QoderCN/Cline 四后端 `state.json` 只在内存中扩充 Codex，`status/list/check/dry-run` 不写回；第一次真实切换后持久化。`sessions/codex.json` 独立保存 Codex ACP session ID，切回与 rollback 均按后端恢复。
+- `cc-acp use codex --yes` 会停止并重启整个 cc-connect，可能中断 5 个项目。当前仅安装了切换功能，没有更改正在运行的 CodeBuddy 服务。

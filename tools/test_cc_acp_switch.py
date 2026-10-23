@@ -107,6 +107,7 @@ class TestSwitcher(unittest.TestCase):
         self.assertEqual(state["previous"], "qodercn")
         self.assertEqual(state["profiles"]["codebuddy"], legacy["profiles"]["codebuddy"])
         self.assertIn("cline", state["profiles"])
+        self.assertIn("codex", state["profiles"])
         self.assertEqual(state_file.read_bytes(), old_state_bytes)
         with mock.patch.object(switch, "binary", return_value="/tmp/fake"):
             result = switch.use(self.config, self.plist, "cline", dry_run=True)
@@ -144,6 +145,84 @@ class TestSwitcher(unittest.TestCase):
                                  yes=True, probe_target=False))
         self.assertEqual(self.session.read_bytes(), cline_state)
         self.assertEqual(json.loads((root / "state.json").read_text())["active"], "cline")
+
+    def test_codex_acp_profile_and_target_only_patch(self):
+        state, active = switch.profile_and_active(self.project["agent"]["options"], None)
+        self.assertEqual(active, "hermes")
+        self.assertEqual(set(state["profiles"]), set(switch.BACKENDS))
+        codex = state["profiles"]["codex"]
+        self.assertEqual(codex["cmd"], "/opt/homebrew/bin/codex-acp")
+        self.assertEqual(codex["args"], [])
+        self.assertEqual(codex["extension"], "generic")
+        self.assertNotIn("model_command", codex)
+        self.assertNotIn("compress_command", codex)
+        changed = switch.patch_config(self.raw, codex)
+        obj = switch.tomllib.loads(changed.decode())
+        self.assertEqual(obj["projects"][0], self.parsed["projects"][0])
+        self.assertEqual(obj["projects"][1]["platforms"],
+                         self.parsed["projects"][1]["platforms"])
+        self.assertEqual(obj["projects"][1]["agent"]["options"]["cmd"], codex["cmd"])
+        self.assertEqual(obj["projects"][1]["agent"]["options"]["args"], [])
+        restored = switch.patch_config(changed, state["profiles"]["hermes"])
+        self.assertEqual(switch.tomllib.loads(restored.decode()), self.parsed)
+
+    def test_four_backend_state_migrates_codex_without_rewrites(self):
+        definitions, _ = switch.profile_and_active(self.project["agent"]["options"], None)
+        old_state = {
+            "active": "cline", "previous": "codebuddy",
+            "profiles": {k: v for k, v in definitions["profiles"].items()
+                         if k != "codex"},
+        }
+        cline_raw = switch.patch_config(self.raw, old_state["profiles"]["cline"])
+        self.config.write_bytes(cline_raw)
+        root, _ = switch.private_root(switch.get_config(self.config)[1])
+        root.mkdir(parents=True)
+        managed = root / "state.json"
+        managed.write_text(json.dumps(old_state))
+        old_bytes = managed.read_bytes()
+        options = switch.get_config(self.config)[2]["agent"]["options"]
+        state, active = switch.profile_and_active(options, switch.load_state(root))
+        self.assertEqual(active, "cline")
+        self.assertEqual(state["previous"], "codebuddy")
+        self.assertEqual(state["profiles"]["cline"], old_state["profiles"]["cline"])
+        self.assertIn("codex", state["profiles"])
+        self.assertEqual(managed.read_bytes(), old_bytes)
+        with mock.patch.object(switch, "binary", return_value="/tmp/fake"):
+            plan = switch.use(self.config, self.plist, "codex", dry_run=True)
+        self.assertIn("cline -> codex", plan)
+        self.assertEqual(managed.read_bytes(), old_bytes)
+        self.assertEqual(self.config.read_bytes(), cline_raw)
+        self.assertEqual(self.session.read_bytes(), self.previous)
+
+    def test_codex_session_isolation_and_rollback(self):
+        contexts = (mock.patch.object(switch, "binary", return_value="/tmp/fake"),
+                    mock.patch.object(switch, "service"),
+                    mock.patch.object(switch, "await_state"),
+                    mock.patch.object(switch, "service_state",
+                                      return_value=("running", 1234)))
+        for item in contexts:
+            item.start()
+        self.addCleanup(lambda: [item.stop() for item in reversed(contexts)])
+        self.assertIn("hermes -> codex",
+                      switch.use(self.config, self.plist, "codex",
+                                 yes=True, probe_target=False))
+        root, _ = switch.private_root(self.parsed)
+        self.assertEqual((root / "sessions/hermes.json").read_bytes(), self.previous)
+        self.assertFalse(self.session.exists())
+        codex_data = json.dumps({"sessions": {
+            "codex": {"agent_session_id": "codex-private",
+                      "agent_type": "acp"}}}).encode()
+        self.session.write_bytes(codex_data)
+        self.assertIn("codex -> hermes",
+                      switch.use(self.config, self.plist, "hermes",
+                                 yes=True, probe_target=False))
+        self.assertEqual((root / "sessions/codex.json").read_bytes(), codex_data)
+        self.assertEqual(self.session.read_bytes(), self.previous)
+        self.assertIn("hermes -> codex",
+                      switch.use(self.config, self.plist, "codex",
+                                 yes=True, probe_target=False))
+        self.assertEqual(self.session.read_bytes(), codex_data)
+        self.assertEqual(json.loads((root / "state.json").read_text())["active"], "codex")
 
     def test_workspace_session_files_fail_closed(self):
         extra=self.dir/"sessions"/(switch.PROJECT+"_ws_deadbeef.json")
