@@ -87,6 +87,51 @@ func TestStreamPreview_BasicFlow(t *testing.T) {
 	}
 }
 
+// Regression: QoderCN ACP can emit thousands of hidden thinking chunks between
+// visible text segments. Quiet mode asks appendSeparator for each one; only
+// one paragraph boundary should be accumulated until new visible text arrives.
+// The same rule covers repeated hidden tool events (all share this helper).
+func TestStreamPreview_QuietHiddenEventsNoBlankFlood(t *testing.T) {
+	mp := &mockUpdaterPlatform{}
+	sp := newStreamPreview(StreamPreviewCfg{Enabled: true, IntervalMs: 1500, MinDeltaChars: 30}, mp, "ctx", context.Background(), nil)
+	defer sp.discard()
+	sp.appendText("intro")
+
+	count := 0
+	for i := 0; i < 10000; i++ {
+		if sp.appendSeparator("\n\n") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("hidden ACP events inserted %d separators, want one", count)
+	}
+	if got := sp.fullText; got != "intro\n\n" {
+		t.Fatalf("quiet prefix after hidden events: length %d, want 7", len(got))
+	}
+
+	sp.appendText("final answer")
+	count = 0
+	for i := 0; i < 10000; i++ {
+		if sp.appendSeparator("\n\n") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("hidden tool events inserted %d separators after new text, want one", count)
+	}
+	if got := sp.fullText; got != "intro\n\nfinal answer\n\n" {
+		t.Fatalf("quiet composed reply: %q", got)
+	}
+
+	// A legitimate Markdown paragraph boundary already present in the text
+	// must not be duplicated by the next hidden event.
+	sp.appendText("new paragraph\n\n")
+	if sp.appendSeparator("\n\n") {
+		t.Fatal("duplicated an existing paragraph break")
+	}
+}
+
 func TestStreamPreview_ThrottlesUpdates(t *testing.T) {
 	mp := &mockUpdaterPlatform{}
 	cfg := StreamPreviewCfg{

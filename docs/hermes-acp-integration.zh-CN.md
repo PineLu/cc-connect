@@ -921,6 +921,16 @@ launchctl kickstart -k gui/$(id -u)/com.cc-connect.service
 
 ---
 
+### 7.7 飞书长回复出现超大空白（quiet 隐藏事件分隔符缺陷，2026-10-29）
+
+- 复现：tujia-feishu-hermes / QoderCN ACP 的 22:02 回合，cc-connect 历史保存 25,995 字节，其中连续 20,864 个换行；同一会话早前还出现 8,702、10,334、34,676 个连续换行。QoderCN 原始 JSONL 中真实文字片段分别为 129 和 5,002 字节，均能与 cc-connect 消息对应，原始文本并无成千上万空行。
+- 根因：display.mode=quiet、thinking_messages=false、tool_messages=false 且 stream_preview.enabled=true 时，core/engine.go 的 EventThinking/EventToolUse 会调用 sp.appendSeparator("\n\n")。旧 core/streaming.go 无去重逻辑，持续的隐藏思考事件将两换行重复写入消息历史与飞书预览，造成超长空白和展开折叠。
+- 修复：appendSeparator 仅在尾部不存在该分隔符时追加；隐藏思考和隐藏工具事件共用此保护。后续有真实正文时仍能重新增加一次正常段落分隔；原正文的 Markdown 空行不受影响。不以简单的全局压缩正则代替源头修复。
+- 测试：TestStreamPreview_QuietHiddenEventsNoBlankFlood 模拟连续 10,000 个隐藏事件，修复前异常添加 10,000 次（测试失败），修复后最多一次；测试也检查新正文、工具事件和合法段落换行。使用 go test ./...、go vet ./...、go test ./core -run TestCUJ_ 回归。
+- 观察边界：旧飞书消息及会话历史不会自动改写。部署后应在新的真实 ACP 回合检查最大连续换行数与飞书卡片高度；只输出元信息，避免泄露会话正文。
+
+---
+
 ## 8. 测试与验证清单
 
 按 `AGENTS.md` 要求，bugfix 必须带「修复前失败、修复后通过」的回归测试。本次新增：

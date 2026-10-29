@@ -552,7 +552,13 @@ func (sp *streamPreview) detachPreview() {
 func (sp *streamPreview) appendSeparator(sep string) bool {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
-	if sp.degraded || !sp.cfg.Enabled || sp.fullText == "" {
+	if sp.degraded || !sp.cfg.Enabled || sp.fullText == "" || sep == "" {
+		return false
+	}
+	// Quiet mode calls this for every hidden thinking/tool event. Some ACP
+	// agents stream thousands of thinking chunks before the next visible
+	// answer: don't turn each chunk into another blank paragraph.
+	if strings.HasSuffix(sp.fullText, sep) {
 		return false
 	}
 	sp.fullText += sep
